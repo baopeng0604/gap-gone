@@ -1,52 +1,48 @@
 import { Region } from "./regionUtils";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
+import { getKeptRegions as getTimelineKeptRegions } from "./regionUtils";
 
 export async function saveToDisk(blob: Blob, defaultName: string) {
-    // Convert Blob to Uint8Array
-    const arrayBuffer = await blob.arrayBuffer();
-    const uint8Array = new Uint8Array(arrayBuffer);
+  if (!isTauriDesktop()) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = defaultName;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    return true;
+  }
 
-    try {
-        // Open Save Dialog
-        const path = await save({
-            defaultPath: defaultName,
-            filters: [{
-                name: 'Audio',
-                extensions: ['wav']
-            }]
-        });
+  const arrayBuffer = await blob.arrayBuffer();
+  const uint8Array = new Uint8Array(arrayBuffer);
 
-        if (path) {
-            // Write to file
-            await writeFile(path, uint8Array);
-            return true;
-        }
-    } catch (err) {
-        console.error("Tauri save failed:", err);
-        throw err;
+  try {
+    const path = await save({
+      defaultPath: defaultName,
+      filters: [{ name: "Audio", extensions: ["wav"] }],
+    });
+
+    if (path) {
+      await writeFile(path, uint8Array);
+      return true;
     }
-    return false;
+  } catch (err) {
+    console.error("Tauri save failed:", err);
+    throw err;
+  }
+  return false;
 }
 
+function isTauriDesktop() {
+  return Boolean(
+    (window as typeof window & { __TAURI_INTERNALS__?: unknown })
+      .__TAURI_INTERNALS__,
+  );
+}
 
 export function getKeptRegions(deletedRegions: Region[], totalDuration: number): Region[] {
-  const sorted = [...deletedRegions].sort((a, b) => a.start - b.start);
-  const kept: Region[] = [];
-  let currentTime = 0;
-
-  for (const region of sorted) {
-    if (currentTime < region.start) {
-      kept.push({ start: currentTime, end: region.start });
-    }
-    currentTime = Math.max(currentTime, region.end);
-  }
-
-  if (currentTime < totalDuration) {
-    kept.push({ start: currentTime, end: totalDuration });
-  }
-
-  return kept;
+  return getTimelineKeptRegions(deletedRegions, totalDuration);
 }
 
 export function exportAudio(
@@ -54,6 +50,9 @@ export function exportAudio(
   deletedRegions: Region[]
 ): Blob {
   const keptRegions = getKeptRegions(deletedRegions, buffer.duration);
+  if (keptRegions.length === 0) {
+    throw new Error("不能导出空音频，请至少恢复一段内容");
+  }
   const sampleRate = buffer.sampleRate;
   const numberOfChannels = buffer.numberOfChannels;
 
@@ -82,24 +81,16 @@ export function exportAudio(
       const endSample = Math.floor(region.end * sampleRate);
       const length = endSample - startSample;
       
-      // Safety check boundaries
-      if (startSample < inputData.length) {
-          // slice handles end > length automatically, but we want exact length match with offset logic
-          // However, if inputData is shorter than expected endSample, we might have issues.
-          // But startSample/endSample are derived from region which is constrained by duration.
-          
-          const chunk = inputData.slice(startSample, startSample + length);
-          
-          // Double check target fit
-          if (offset + chunk.length <= outputData.length) {
-             outputData.set(chunk, offset);
-          } else {
-             // If rounding error caused overflow, truncate
-             // This effectively solves the RangeError
-             const fitLength = outputData.length - offset;
-             outputData.set(chunk.slice(0, fitLength), offset);
-          }
-          offset += chunk.length;
+      if (startSample < inputData.length && length > 0) {
+        const chunk = inputData.slice(
+          startSample,
+          Math.min(inputData.length, startSample + length),
+        );
+        const writableLength = Math.min(chunk.length, outputData.length - offset);
+        if (writableLength > 0) {
+          outputData.set(chunk.slice(0, writableLength), offset);
+          offset += writableLength;
+        }
       }
     }
   }
@@ -108,7 +99,7 @@ export function exportAudio(
 }
 
 // Simple WAV encoder
-function bufferToWav(abuffer: AudioBuffer) {
+export function bufferToWav(abuffer: AudioBuffer): Blob {
   const numOfChan = abuffer.numberOfChannels,
     length = abuffer.length * numOfChan * 2 + 44,
     buffer = new ArrayBuffer(length),

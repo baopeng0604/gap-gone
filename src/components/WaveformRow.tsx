@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, memo } from "react";
 import { formatTimeCompact } from "../utils/timeUtils";
+import type { Region } from "../utils/regionUtils";
 
 interface WaveformRowProps {
   buffer: AudioBuffer;
@@ -8,7 +9,8 @@ interface WaveformRowProps {
   width?: number;
   height?: number;
   onSeek: (time: number) => void;
-  // currentTime is no longer a prop for the canvas
+  editMode?: "seek" | "select" | "cut" | "restore";
+  previewRegions?: Region[];
 }
 
 function drawWaveformSlice({
@@ -217,6 +219,8 @@ interface ActiveWaveformRowProps extends WaveformRowProps {
   regions: { start: number; end: number }[];
   onRegionAdd: (start: number, end: number) => void;
   onRegionRemove: (start: number, end: number) => void;
+  selection?: Region | null;
+  onSelectionChange?: (selection: Region | null) => void;
 }
 
 interface PeelEffect {
@@ -238,6 +242,10 @@ const WaveformRow = ({
   regions,
   onRegionAdd,
   onRegionRemove,
+  editMode = "seek",
+  previewRegions = [],
+  selection,
+  onSelectionChange,
 }: ActiveWaveformRowProps) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [dragState, setDragState] = React.useState<{
@@ -303,13 +311,14 @@ const WaveformRow = ({
       triggerPeelEffect(startX, endX, rStart, rEnd);
     } else if (dragState.button === 1) {
       onRegionRemove(rStart, rEnd);
+    } else if (dragState.button === 3) {
+      onSelectionChange?.({ start: rStart, end: rEnd });
     }
 
     setDragState(null);
   };
 
-  const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    // Prevent default to stop text selection or scrolling
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
     const container = containerRef.current;
     if (!container) return;
@@ -317,26 +326,35 @@ const WaveformRow = ({
     const rect = container.getBoundingClientRect();
     const x = e.clientX - rect.left;
 
-    // Left click: Seek
-    if (e.button === 0) {
+    if (e.button === 0 && editMode === "seek") {
       const percentage = x / width;
       const seekTime = startTime + percentage * (endTime - startTime);
       onSeek(seekTime);
       return;
     }
 
-    // Right (2) or Middle (1) click: Start Drag
-    if (e.button === 2 || e.button === 1) {
+    // Tool modes use the left button. Right-click and middle-click remain
+    // compatible shortcuts for cut and restore respectively.
+    const operationButton =
+      e.button === 0
+        ? editMode === "restore"
+          ? 1
+          : editMode === "select"
+            ? 3
+            : 2
+        : e.button;
+    if (operationButton === 3 || operationButton === 2 || operationButton === 1) {
+      container.setPointerCapture(e.pointerId);
       setDragState({
         isDragging: true,
         startX: x,
         currentX: x,
-        button: e.button,
+        button: operationButton,
       });
     }
   };
 
-  const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!dragState?.isDragging) return;
 
     const container = containerRef.current;
@@ -354,26 +372,11 @@ const WaveformRow = ({
     setDragState((prev) => (prev ? { ...prev, currentX: x } : null));
   };
 
-  const handleMouseUp = () => {
+  const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!dragState?.isDragging) return;
     commitDrag(dragState.currentX);
-  };
-
-  // Handle mouse leave - we want to continue dragging behavior or commit?
-  // User Requirement: "Mouse drag out of current row area means right side ends at row end".
-  // The 'handleMouseMove' clamping logic handles this if the mouse moves *within* the element.
-  // But if the mouse leaves the element entirely, `onMouseMove` might stop firing if not captured.
-  // Simpler approach for now: Use `onMouseLeave` to commit if dragging?
-  // OR better: Attach global mouse up listener?
-  // Let's stick to container-bound events first. If user drags *out* of box, `onMouseLeave` fires.
-  // We can treat `onMouseLeave` as `onMouseUp` with clamped values.
-
-  const handleMouseLeave = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (dragState?.isDragging) {
-      const rect = containerRef.current!.getBoundingClientRect();
-      let x = e.clientX - rect.left;
-      x = Math.max(0, Math.min(x, width));
-      commitDrag(x);
+    if (containerRef.current?.hasPointerCapture(e.pointerId)) {
+      containerRef.current.releasePointerCapture(e.pointerId);
     }
   };
 
@@ -426,16 +429,17 @@ const WaveformRow = ({
     <div
       ref={containerRef}
       className="waveform-row-container"
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
-      onMouseLeave={handleMouseLeave}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerUp}
       onContextMenu={(e) => e.preventDefault()} // Disable native context menu
       style={{
         width: width,
         height: height,
         position: "relative",
-        cursor: "crosshair",
+        cursor: editMode === "select" ? "pointer" : "crosshair",
+        touchAction: "none",
       }}
     >
       <div className="waveform-row-clip">
@@ -480,6 +484,45 @@ const WaveformRow = ({
           return null;
         })}
 
+        {previewRegions.map((region, idx) => {
+          const previewStart = Math.max(region.start, startTime);
+          const previewEnd = Math.min(region.end, endTime);
+          if (previewStart >= previewEnd) return null;
+
+          return (
+            <div
+              key={`silence-preview-${idx}`}
+              className="silence-preview-region"
+              style={{
+                left:
+                  ((previewStart - startTime) / (endTime - startTime)) * width,
+                width:
+                  ((previewEnd - previewStart) / (endTime - startTime)) *
+                  width,
+              }}
+            />
+          );
+        })}
+
+        {selection && (() => {
+          const selectionStart = Math.max(selection.start, startTime);
+          const selectionEnd = Math.min(selection.end, endTime);
+          if (selectionStart >= selectionEnd) return null;
+          return (
+            <div
+              className="waveform-selection"
+              style={{
+                left:
+                  ((selectionStart - startTime) / (endTime - startTime)) * width,
+                width:
+                  ((selectionEnd - selectionStart) /
+                    (endTime - startTime)) *
+                  width,
+              }}
+            />
+          );
+        })()}
+
         {restorePreviewSegments.map((segment) => (
           <div
             key={segment.key}
@@ -511,12 +554,16 @@ const WaveformRow = ({
               backgroundColor:
                 dragState.button === 2
                   ? "rgba(18, 18, 18, 0.68)"
+                  : dragState.button === 3
+                    ? "rgba(74, 133, 255, 0.3)"
                   : "rgba(255, 255, 255, 0.2)",
               zIndex: 4,
               pointerEvents: "none",
               border:
                 dragState.button === 2
                   ? "1px dashed rgba(255, 255, 255, 0.18)"
+                  : dragState.button === 3
+                    ? "1px dashed rgba(125, 169, 255, 0.85)"
                   : "1px dashed rgba(255, 255, 255, 0.42)",
             }}
           />

@@ -8,6 +8,10 @@ interface WaveformScoreProps {
   regions: { start: number; end: number }[];
   onRegionAdd: (start: number, end: number) => void;
   onRegionRemove: (start: number, end: number) => void;
+  editMode?: "seek" | "select" | "cut" | "restore";
+  selection?: { start: number; end: number } | null;
+  onSelectionChange?: (selection: { start: number; end: number } | null) => void;
+  previewRegions?: { start: number; end: number }[];
 }
 
 const WaveformScore = ({
@@ -18,6 +22,10 @@ const WaveformScore = ({
   regions,
   onRegionAdd,
   onRegionRemove,
+  editMode = "seek",
+  selection = null,
+  onSelectionChange,
+  previewRegions = [],
 }: WaveformScoreProps) => {
   const duration = buffer.duration;
   const rowCount = Math.ceil(duration / secondsPerRow);
@@ -46,6 +54,10 @@ const WaveformScore = ({
         regions={regions}
         onRegionAdd={onRegionAdd}
         onRegionRemove={onRegionRemove}
+        editMode={editMode}
+        selection={selection}
+        onSelectionChange={onSelectionChange}
+        previewRegions={previewRegions}
       />,
     );
   }
