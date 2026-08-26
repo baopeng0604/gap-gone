@@ -22,3 +22,13 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# WorkBuddy
+.workbuddy/
+
+# Temp & generated
+_tmp_*
+vite.config.ts.timestamp-*
+
+# Lock files (project uses pnpm, not npm)
+package-lock.json
