@@ -104,6 +104,35 @@ fn write_level(app: &AppHandle, samples: &[f32]) {
     );
 }
 
+/// 把交错的立体声或多声道数据下混为单声道。
+/// Windows WASAPI 共享模式下采集流只接受设备混音格式，
+/// 声道数必须与设备一致，因此只能在回调里转成单声道。
+fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
+    if channels <= 1 {
+        return data.to_vec();
+    }
+    data.chunks(channels)
+        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
+        .collect()
+}
+
+fn write_mono_block(
+    app: &AppHandle,
+    writer: &Arc<Mutex<Option<hound::WavWriter<BufWriter<File>>>>>,
+    mono: &[f32],
+) {
+    write_level(app, mono);
+    if let Ok(mut guard) = writer.lock() {
+        if let Some(writer) = guard.as_mut() {
+            for sample in mono {
+                let value = (*sample * i16::MAX as f32)
+                    .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                let _ = writer.write_sample(value);
+            }
+        }
+    }
+}
+
 fn temp_recording_path() -> PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -148,11 +177,12 @@ fn start_recording(
     let supported = device
         .default_input_config()
         .map_err(|error| format!("无法读取录音设备格式: {error}"))?;
-    let mut config: StreamConfig = supported.config();
-    config.channels = 1;
-    if supported.sample_rate() == 48_000 {
-        config.sample_rate = 48_000;
-    }
+    // Windows WASAPI 共享模式的采集流只接受设备混音格式；
+    // 不能改动声道数或采样率，否则 Initialize 返回
+    // AUDCLNT_E_UNSUPPORTED_FORMAT（表现为能选设备但无法录音）。
+    // 因此这里原样使用默认配置，回调里再下混为单声道。
+    let config: StreamConfig = supported.config();
+    let channels = config.channels as usize;
     let sample_format = supported.sample_format();
     let path = temp_recording_path();
     let spec = hound::WavSpec {
@@ -178,17 +208,8 @@ fn start_recording(
         SampleFormat::F32 => device.build_input_stream(
             config.clone(),
             move |data: &[f32], _| {
-                write_level(&callback_app, data);
-                if let Ok(mut guard) = callback_writer.lock() {
-                    if let Some(writer) = guard.as_mut() {
-                        for sample in data {
-                            let value = (*sample * i16::MAX as f32)
-                                .clamp(i16::MIN as f32, i16::MAX as f32)
-                                as i16;
-                            let _ = writer.write_sample(value);
-                        }
-                    }
-                }
+                let mono = downmix_to_mono(data, channels);
+                write_mono_block(&callback_app, &callback_writer, &mono);
             },
             make_error_callback(),
             None,
@@ -203,14 +224,8 @@ fn start_recording(
                         .iter()
                         .map(|sample| *sample as f32 / i16::MAX as f32)
                         .collect();
-                    write_level(&callback_app, &samples);
-                    if let Ok(mut guard) = callback_writer.lock() {
-                        if let Some(writer) = guard.as_mut() {
-                            for sample in data {
-                                let _ = writer.write_sample(*sample);
-                            }
-                        }
-                    }
+                    let mono = downmix_to_mono(&samples, channels);
+                    write_mono_block(&callback_app, &callback_writer, &mono);
                 },
                 make_error_callback(),
                 None,
@@ -226,17 +241,8 @@ fn start_recording(
                         .iter()
                         .map(|sample| *sample as f32 / 32768.0 - 1.0)
                         .collect();
-                    write_level(&callback_app, &samples);
-                    if let Ok(mut guard) = callback_writer.lock() {
-                        if let Some(writer) = guard.as_mut() {
-                            for sample in data {
-                                let value = (*sample as i32 - 32_768)
-                                    .clamp(i16::MIN as i32, i16::MAX as i32)
-                                    as i16;
-                                let _ = writer.write_sample(value);
-                            }
-                        }
-                    }
+                    let mono = downmix_to_mono(&samples, channels);
+                    write_mono_block(&callback_app, &callback_writer, &mono);
                 },
                 make_error_callback(),
                 None,

@@ -64,6 +64,7 @@ export function useRecorder() {
   const discardStopRef = useRef(false);
   const nativePathRef = useRef<string | null>(null);
   const nativeUnlistenRef = useRef<UnlistenFn | null>(null);
+  const nativeErrorUnlistenRef = useRef<UnlistenFn | null>(null);
   const nativeTimerRef = useRef<number | null>(null);
 
   const refreshDevices = useCallback(async () => {
@@ -161,6 +162,8 @@ export function useRecorder() {
   const cleanupNative = useCallback(() => {
     nativeUnlistenRef.current?.();
     nativeUnlistenRef.current = null;
+    nativeErrorUnlistenRef.current?.();
+    nativeErrorUnlistenRef.current = null;
     if (nativeTimerRef.current !== null) {
       window.clearInterval(nativeTimerRef.current);
       nativeTimerRef.current = null;
@@ -241,6 +244,14 @@ export function useRecorder() {
             if (event.payload.peak >= 0.999) setClipLatched(true);
           },
         );
+        // Rust 端录音流在运行期出错（设备拔出、被占用等）会通过该事件上报。
+        nativeErrorUnlistenRef.current = await listen<string>(
+          "recording-error",
+          (event) => {
+            setStatus("error");
+            setError(event.payload || "录音过程中发生错误");
+          },
+        );
         startedAtRef.current = performance.now();
         nativeTimerRef.current = window.setInterval(
           () =>
@@ -249,8 +260,18 @@ export function useRecorder() {
         );
         setStatus("recording");
         return;
-      } catch {
-        // Development webview fallback below keeps browser testing possible.
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        // 仅当命令不存在（浏览器开发预览）时降级到 Web Media API；
+        // 原生录音的真实错误必须直接展示，否则用户只能看到无效的降级报错。
+        const commandMissing =
+          message.includes("start_recording") &&
+          /not found|unknown|no such/i.test(message);
+        if (!commandMissing) {
+          setStatus("error");
+          setError(message || "无法启动录音");
+          return;
+        }
       }
     }
 
