@@ -1,0 +1,52 @@
+name: Build Windows App
+
+on:
+  # 方式一：手动触发。Actions 页面 -> 选中本 workflow -> 点击 "Run workflow" 时，
+  # 右侧下拉框可以选择任意分支，构建的就是所选分支的代码。
+  # 注意：所选分支上必须已存在本文件，否则下拉框里看不到该分支。
+  workflow_dispatch:
+
+  # 方式二（可选）：推送到指定分支时自动构建。构建的就是被推送的分支。
+  # 取消注释即可启用；不限分支可写 branches: [main, record] 或直接删掉 branches 过滤。
+  # push:
+  #   branches: [main]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout 当前分支
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # 缓存 Rust 编译产物（DeepFilterNet + tract 全量编译要 30 分钟以上，缓存后大幅加速）
+      - name: 缓存 Rust 编译产物
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      # bundle.targets = "all"：Windows 上会产出 NSIS 安装包(.exe) 和 MSI(.msi)
+      - name: 构建 Tauri Windows 应用
+        run: npm run tauri build
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          # 产物名带分支名，多分支构建互不覆盖
+          name: gap-gone-windows-${{ github.ref_name }}
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/gap-gone.exe
+          if-no-files-found: error

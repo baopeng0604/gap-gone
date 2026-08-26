@@ -33,54 +33,92 @@
 
 ## 📦 安装与运行
 
-确保你已经安装了 [Rust](https://www.rust-lang.org/tools/install) 和 [Node.js](https://nodejs.org)。
+### 前提条件
 
-1.  **克隆项目**
+- [Rust](https://www.rust-lang.org/tools/install)（含 cargo）
+- [Node.js](https://nodejs.org)（建议 18+）
+- **Windows 额外要求**：MSVC Build Tools（含 C++ 桌面开发工作负载）+ WebView2 运行时（Windows 10/11 通常已预装）
 
-    ```bash
-    git clone https://github.com/your-username/gap-gone.git
-    cd gap-gone
-    ```
-
-2.  **安装依赖**
-
-    ```bash
-    pnpm install
-    # 或者 npm install / yarn install
-    ```
-
-3.  **启动开发模式**
-
-    ```bash
-    pnpm tauri dev
-    ```
-
-4.  **构建应用**
-    ```bash
-    pnpm tauri build
-    ```
-
-### 前端构建产物
-
-`pnpm build` 只构建前端静态资源，输出到：
-
-```text
-dist/
-```
-
-不要直接双击 `dist/index.html`，因为资源路径和部分 Tauri API 需要通过 HTTP 服务加载。查看生产前端请运行：
+### 克隆项目
 
 ```bash
-pnpm preview --host 127.0.0.1
+git clone https://github.com/your-username/gap-gone.git
+cd gap-gone
 ```
 
-开发模式使用 `http://127.0.0.1:1420/`。如果该地址仍显示旧界面，请停止旧的 Vite 进程后重新运行：
+### 安装依赖
 
 ```bash
-pnpm dev --host 127.0.0.1
+# npm（默认）
+npm install
+
+# 或 pnpm
+pnpm install
 ```
 
-`pnpm tauri build` 通常会在 `src-tauri/target/release/bundle/` 下生成 macOS、Windows 或 Linux 安装产物；macOS 应用一般位于 `macos/gap-gone.app`，磁盘镜像位于 `dmg/`。
+> 项目默认配置为 npm（`tauri.conf.json` 中 `beforeBuildCommand` 为 `npm run build`）。切换到 pnpm 时需同步修改该配置并提交 `pnpm-lock.yaml`。
+
+### 启动开发模式
+
+```bash
+# npm
+npm run tauri dev
+
+# pnpm
+pnpm tauri dev
+```
+
+开发服务器地址：`http://localhost:1420/`。如果仍显示旧界面，停止旧 Vite 进程后重新运行即可。
+
+### 构建应用
+
+```bash
+# npm
+npm run tauri build
+
+# pnpm
+pnpm tauri build
+```
+
+> 首次编译需下载并编译全部 Rust 依赖（含 DeepFilterNet3 + tract），耗时约 30–60 分钟；后续增量编译会快很多。
+
+### 构建产物位置
+
+构建完成后，产物位于 `src-tauri/target/release/`：
+
+| 平台 | 可执行文件 | 安装包 |
+|---|---|---|
+| **Windows** | `gap-gone.exe` | `bundle/nsis/gap-gone_0.1.0_x64-setup.exe`（NSIS）、`bundle/msi/*.msi`（MSI） |
+| **macOS** | `gap-gone.app` | `bundle/dmg/gap-gone_*.dmg` |
+| **Linux** | — | `bundle/deb/*.deb`、`bundle/appimage/*.AppImage` |
+
+可执行文件可直接双击运行，安装包用于分发。
+
+### 仅构建前端
+
+```bash
+# npm
+npm run build
+
+# pnpm
+pnpm build
+```
+
+输出到 `dist/`。不要直接双击 `dist/index.html`，资源路径和部分 Tauri API 需要通过 HTTP 服务加载。预览前端：
+
+```bash
+npm run preview -- --host 127.0.0.1
+# 或 pnpm preview --host 127.0.0.1
+```
+
+### CI 自动构建（GitHub Actions）
+
+项目内置 `.github/workflows/build-windows.yml`，可在 GitHub Actions 上自动构建 Windows 安装包：
+
+- **手动触发**：仓库 Actions 页面 → 选中 "Build Windows App" → Run workflow（可选择任意分支）
+- **推送触发**（可选）：取消 `on.push` 部分的注释即可在推送时自动构建
+
+构建产物会作为 Artifact 上传，可在 Actions 运行页面下载。
 
 ## 🎮 使用指南
 
