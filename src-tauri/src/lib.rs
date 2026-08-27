@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        mpsc, Arc, Mutex,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -16,7 +16,7 @@ use cpal::{
 use df::tract::{DfParams, DfTract, RuntimeParams};
 use ndarray::Array2;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Default)]
 struct RecordingManager {
@@ -24,11 +24,25 @@ struct RecordingManager {
     denoise_cancelled: AtomicBool,
 }
 
+/// 写入线程的指令。实时音频回调里只入队采样块，
+/// 磁盘写入、电平统计与 IPC 事件全部由专用线程承担，
+/// 避免回调超过 WASAPI 单个缓冲处理周期触发
+/// AUDCLNT_E_BUFFER_ERROR（underrun/overrun）。
+enum WriterCommand {
+    Samples(Vec<f32>),
+    Finalize {
+        respond: Option<mpsc::Sender<Result<(), String>>>,
+    },
+}
+
 struct RecordingState {
     stream: Stream,
-    writer: Arc<Mutex<Option<hound::WavWriter<BufWriter<File>>>>>,
+    writer_tx: mpsc::Sender<WriterCommand>,
     path: PathBuf,
     paused: bool,
+    /// 流已报错、正等待或正在回收。
+    /// start_recording 依据它区分「真在录音」与「可清理的残留状态」。
+    errored: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Serialize)]
@@ -51,6 +65,14 @@ struct RecordingStarted {
 struct RecordingLevel {
     rms: f32,
     peak: f32,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordingErrorPayload {
+    message: String,
+    /// 已 finalize 的部分录音文件；前端读取后进入试听，避免整段丢失。
+    path: Option<String>,
 }
 
 fn input_devices() -> Result<Vec<(Device, String, bool)>, String> {
@@ -85,25 +107,6 @@ fn list_audio_input_devices() -> Result<Vec<AudioDevice>, String> {
         .collect())
 }
 
-fn write_level(app: &AppHandle, samples: &[f32]) {
-    if samples.is_empty() {
-        return;
-    }
-    let mut sum = 0.0;
-    let mut peak: f32 = 0.0;
-    for sample in samples {
-        sum += sample * sample;
-        peak = peak.max(sample.abs());
-    }
-    let _ = app.emit(
-        "recording-level",
-        RecordingLevel {
-            rms: (sum / samples.len() as f32).sqrt().min(1.0),
-            peak: peak.min(1.0),
-        },
-    );
-}
-
 /// 把交错的立体声或多声道数据下混为单声道。
 /// Windows WASAPI 共享模式下采集流只接受设备混音格式，
 /// 声道数必须与设备一致，因此只能在回调里转成单声道。
@@ -116,20 +119,117 @@ fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
-fn write_mono_block(
-    app: &AppHandle,
-    writer: &Arc<Mutex<Option<hound::WavWriter<BufWriter<File>>>>>,
-    mono: &[f32],
-) {
-    write_level(app, mono);
-    if let Ok(mut guard) = writer.lock() {
-        if let Some(writer) = guard.as_mut() {
-            for sample in mono {
-                let value = (*sample * i16::MAX as f32)
-                    .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                let _ = writer.write_sample(value);
+/// 启动 WAV 写入线程：接收实时回调入队的采样块，
+/// 写盘并按 ~100ms 聚合电平事件（原来每个音频块 emit 一次，
+/// 高频 IPC + 回调内磁盘 IO 是 underrun 的主因）。
+fn spawn_wav_writer(
+    app: AppHandle,
+    path: &PathBuf,
+    spec: hound::WavSpec,
+    sample_rate: u32,
+) -> Result<mpsc::Sender<WriterCommand>, String> {
+    let writer: hound::WavWriter<BufWriter<File>> = hound::WavWriter::create(path, spec)
+        .map_err(|error| format!("无法创建临时录音文件: {error}"))?;
+    let (tx, rx) = mpsc::channel::<WriterCommand>();
+    let emit_window = (sample_rate / 10).max(1) as usize;
+    std::thread::Builder::new()
+        .name("gap-gone-wav-writer".to_string())
+        .spawn(move || {
+            let mut writer = writer;
+            let mut sum_sq = 0.0f32;
+            let mut peak = 0.0f32;
+            let mut samples_seen = 0usize;
+            while let Ok(command) = rx.recv() {
+                match command {
+                    WriterCommand::Samples(mono) => {
+                        for sample in &mono {
+                            sum_sq += sample * sample;
+                            peak = peak.max(sample.abs());
+                            let value = (*sample * i16::MAX as f32)
+                                .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                            let _ = writer.write_sample(value);
+                        }
+                        samples_seen += mono.len();
+                        if samples_seen >= emit_window {
+                            let rms = (sum_sq / samples_seen as f32).sqrt().min(1.0);
+                            let _ = app.emit(
+                                "recording-level",
+                                RecordingLevel {
+                                    rms,
+                                    peak: peak.min(1.0),
+                                },
+                            );
+                            sum_sq = 0.0;
+                            peak = 0.0;
+                            samples_seen = 0;
+                        }
+                    }
+                    WriterCommand::Finalize { respond } => {
+                        // 通道 FIFO 保证 Finalize 前的采样块都已写盘。
+                        let result = writer
+                            .finalize()
+                            .map_err(|error| format!("无法完成录音文件: {error}"));
+                        if let Some(respond) = respond {
+                            let _ = respond.send(result);
+                        }
+                        return;
+                    }
+                }
             }
+            // 发送端全部关闭却没收到 Finalize：兜底 finalize。
+            let _ = writer.finalize();
+        })
+        .map_err(|error| format!("无法启动录音写入线程: {error}"))?;
+    Ok(tx)
+}
+
+/// WASAPI 流报错（underrun/overrun、设备拔出、被占用等）后的回收：
+/// 停掉失效的流、finalize 已写入的部分录音并通知前端。
+/// 必须在独立线程执行——drop(Stream) 会 join 音频回调线程，
+/// 在回调线程里自 drop 会死锁，所以在错误回调里只做标记。
+fn recover_failed_recording(app: AppHandle, error: cpal::Error) {
+    let manager = app.state::<RecordingManager>();
+    let Ok(mut guard) = manager.active.lock() else {
+        return;
+    };
+    // 只回收已标记 errored 的流：回收线程与 start_recording 抢锁可能滞后，
+    // 不能误杀 start 刚刚建立的新录音。
+    let stale = guard
+        .as_ref()
+        .is_some_and(|recording| recording.errored.load(Ordering::Relaxed));
+    if !stale {
+        return;
+    }
+    let Some(recording) = guard.take() else {
+        return;
+    };
+    drop(guard);
+    drop(recording.stream);
+    // finalize 已采集数据：录音中断时保住中断前的部分。
+    let _ = recording
+        .writer_tx
+        .send(WriterCommand::Finalize { respond: None });
+    let payload = RecordingErrorPayload {
+        message: error.to_string(),
+        path: Some(recording.path.to_string_lossy().to_string()),
+    };
+    let _ = app.emit("recording-error", payload);
+}
+
+fn make_error_callback(
+    app: AppHandle,
+    errored: Arc<AtomicBool>,
+) -> impl FnMut(cpal::Error) + Send + 'static {
+    move |error: cpal::Error| {
+        // 音频线程上只做标记，清理交给独立线程。
+        if errored.swap(true, Ordering::Relaxed) {
+            return;
         }
+        let app = app.clone();
+        std::thread::Builder::new()
+            .name("gap-gone-recording-recovery".to_string())
+            .spawn(move || recover_failed_recording(app, error))
+            .ok();
     }
 }
 
@@ -169,8 +269,20 @@ fn start_recording(
         .active
         .lock()
         .map_err(|_| "录音状态不可用".to_string())?;
-    if active.is_some() {
-        return Err("已经有录音正在进行".to_string());
+    if let Some(existing) = active.as_ref() {
+        if existing.errored.load(Ordering::Relaxed) {
+            // 上一条流已报错但回收线程尚未完成：清掉残留再开新录音，
+            // 避免用户被「已经有录音正在进行」卡住无法重录。
+            if let Some(stale) = active.take() {
+                drop(stale.stream);
+                let _ = stale
+                    .writer_tx
+                    .send(WriterCommand::Finalize { respond: None });
+                let _ = std::fs::remove_file(stale.path);
+            }
+        } else {
+            return Err("已经有录音正在进行".to_string());
+        }
     }
 
     let (device, _) = choose_device(device_id.as_deref())?;
@@ -191,75 +303,75 @@ fn start_recording(
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let writer = Arc::new(Mutex::new(Some(
-        hound::WavWriter::create(&path, spec)
-            .map_err(|error| format!("无法创建临时录音文件: {error}"))?,
-    )));
-    let callback_writer = Arc::clone(&writer);
-    let callback_app = app.clone();
-    let make_error_callback = || {
-        let error_app = app.clone();
-        move |error: cpal::Error| {
-            let _ = error_app.emit("recording-error", error.to_string());
-        }
-    };
+    let writer_tx = spawn_wav_writer(app.clone(), &path, spec, config.sample_rate)?;
+    let errored = Arc::new(AtomicBool::new(false));
 
     let stream = match sample_format {
         SampleFormat::F32 => device.build_input_stream(
             config.clone(),
-            move |data: &[f32], _| {
-                let mono = downmix_to_mono(data, channels);
-                write_mono_block(&callback_app, &callback_writer, &mono);
+            {
+                let writer_tx = writer_tx.clone();
+                move |data: &[f32], _| {
+                    // 实时回调只做下混 + 入队；磁盘/IPC 全在写入线程。
+                    let mono = downmix_to_mono(data, channels);
+                    let _ = writer_tx.send(WriterCommand::Samples(mono));
+                }
             },
-            make_error_callback(),
+            make_error_callback(app.clone(), Arc::clone(&errored)),
             None,
         ),
-        SampleFormat::I16 => {
-            let callback_writer = Arc::clone(&writer);
-            let callback_app = app.clone();
-            device.build_input_stream(
-                config.clone(),
+        SampleFormat::I16 => device.build_input_stream(
+            config.clone(),
+            {
+                let writer_tx = writer_tx.clone();
                 move |data: &[i16], _| {
                     let samples: Vec<f32> = data
                         .iter()
                         .map(|sample| *sample as f32 / i16::MAX as f32)
                         .collect();
                     let mono = downmix_to_mono(&samples, channels);
-                    write_mono_block(&callback_app, &callback_writer, &mono);
-                },
-                make_error_callback(),
-                None,
-            )
-        }
-        SampleFormat::U16 => {
-            let callback_writer = Arc::clone(&writer);
-            let callback_app = app.clone();
-            device.build_input_stream(
-                config.clone(),
+                    let _ = writer_tx.send(WriterCommand::Samples(mono));
+                }
+            },
+            make_error_callback(app.clone(), Arc::clone(&errored)),
+            None,
+        ),
+        SampleFormat::U16 => device.build_input_stream(
+            config.clone(),
+            {
+                let writer_tx = writer_tx.clone();
                 move |data: &[u16], _| {
                     let samples: Vec<f32> = data
                         .iter()
                         .map(|sample| *sample as f32 / 32768.0 - 1.0)
                         .collect();
                     let mono = downmix_to_mono(&samples, channels);
-                    write_mono_block(&callback_app, &callback_writer, &mono);
-                },
-                make_error_callback(),
-                None,
-            )
-        }
+                    let _ = writer_tx.send(WriterCommand::Samples(mono));
+                }
+            },
+            make_error_callback(app.clone(), Arc::clone(&errored)),
+            None,
+        ),
         other => return Err(format!("暂不支持录音格式 {other:?}")),
+    };
+    let stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            // 写入线程会因通道关闭自行退出，这里只需清理空文件。
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("无法启动录音流: {error}"));
+        }
+    };
+    if let Err(error) = stream.play() {
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("无法播放录音流: {error}"));
     }
-    .map_err(|error| format!("无法启动录音流: {error}"))?;
-
-    stream
-        .play()
-        .map_err(|error| format!("无法播放录音流: {error}"))?;
     *active = Some(RecordingState {
         stream,
-        writer,
+        writer_tx,
         path: path.clone(),
         paused: false,
+        errored,
     });
     Ok(RecordingStarted {
         path: path.to_string_lossy().to_string(),
@@ -316,18 +428,21 @@ fn stop_recording(state: State<'_, RecordingManager>) -> Result<String, String> 
         .map_err(|_| "录音状态不可用".to_string())?
         .take()
         .ok_or_else(|| "当前没有正在进行的录音".to_string())?;
+    // 先停流（join 音频线程；回调只入队，会立即返回），
+    // 再让写入线程把队列里的采样写完并 finalize。
     drop(recording.stream);
-    let path = recording.path.clone();
-    let writer = recording
-        .writer
-        .lock()
-        .map_err(|_| "录音文件不可用".to_string())?
-        .take()
-        .ok_or_else(|| "录音文件已经关闭".to_string())?;
-    writer
-        .finalize()
-        .map_err(|error| format!("无法完成录音文件: {error}"))?;
-    Ok(path.to_string_lossy().to_string())
+    let (respond_tx, respond_rx) = mpsc::channel();
+    recording
+        .writer_tx
+        .send(WriterCommand::Finalize {
+            respond: Some(respond_tx),
+        })
+        .map_err(|_| "录音写入线程已退出".to_string())?;
+    match respond_rx.recv() {
+        Ok(result) => result?,
+        Err(_) => return Err("录音写入线程没有响应".to_string()),
+    }
+    Ok(recording.path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -342,6 +457,9 @@ fn cancel_recording(
         .take();
     if let Some(recording) = recording {
         drop(recording.stream);
+        let _ = recording
+            .writer_tx
+            .send(WriterCommand::Finalize { respond: None });
         let _ = std::fs::remove_file(recording.path);
     } else if let Some(path) = path {
         let _ = remove_recording_file(&path);

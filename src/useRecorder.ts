@@ -244,14 +244,44 @@ export function useRecorder() {
             if (event.payload.peak >= 0.999) setClipLatched(true);
           },
         );
-        // Rust 端录音流在运行期出错（设备拔出、被占用等）会通过该事件上报。
-        nativeErrorUnlistenRef.current = await listen<string>(
-          "recording-error",
-          (event) => {
+        // Rust 端录音流出错（WASAPI underrun/overrun、设备拔出等）时会回收流，
+        // 并保留已写入的部分录音；这里读回来直接进入试听，避免整段丢失。
+        nativeErrorUnlistenRef.current = await listen<{
+          message: string;
+          path: string | null;
+        }>("recording-error", async (event) => {
+          const { message, path } = event.payload;
+          let partialBlob: Blob | null = null;
+          if (path) {
+            try {
+              const bytes = await invoke<number[]>("read_recording", { path });
+              // 44 字节是 WAV 头，超过说明有实际采样数据。
+              if (bytes.length > 44) {
+                partialBlob = new Blob([new Uint8Array(bytes)], {
+                  type: "audio/wav",
+                });
+                void invoke("delete_recording_file", { path }).catch(
+                  () => undefined,
+                );
+              }
+            } catch {
+              // 部分录音读取失败时按普通错误处理。
+            }
+          }
+          stopMeter();
+          cleanupNative();
+          setIsPaused(false);
+          if (partialBlob) {
+            setRecordedBlob(partialBlob);
+            setDuration(getElapsedDuration());
+            setStatus("review");
+            setError(`录音中断（${message}），已保留中断前的部分录音，请试听确认`);
+          } else {
+            setRecordedBlob(null);
             setStatus("error");
-            setError(event.payload || "录音过程中发生错误");
-          },
-        );
+            setError(message || "录音过程中发生错误");
+          }
+        });
         startedAtRef.current = performance.now();
         nativeTimerRef.current = window.setInterval(
           () =>
@@ -359,6 +389,7 @@ export function useRecorder() {
     }
   }, [
     cleanupAudio,
+    cleanupNative,
     refreshDevices,
     selectedDeviceId,
     startMeter,
