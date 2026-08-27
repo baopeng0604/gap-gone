@@ -12,6 +12,8 @@
     "fs:default",
     "fs:allow-write-text-file",
     "fs:allow-write-file",
-    "fs:write-files"
+    "fs:write-files",
+    "fs:allow-temp-read",
+    "fs:allow-temp-write"
   ]
 }

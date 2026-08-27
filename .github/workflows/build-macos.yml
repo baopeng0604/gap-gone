@@ -1,0 +1,50 @@
+name: Build macOS App
+
+on:
+  # 手动触发：Actions 页面 -> 选中本 workflow -> Run workflow（可选分支）。
+  # 所选分支上必须已存在本文件，否则下拉框里看不到该分支。
+  workflow_dispatch:
+
+  # push:
+  #   branches: [main]
+
+jobs:
+  build-macos:
+    # macos-latest 为 Apple Silicon (arm64)。Intel Mac 已被 Apple 淘汰，
+    # 如确需 x86_64 安装包，另加 macos-13 matrix 即可。
+    runs-on: macos-latest
+    steps:
+      - name: Checkout 当前分支
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # 缓存 Rust 编译产物（DeepFilterNet + tract 全量编译要 30 分钟以上）
+      - name: 缓存 Rust 编译产物
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      # 未配置签名证书时 macOS 构建走 ad-hoc 签名，本地可用；
+      # 分发给别人会被 Gatekeeper 拦截，需另配 Apple 证书 + 公证（见 AGENTS.md）。
+      - name: 构建 Tauri macOS 应用
+        run: npm run tauri build
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: gap-gone-macos-${{ github.ref_name }}
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/*.app
+          if-no-files-found: error

@@ -17,7 +17,7 @@ Gap Gone 是面向博客作者和内容创作者的本地录音、去静音和�
 7. 点击取消会删除临时录音；点击确定并编辑会进入波形编辑页。
 录音相关按钮会直接显示对应按键提示：暂停/继续 `P`、取消 `Esc`、停止 `S`；顶部录音按钮显示 `R`。
 
-默认录音规格为 48 kHz、单声道、PCM WAV。macOS 和 Windows 使用 Rust/CPAL 原生采集，浏览器开发环境保留 Web Media API 回退。
+录音采样率跟随设备默认格式（Windows WASAPI 与 macOS CoreAudio 都只接受设备原生格式，常见为 48 kHz，部分 USB 麦为 44.1 kHz），统一在回调中下混为单声道 PCM WAV。macOS 和 Windows 使用 Rust/CPAL 原生采集，浏览器开发环境保留 Web Media API 回退。
 
 录音电平中，-6 dBFS 以上显示黄色预警；检测到数字削波时，右侧 CLIP 标记会锁存为红色。点击红色标记只会清除提示，不会修改录音。
 长条电平条按 dBFS 刻度标出 -24、-18、-12、-6 和 -3 dB，越靠右代表电平越高、越接近 0 dBFS。
@@ -54,6 +54,28 @@ Gap Gone 是面向博客作者和内容创作者的本地录音、去静音和�
 
 macOS 回归建议：正常录音→停止→试听、暂停/继续、录音中拔出设备、降噪链路。
 
+### 跨平台兼容与 IPC 传输修复记录（2026-08-27）
+
+**背景**：审核发现三个跨平台风险，本次全部修复。
+
+**1. 非 48 kHz 设备降噪静默降级**
+
+- 现象：`denoise_audio` 只接受 48 kHz 单声道，而录音直接采用设备默认采样率。macOS 上大量 USB 麦克风默认 44.1 kHz，这些设备会无声地退回效果较弱的「兼容性降噪」，界面无提示。
+- 修改：`src/utils/noiseReduction.ts` 新增 `renderBuffer`，用 OfflineAudioContext 在送 DeepFilterNet3 前重采样/下混到 48 kHz 单声道，处理完再还原回原始采样率与声道数。桌面端任何设备格式都走 DeepFilterNet3，结果消息仍会标明实际使用的引擎。
+
+**2. 大文件 IPC 传输卡死风险**
+
+- 现象：`read_recording` 与 `denoise_audio` 用 `Vec<u8>` 收发 WAV 数据，Tauri v2 自定义命令参数走 JSON 数字数组序列化；10 分钟录音约 56 MB，会展开成数千万个数字，内存与序列化开销不可接受。
+- 修改：改为「临时文件 + 路径传参」。
+  - `src-tauri/src/lib.rs`：删除 `read_recording`；新增 `prepare_denoise_files`（由 Rust 生成合法的 `gap-gone-*` temp 路径对）；`denoise_audio` 改为收 `inputPath`/`outputPath`，从磁盘读入、写出到磁盘；路径校验统一收敛到 `validate_temp_recording_path`。
+  - 前端：读录音与降噪结果改用 `@tauri-apps/plugin-fs` 的 `readFile`/`writeFile`（二进制 raw 传输，不经 JSON 数组）；capabilities 增加 `fs:allow-temp-read` / `fs:allow-temp-write`。
+  - 降噪结束后前端经 `delete_recording_file` 清理两个临时文件；取消/失败路径在 `finally` 里同样清理。
+
+**3. CI 只有 Windows 构建**
+
+- 新增 `.github/workflows/build-macos.yml`（macos-latest，Apple Silicon），与 Windows 流水线同结构（npm ci + rust-cache + tauri build），手动触发。改 df-tract/tract 等重依赖后两条流水线都要跑。
+- 注意：macOS 产物为 ad-hoc 签名，自用没问题；对外分发会被 Gatekeeper 拦截，需要另配 Apple 开发者证书与公证流程。
+
 ## 编辑语义
 
 波形每行表示 10 秒，默认窗口为 1200×800，单行波形宽度为 1000px。
@@ -88,7 +110,7 @@ macOS 回归建议：正常录音→停止→试听、暂停/继续、录音中�
 
 ## 降噪
 
-桌面应用内置标准 DeepFilterNet3 模型。模型使用 Rust 原生处理链，在 48 kHz 单声道音频上执行离线处理。模型约 8.5 MB，随应用分发，不需要联网下载。
+桌面应用内置标准 DeepFilterNet3 模型。模型使用 Rust 原生处理链，在 48 kHz 单声道音频上执行离线处理；录音为其他采样率或立体声时，前端会在处理前后自动重采样转换，任何设备都能使用模型降噪。模型约 8.5 MB，随应用分发，不需要联网下载。
 
 降噪提供轻、中、强三档。没有选区时处理整段音频，有选区时只替换选区。降噪结果先进入试听预览，确认后才成为当前版本，取消试听会恢复处理前版本。
 

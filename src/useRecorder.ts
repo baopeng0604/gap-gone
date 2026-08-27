@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { readFile } from "@tauri-apps/plugin-fs";
 
 export interface AudioInputDevice {
   deviceId: string;
@@ -30,6 +31,14 @@ const emptyLevel: MonitorLevel = {
 
 function toDb(linear: number) {
   return linear > 0 ? 20 * Math.log10(linear) : Number.NEGATIVE_INFINITY;
+}
+
+/** fs 插件返回的 Uint8Array 转成独立 ArrayBuffer，避免 Blob 引用共享缓冲的偏移问题。 */
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer;
 }
 
 function isTauriDesktop() {
@@ -254,10 +263,11 @@ export function useRecorder() {
           let partialBlob: Blob | null = null;
           if (path) {
             try {
-              const bytes = await invoke<number[]>("read_recording", { path });
+              // fs 插件走二进制 raw 传输，长录音不会像 JSON 数组那样卡死 IPC。
+              const bytes = await readFile(path);
               // 44 字节是 WAV 头，超过说明有实际采样数据。
               if (bytes.length > 44) {
-                partialBlob = new Blob([new Uint8Array(bytes)], {
+                partialBlob = new Blob([toArrayBuffer(bytes)], {
                   type: "audio/wav",
                 });
                 void invoke("delete_recording_file", { path }).catch(
@@ -401,9 +411,9 @@ export function useRecorder() {
     if (nativePathRef.current) {
       const activePath = nativePathRef.current;
       return invoke<string>("stop_recording")
-        .then((path) => invoke<number[]>("read_recording", { path }))
+        .then((path) => readFile(path))
         .then((bytes) => {
-          const blob = new Blob([new Uint8Array(bytes)], { type: "audio/wav" });
+          const blob = new Blob([toArrayBuffer(bytes)], { type: "audio/wav" });
           setRecordedBlob(blob);
           setStatus("review");
           setIsPaused(false);

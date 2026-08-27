@@ -241,6 +241,51 @@ fn temp_recording_path() -> PathBuf {
     std::env::temp_dir().join(format!("gap-gone-{timestamp}.wav"))
 }
 
+/// 校验路径必须是系统 temp 目录下的 gap-gone-* 文件，
+/// 前端传来的任何读写路径都必须过这层校验，防止越权访问磁盘。
+fn validate_temp_recording_path(path: &str) -> Result<PathBuf, String> {
+    let candidate = PathBuf::from(path);
+    let temp_dir = std::env::temp_dir();
+    let file_name = candidate
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "录音文件路径无效".to_string())?;
+    if !file_name.starts_with("gap-gone-") || candidate.parent() != Some(temp_dir.as_path()) {
+        return Err("只能访问 Gap Gone 临时录音文件".to_string());
+    }
+    Ok(candidate)
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DenoiseFiles {
+    input_path: String,
+    output_path: String,
+}
+
+/// 降噪走「临时文件 + 路径传参」：前端把 WAV 写入 inputPath，
+/// Rust 读入处理、写出 outputPath，前端再读回。
+/// 避免大文件 Vec<u8> 走 JSON 数组序列化卡死 IPC。
+/// 路径由 Rust 生成，保证一定落在 temp 目录且带 gap-gone- 前缀。
+#[tauri::command]
+fn prepare_denoise_files() -> DenoiseFiles {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let temp_dir = std::env::temp_dir();
+    DenoiseFiles {
+        input_path: temp_dir
+            .join(format!("gap-gone-denoise-input-{timestamp}.wav"))
+            .to_string_lossy()
+            .to_string(),
+        output_path: temp_dir
+            .join(format!("gap-gone-denoise-output-{timestamp}.wav"))
+            .to_string_lossy()
+            .to_string(),
+    }
+}
+
 fn choose_device(device_id: Option<&str>) -> Result<(Device, String), String> {
     let mut devices = input_devices()?;
     if let Some(id) = device_id {
@@ -468,30 +513,8 @@ fn cancel_recording(
 }
 
 fn remove_recording_file(path: &str) -> Result<(), String> {
-    let candidate = PathBuf::from(path);
-    let temp_dir = std::env::temp_dir();
-    let file_name = candidate
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "录音文件路径无效".to_string())?;
-    if !file_name.starts_with("gap-gone-") || candidate.parent() != Some(temp_dir.as_path()) {
-        return Err("只能访问 Gap Gone 临时录音文件".to_string());
-    }
+    let candidate = validate_temp_recording_path(path)?;
     std::fs::remove_file(candidate).map_err(|error| format!("无法删除临时录音: {error}"))
-}
-
-#[tauri::command]
-fn read_recording(path: String) -> Result<Vec<u8>, String> {
-    let candidate = PathBuf::from(&path);
-    let temp_dir = std::env::temp_dir();
-    let file_name = candidate
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "录音文件路径无效".to_string())?;
-    if !file_name.starts_with("gap-gone-") || candidate.parent() != Some(temp_dir.as_path()) {
-        return Err("只能读取 Gap Gone 临时录音文件".to_string());
-    }
-    std::fs::read(candidate).map_err(|error| format!("无法读取录音文件: {error}"))
 }
 
 #[tauri::command]
@@ -503,10 +526,15 @@ fn delete_recording_file(path: String) -> Result<(), String> {
 fn denoise_audio(
     app: AppHandle,
     state: State<'_, RecordingManager>,
-    wav_bytes: Vec<u8>,
+    input_path: String,
+    output_path: String,
     preset: String,
-) -> Result<Vec<u8>, String> {
+) -> Result<(), String> {
     state.denoise_cancelled.store(false, Ordering::Relaxed);
+    let input_path = validate_temp_recording_path(&input_path)?;
+    let output_path = validate_temp_recording_path(&output_path)?;
+    let wav_bytes =
+        std::fs::read(&input_path).map_err(|error| format!("无法读取降噪输入: {error}"))?;
     let mut reader = hound::WavReader::new(std::io::Cursor::new(wav_bytes))
         .map_err(|error| format!("无法读取 WAV: {error}"))?;
     let input_spec = reader.spec();
@@ -561,7 +589,7 @@ fn denoise_audio(
     }
     enhanced.truncate(samples.len());
 
-    let output_path = temp_recording_path().with_file_name("gap-gone-denoised.wav");
+    // 结果直接写到前端提供的 temp 路径，由前端读回并负责清理。
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: 48_000,
@@ -578,9 +606,7 @@ fn denoise_audio(
     writer
         .finalize()
         .map_err(|error| format!("无法完成降噪结果: {error}"))?;
-    let result = std::fs::read(&output_path).map_err(|error| format!("无法读取降噪结果: {error}"));
-    let _ = std::fs::remove_file(output_path);
-    result
+    Ok(())
 }
 
 #[tauri::command]
@@ -608,7 +634,7 @@ pub fn run() {
             resume_recording,
             stop_recording,
             cancel_recording,
-            read_recording,
+            prepare_denoise_files,
             delete_recording_file,
             denoise_audio,
             cancel_denoise
