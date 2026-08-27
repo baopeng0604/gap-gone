@@ -1,6 +1,10 @@
 import React, { useEffect, useRef, memo } from "react";
 import { formatTimeCompact } from "../utils/timeUtils";
 import type { Region } from "../utils/regionUtils";
+import type { TranscriptWord } from "../utils/transcribe";
+
+/** 词带高度：有转录词时波形行下方多出一条文字带。 */
+const WORD_STRIP_HEIGHT = 26;
 
 interface WaveformRowProps {
   buffer: AudioBuffer;
@@ -221,6 +225,8 @@ interface ActiveWaveformRowProps extends WaveformRowProps {
   onRegionRemove: (start: number, end: number) => void;
   selection?: Region | null;
   onSelectionChange?: (selection: Region | null) => void;
+  /** 本行时间范围内的转录词（已由 WaveformScore 过滤）。 */
+  words?: TranscriptWord[] | null;
 }
 
 interface PeelEffect {
@@ -246,6 +252,7 @@ const WaveformRow = ({
   previewRegions = [],
   selection,
   onSelectionChange,
+  words = null,
 }: ActiveWaveformRowProps) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [dragState, setDragState] = React.useState<{
@@ -425,6 +432,27 @@ const WaveformRow = ({
         })
       : [];
 
+  // 词带布局：按时间戳换算 x 坐标，字距过密时按最小间距右移防重叠。
+  const wordItems = React.useMemo(() => {
+    if (!words || words.length === 0) return [];
+    const pxPerSec = width / (endTime - startTime);
+    let prevRight = -Infinity;
+    return words.map((word) => {
+      const rawLeft = (word.start - startTime) * pxPerSec;
+      // 估算字宽：全角 13px，半角 7.5px，最小 4px。
+      const estWidth = Array.from(word.text).reduce(
+        (acc, ch) => acc + (ch.charCodeAt(0) > 0xff ? 13 : 7.5),
+        4,
+      );
+      const left = Math.min(Math.max(rawLeft, prevRight + 1), width - 8);
+      prevRight = left + estWidth;
+      const mid = (word.start + word.end) / 2;
+      const deleted = regions.some((r) => mid >= r.start && mid < r.end);
+      const active = currentTime >= word.start && currentTime < word.end;
+      return { word, left, deleted, active };
+    });
+  }, [words, width, startTime, endTime, regions, currentTime]);
+
   return (
     <div
       ref={containerRef}
@@ -436,13 +464,18 @@ const WaveformRow = ({
       onContextMenu={(e) => e.preventDefault()} // Disable native context menu
       style={{
         width: width,
-        height: height,
+        height: height + (wordItems.length > 0 ? WORD_STRIP_HEIGHT : 0),
         position: "relative",
         cursor: editMode === "select" ? "pointer" : "crosshair",
         touchAction: "none",
       }}
     >
-      <div className="waveform-row-clip">
+      <div
+        className="waveform-row-clip"
+        style={{
+          bottom: wordItems.length > 0 ? WORD_STRIP_HEIGHT : 0,
+        }}
+      >
         <div className="row-time-label" style={{ zIndex: 10 }}>
           {formatTimeCompact(startTime)}
         </div>
@@ -609,6 +642,31 @@ const WaveformRow = ({
           <div className="region-peel-effect-shadow" />
         </div>
       ))}
+
+      {/* 词带：pointer-events 穿透，点击行为由行容器按位置处理
+          （seek 模式点击即跳转到对应时间，天然就是"点词跳转"）。 */}
+      {wordItems.length > 0 && (
+        <div
+          className="waveform-word-strip"
+          style={{ height: WORD_STRIP_HEIGHT }}
+        >
+          {wordItems.map((item, index) => (
+            <span
+              key={index}
+              className={[
+                "waveform-word",
+                item.active ? "waveform-word-active" : "",
+                item.deleted ? "waveform-word-deleted" : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              style={{ left: item.left }}
+            >
+              {item.word.text}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 };

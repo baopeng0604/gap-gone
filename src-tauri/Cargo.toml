@@ -27,6 +27,11 @@ tauri-plugin-fs = "2"
 cpal = "0.18.2"
 hound = "3.5.1"
 ndarray = "0.15"
+# SenseVoice 转录：官方 Rust binding，默认静态链接，
+# build.rs 按平台自动下载预编译 sherpa-onnx 库。
+sherpa-onnx = "1.13"
+# 模型文件下载（ModelScope/HuggingFace 单文件直下）。
+ureq = "2"
 df = { package = "deep_filter", git = "https://github.com/Rikorose/DeepFilterNet", rev = "d375b2d8309e0935d165700c91da9de862a99c31", features = ["tract", "default-model"] }
 tract-core = "=0.21.4"
 tract-data = "=0.21.4"

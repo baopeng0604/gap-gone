@@ -28,8 +28,8 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 ## 代码结构
 
 - `src/useRecorder.ts` — 录音 Hook。**双路径**：Tauri 桌面走原生命令（`start_recording` 等），浏览器/无命令时降级 Web Media API（getUserMedia + MediaRecorder）。改录音逻辑时两条路径都要考虑。
-- `src/App.tsx` — 主界面与状态编排；`src/components/` 波形/时间轴组件；`src/utils/` 音频分析（静音检测）、降噪、WAV 导出。
-- `src-tauri/src/lib.rs` — 全部原生命令与 cpal 录音流管理（`RecordingManager` 状态机）。
+- `src/App.tsx` — 主界面与状态编排；`src/components/` 波形/时间轴/转录面板组件；`src/utils/` 音频分析（静音检测）、降噪、转录、WAV 导出。
+- `src-tauri/src/lib.rs` — 录音相关原生命令与 cpal 录音流管理（`RecordingManager` 状态机）；`src-tauri/src/transcribe.rs` — SenseVoice 转录（模型下载 + `gap-gone-transcribe` 工作线程）。
 
 ## 关键领域概念
 
@@ -42,9 +42,10 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 3. **DeepFilterNet 降噪只接受 48 kHz 单声道 16-bit WAV**（`denoise_audio` 有校验）。采样率/声道不匹配由前端 `noiseReduction.ts` 的 `renderBuffer`（OfflineAudioContext）在处理前后做转换，不要把重采样塞进 Rust 侧。
 4. **临时录音文件命名约定 `gap-gone-*.wav` 且必须位于系统 temp 目录**。`validate_temp_recording_path`（被 `delete_recording_file` / `denoise_audio` 复用）依赖该前缀与父目录做安全校验，改命名前先改校验。降噪临时路径由 `prepare_denoise_files` 生成，保证前缀合法。
 5. **大文件禁止走 `Vec<u8>` 命令参数/返回值**。Tauri v2 自定义命令的参数走 JSON 数字数组序列化，长录音会卡死 IPC。一律走「临时文件 + 路径传参」：前端用 `@tauri-apps/plugin-fs` 的 `writeFile`/`readFile`（二进制 raw 传输），Rust 命令只收发路径字符串。capabilities 需含 `fs:allow-temp-read` / `fs:allow-temp-write`。
-6. **DfTract 不是 Send（内含 Rc），不能放进 Tauri State**。降噪模型常驻 `gap-gone-denoise` 工作线程并缓存复用；命令只投递 `DenoiseJob`。复用前必须 `init()` + `DFState::reset()` + `init_norm_states()` 重置流式状态，否则上一段音频的归一化状态会串扰下一段。
+6. **DfTract 不是 Send（内含 Rc），不能放进 Tauri State**。降噪模型常驻 `gap-gone-denoise` 工作线程并缓存复用；命令只投递 `DenoiseJob`。复用前必须 `init()` + `DFState::reset()` + `init_norm_states()` 重置流式状态，否则上一段音频的归一化状态会串扰下一段。SenseVoice 转录同理常驻 `gap-gone-transcribe` 线程。
 7. **设备选择用 cpal `Device::id()`（平台稳定 ID）**，不要用设备名——两台同名 USB 麦会选错。名称只做显示 label 和兜底匹配。
-8. 录音错误通过 Tauri 事件 `recording-error` 上报前端；电平通过 `recording-level` 上报；降噪进度通过 `denoise-progress` 上报（-1 表示正在加载模型）。
+8. **大模型不进安装包**。SenseVoice 模型（~230MB）运行时下载到 `app_data_dir/models/sense-voice/`（HF 主站 + hf-mirror 镜像，`.partial` 过渡文件），支持用户手动放置；`transcribe_model_status` 是唯一就绪判定。
+9. 录音错误通过 Tauri 事件 `recording-error` 上报前端；电平通过 `recording-level` 上报；降噪进度通过 `denoise-progress` 上报（-1 表示正在加载模型）；转录进度通过 `transcribe-progress` 上报（stage: download/load/transcribe）。
 
 ## 安全基线
 

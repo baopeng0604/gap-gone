@@ -21,6 +21,17 @@ import {
   cancelDeepFilterProcessing,
   type NoisePreset,
 } from "./utils/noiseReduction";
+import {
+  cancelTranscribe,
+  checkTranscribeModel,
+  downloadTranscribeModel,
+  isTauriDesktop,
+  onTranscribeProgress,
+  runTranscription,
+  type TranscriptResult,
+  type TranscribeProgress,
+} from "./utils/transcribe";
+import TranscriptPanel from "./components/TranscriptPanel";
 import { useRecorder } from "./useRecorder";
 import "./App.css";
 
@@ -96,6 +107,9 @@ function App() {
   const [isStartingRecording, setIsStartingRecording] = useState(false);
   const [denoisePreview, setDenoisePreview] = useState<AudioBuffer | null>(null);
   const [denoiseProgress, setDenoiseProgress] = useState<number | null>(null);
+  const [transcript, setTranscript] = useState<TranscriptResult | null>(null);
+  const [transcribeProgress, setTranscribeProgress] =
+    useState<TranscribeProgress | null>(null);
   const denoiseBaseRef = useRef<AudioBuffer | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -305,6 +319,7 @@ function App() {
       setAudioBuffer(decoded);
       originalBufferRef.current = decoded;
       setHasEnhancedAudio(false);
+      setTranscript(null);
       resetEditing();
     } catch {
       setNoiseNotice("无法解析音频文件");
@@ -493,6 +508,7 @@ function App() {
       setAudioBuffer(decoded);
       originalBufferRef.current = decoded;
       setHasEnhancedAudio(false);
+      setTranscript(null);
       resetEditing();
       recorder.clearReview();
     } catch {
@@ -531,6 +547,39 @@ function App() {
 
   const cancelDenoiseProcessing = async () => {
     await cancelDeepFilterProcessing();
+  };
+
+  const handleTranscribe = async () => {
+    if (!audioBuffer || !audioContextRef.current || !isTauriDesktop()) return;
+    stopPlayback(false);
+    setIsProcessing(true);
+    setTranscribeProgress({ stage: "load", percent: -1 });
+    const unlisten = await onTranscribeProgress(setTranscribeProgress);
+    try {
+      // 首次使用先下载模型（约 230MB），之后本地离线可用。
+      const status = await checkTranscribeModel();
+      if (!status.ready) {
+        setNoiseNotice("首次使用转录需下载 SenseVoice 模型（约 230MB），下载中…");
+        await downloadTranscribeModel();
+      }
+      const result = await runTranscription(audioBuffer);
+      setTranscript(result);
+      setNoiseNotice(
+        result.segments.length
+          ? `转录完成，共 ${result.segments.length} 句，波形下方显示逐字对照，点击可跳转`
+          : "转录完成，但没有识别到语音内容",
+      );
+    } catch (cause) {
+      setNoiseNotice(
+        String(cause).includes("取消")
+          ? "转录已取消"
+          : `转录失败：${cause instanceof Error ? cause.message : cause}`,
+      );
+    } finally {
+      unlisten();
+      setTranscribeProgress(null);
+      setIsProcessing(false);
+    }
   };
 
   const confirmNoiseReduction = () => {
@@ -927,6 +976,34 @@ function App() {
             恢复原始
           </button>
         </div>
+        {isTauriDesktop() && (
+          <>
+            <span className="toolbar-divider" aria-hidden="true" />
+            <div className="toolbar-group" aria-label="转录">
+              <button
+                onClick={() => void handleTranscribe()}
+                disabled={!audioBuffer || isProcessing}
+              >
+                转录文字
+              </button>
+              {transcribeProgress && (
+                <>
+                  <span className="denoise-progress">
+                    {transcribeProgress.stage === "download" &&
+                      `下载模型 ${Math.round(transcribeProgress.percent)}%`}
+                    {transcribeProgress.stage === "load" &&
+                      "正在加载转录模型…"}
+                    {transcribeProgress.stage === "transcribe" &&
+                      `转录 ${Math.round(transcribeProgress.percent)}%`}
+                  </span>
+                  <button onClick={() => void cancelTranscribe()}>
+                    取消转录
+                  </button>
+                </>
+              )}
+            </div>
+          </>
+        )}
         <span className="toolbar-divider" aria-hidden="true" />
         <div className="toolbar-group" aria-label="输出和帮助">
           <button onClick={handleExport} disabled={!audioBuffer || isProcessing}>
@@ -1159,11 +1236,22 @@ function App() {
             selection={selection}
             onSelectionChange={setSelection}
             previewRegions={detectedSilenceRegions}
+            words={transcript?.words ?? null}
           />
         ) : (
           <div className="empty-state">请打开音频或点击“录音”开始</div>
         )}
       </div>
+
+      {transcript && audioBuffer && (
+        <TranscriptPanel
+          segments={transcript.segments}
+          currentTime={currentTime}
+          deletedRegions={deletedRegions}
+          onSeek={handleSeek}
+          onClose={() => setTranscript(null)}
+        />
+      )}
 
       <HelpModal
         open={helpOpen}

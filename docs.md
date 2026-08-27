@@ -124,6 +124,56 @@ macOS 回归建议：正常录音→停止→试听、暂停/继续、录音中�
 
 DeepFilterNet3 主要面向人声背景噪声。它不是无损处理器，强度过高时可能产生金属音、吞字或过度抑制环境声。第一阶段不使用约 35 MB 的低延迟变体，因为当前目标是录音后的离线编辑。
 
+## 语音转录（SenseVoice）
+
+桌面端内置 SenseVoice-Small（int8）本地离线转录，经 sherpa-onnx 官方 Rust binding 接入，无需联网、无需 API key。支持中/英/日/韩/粤语自动识别，但**不做说话人分离**（多人对话不区分说话人）。
+
+点击工具栏「转录文字」开始：首次使用会先下载模型（约 230MB，显示下载进度），之后转录全程本地完成。转录结果以两种形态呈现：**每行波形下方的逐字词带**（字按时间戳与波形横向对齐，正在播放的字高亮，被切除区间覆盖的字划线置灰，点击对应位置即跳转——词带是"瞄准镜"，切除/恢复仍用拖拽工具画区间）和**波形下方的句子面板**（点击句子跳转，播放句高亮跟随，可导出 `.srt` 字幕和 `.txt` 文字稿）。转录锚定原始完整时间轴，切除/恢复不需要重跑。
+
+### 时间戳精度说明
+
+SenseVoice 是 CTC 架构，输出字级（中文）/子词级（英文）时间戳，分辨率约 60ms，典型偏差 ±100~200ms。适合"点字定位再听辨剪辑"，不适合当作精确切割点直接下刀。
+
+### 模型文件位置与手动下载
+
+模型目录（应用数据目录下的 `models/sense-voice/`）：
+
+- **Windows**：`C:\Users\<用户名>\AppData\Roaming\com.littlefean.gap-gone\models\sense-voice\`
+- **macOS**：`~/Library/Application Support/com.littlefean.gap-gone/models/sense-voice/`
+
+目录中需要两个文件（应用会自动检测，齐全即跳过下载）：
+
+| 文件 | 大小 | 说明 |
+|---|---|---|
+| `model.int8.onnx` | 约 229 MB | SenseVoice-Small int8 量化模型 |
+| `tokens.txt` | 约 309 KB | 词表 |
+
+**手动下载（国内网络推荐，走 hf-mirror 镜像）。Windows PowerShell：**
+
+```powershell
+$dir = "$env:APPDATA\com.littlefean.gap-gone\models\sense-voice"
+New-Item -ItemType Directory -Force $dir
+curl.exe -L -o "$dir\model.int8.onnx" "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/resolve/main/model.int8.onnx"
+curl.exe -L -o "$dir\tokens.txt" "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/resolve/main/tokens.txt"
+```
+
+**macOS 终端：**
+
+```bash
+dir="$HOME/Library/Application Support/com.littlefean.gap-gone/models/sense-voice"
+mkdir -p "$dir"
+curl -L -o "$dir/model.int8.onnx" "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/resolve/main/model.int8.onnx"
+curl -L -o "$dir/tokens.txt" "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/resolve/main/tokens.txt"
+```
+
+海外网络把 `hf-mirror.com` 换成 `huggingface.co` 即可（URL 其余部分不变）。也可以用浏览器打开上述链接下载，再把两个文件放进模型目录。
+
+### 实现要点
+
+- `src-tauri/src/transcribe.rs`：识别器常驻 `gap-gone-transcribe` 工作线程（模型只加载一次）；整段音频按 ~60s 在低能量点切块，块间汇报真实进度并检查取消标记；词级 token 按标点聚合成句子，滤除 `<|...|>` 元标签。
+- 下载：HuggingFace 主站 → hf-mirror 镜像依次尝试，先写 `.partial` 再改名，中途取消/断网不会留下半个文件被误判为已就绪。
+- 前端：`src/utils/transcribe.ts`（16 kHz 重采样 + 临时文件传参 + SRT/TXT 导出）、`src/components/TranscriptPanel.tsx`（句子面板）。
+
 ## 导出
 
 第一阶段只导出 48 kHz、单声道、16-bit PCM WAV。默认文件名带有精确到秒的日期时间前缀，例如 `20260823-233600-edited-audio.wav`，减少意外覆盖。后续如有发布需求，再增加 MP3 或 M4A/AAC，并单独评估编码质量与平台支持。

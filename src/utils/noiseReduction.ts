@@ -116,7 +116,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
  * 用 OfflineAudioContext 把音频重采样/ remix 到目标格式。
  * 格式已匹配时原样返回，不做无谓渲染。
  */
-async function renderBuffer(
+export async function renderBuffer(
   buffer: AudioBuffer,
   channels: number,
   sampleRate: number,

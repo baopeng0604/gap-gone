@@ -18,14 +18,20 @@ use ndarray::Array2;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod transcribe;
+
 #[derive(Default)]
-struct RecordingManager {
+pub(crate) struct RecordingManager {
     active: Mutex<Option<RecordingState>>,
     /// 与降噪工作线程共享的取消标记。
     denoise_cancelled: Arc<AtomicBool>,
     /// 降噪工作线程的任务入口。DfTract 含 Rc 不是 Send，
     /// 模型只能常驻该线程，首次降噪时惰性启动。
     denoise_tx: Mutex<Option<mpsc::Sender<DenoiseJob>>>,
+    /// 与转录工作线程共享的取消标记。
+    transcribe_cancelled: Arc<AtomicBool>,
+    /// 转录工作线程的任务入口（SenseVoice 识别器常驻该线程）。
+    transcribe_tx: Mutex<Option<mpsc::Sender<transcribe::TranscribeJob>>>,
 }
 
 /// 写入线程的指令。实时音频回调里只入队采样块，
@@ -255,7 +261,7 @@ fn temp_recording_path() -> PathBuf {
 
 /// 校验路径必须是系统 temp 目录下的 gap-gone-* 文件，
 /// 前端传来的任何读写路径都必须过这层校验，防止越权访问磁盘。
-fn validate_temp_recording_path(path: &str) -> Result<PathBuf, String> {
+pub(crate) fn validate_temp_recording_path(path: &str) -> Result<PathBuf, String> {
     let candidate = PathBuf::from(path);
     let temp_dir = std::env::temp_dir();
     let file_name = candidate
@@ -725,7 +731,12 @@ pub fn run() {
             prepare_denoise_files,
             delete_recording_file,
             denoise_audio,
-            cancel_denoise
+            cancel_denoise,
+            transcribe::transcribe_model_status,
+            transcribe::download_transcribe_model,
+            transcribe::prepare_transcribe_file,
+            transcribe::start_transcription,
+            transcribe::cancel_transcribe
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

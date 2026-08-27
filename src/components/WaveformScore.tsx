@@ -1,4 +1,5 @@
 import WaveformRow from "./WaveformRow";
+import type { TranscriptWord } from "../utils/transcribe";
 
 interface WaveformScoreProps {
   buffer: AudioBuffer;
@@ -12,6 +13,8 @@ interface WaveformScoreProps {
   selection?: { start: number; end: number } | null;
   onSelectionChange?: (selection: { start: number; end: number } | null) => void;
   previewRegions?: { start: number; end: number }[];
+  /** 字词级转录，贴在每行波形下方的词带。 */
+  words?: TranscriptWord[] | null;
 }
 
 const WaveformScore = ({
@@ -26,6 +29,7 @@ const WaveformScore = ({
   selection = null,
   onSelectionChange,
   previewRegions = [],
+  words = null,
 }: WaveformScoreProps) => {
   const duration = buffer.duration;
   const rowCount = Math.ceil(duration / secondsPerRow);
@@ -34,14 +38,9 @@ const WaveformScore = ({
   for (let i = 0; i < rowCount; i++) {
     const startTime = i * secondsPerRow;
     const endTime = Math.min((i + 1) * secondsPerRow, duration);
-
-    // Only pass currentTime if it's relevant to this row to avoid re-rendering
-    // all other rows?
-    // Actually, React will still diff the props.
-    // But since WaveformCanvas is memoized inside WaveformRow,
-    // and the Playhead logic inside WaveformRow is fast (div position),
-    // it should be fine to pass currentTime to all.
-    // The main heavy lifting (canvas drawing) is now skipped.
+    const rowWords = words
+      ? words.filter((word) => word.start < endTime && word.end > startTime)
+      : null;
 
     rows.push(
       <WaveformRow
@@ -58,6 +57,7 @@ const WaveformScore = ({
         selection={selection}
         onSelectionChange={onSelectionChange}
         previewRegions={previewRegions}
+        words={rowWords}
       />,
     );
   }
