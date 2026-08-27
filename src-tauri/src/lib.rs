@@ -21,7 +21,11 @@ use tauri::{AppHandle, Emitter, Manager, State};
 #[derive(Default)]
 struct RecordingManager {
     active: Mutex<Option<RecordingState>>,
-    denoise_cancelled: AtomicBool,
+    /// 与降噪工作线程共享的取消标记。
+    denoise_cancelled: Arc<AtomicBool>,
+    /// 降噪工作线程的任务入口。DfTract 含 Rc 不是 Send，
+    /// 模型只能常驻该线程，首次降噪时惰性启动。
+    denoise_tx: Mutex<Option<mpsc::Sender<DenoiseJob>>>,
 }
 
 /// 写入线程的指令。实时音频回调里只入队采样块，
@@ -75,7 +79,11 @@ struct RecordingErrorPayload {
     path: Option<String>,
 }
 
-fn input_devices() -> Result<Vec<(Device, String, bool)>, String> {
+/// 返回 (device, id, label, is_default)。
+/// id 使用 cpal DeviceId（WASAPI endpoint id / CoreAudio UID），
+/// 平台级稳定且唯一；两台同名 USB 麦也能区分。
+/// 个别后端拿不到 id 时退回设备名（有同名撞车风险，属兜底）。
+fn input_devices() -> Result<Vec<(Device, String, String, bool)>, String> {
     let host = cpal::default_host();
     let default_name = host
         .default_input_device()
@@ -89,8 +97,12 @@ fn input_devices() -> Result<Vec<(Device, String, bool)>, String> {
                 .description()
                 .map(|description| description.name().to_string())
                 .unwrap_or_else(|_| "未命名设备".to_string());
+            let id = device
+                .id()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|_| name.clone());
             let is_default = default_name.as_deref() == Some(name.as_str());
-            (device, name, is_default)
+            (device, id, name, is_default)
         })
         .collect::<Vec<_>>())
 }
@@ -99,8 +111,8 @@ fn input_devices() -> Result<Vec<(Device, String, bool)>, String> {
 fn list_audio_input_devices() -> Result<Vec<AudioDevice>, String> {
     Ok(input_devices()?
         .into_iter()
-        .map(|(_, label, is_default)| AudioDevice {
-            id: label.clone(),
+        .map(|(_, id, label, is_default)| AudioDevice {
+            id,
             label,
             is_default,
         })
@@ -289,18 +301,23 @@ fn prepare_denoise_files() -> DenoiseFiles {
 fn choose_device(device_id: Option<&str>) -> Result<(Device, String), String> {
     let mut devices = input_devices()?;
     if let Some(id) = device_id {
-        if let Some((device, name, _)) = devices.into_iter().find(|(_, name, _)| name == id) {
+        // 优先按稳定 id 匹配；兜底按名称匹配（兼容旧前端缓存的 name 型 id）。
+        if let Some(index) = devices
+            .iter()
+            .position(|(_, device_id, name, _)| device_id == id || name == id)
+        {
+            let (device, _, name, _) = devices.swap_remove(index);
             return Ok((device, name));
         }
         return Err("找不到所选录音设备".to_string());
     }
-    if let Some(index) = devices.iter().position(|(_, _, is_default)| *is_default) {
-        let (device, name, _) = devices.swap_remove(index);
+    if let Some(index) = devices.iter().position(|(_, _, _, is_default)| *is_default) {
+        let (device, _, name, _) = devices.swap_remove(index);
         return Ok((device, name));
     }
     devices
         .pop()
-        .map(|(device, name, _)| (device, name))
+        .map(|(device, _, name, _)| (device, name))
         .ok_or_else(|| "没有可用的录音设备".to_string())
 }
 
@@ -533,8 +550,62 @@ fn denoise_audio(
     state.denoise_cancelled.store(false, Ordering::Relaxed);
     let input_path = validate_temp_recording_path(&input_path)?;
     let output_path = validate_temp_recording_path(&output_path)?;
-    let wav_bytes =
-        std::fs::read(&input_path).map_err(|error| format!("无法读取降噪输入: {error}"))?;
+
+    // DfTract 内含 Rc，不是 Send，不能放进 Tauri State 跨线程共享。
+    // 因此模型常驻一个专用工作线程（gap-gone-denoise），命令只投递任务；
+    // 线程内缓存模型，避免每次降噪都花数秒重建 tract 运行时。
+    let tx = {
+        let mut guard = state
+            .denoise_tx
+            .lock()
+            .map_err(|_| "降噪状态不可用".to_string())?;
+        if guard.is_none() {
+            let (tx, rx) = mpsc::channel::<DenoiseJob>();
+            std::thread::Builder::new()
+                .name("gap-gone-denoise".to_string())
+                .spawn(move || denoise_worker(rx))
+                .map_err(|error| format!("无法启动降噪线程: {error}"))?;
+            *guard = Some(tx);
+        }
+        guard.as_ref().expect("降噪线程刚刚已启动").clone()
+    };
+    let (respond_tx, respond_rx) = mpsc::channel();
+    tx.send(DenoiseJob {
+        input_path,
+        output_path,
+        preset,
+        app,
+        cancelled: Arc::clone(&state.denoise_cancelled),
+        respond: respond_tx,
+    })
+    .map_err(|_| "降噪线程已退出".to_string())?;
+    match respond_rx.recv() {
+        Ok(result) => result,
+        Err(_) => Err("降噪线程没有响应".to_string()),
+    }
+}
+
+struct DenoiseJob {
+    input_path: PathBuf,
+    output_path: PathBuf,
+    preset: String,
+    app: AppHandle,
+    cancelled: Arc<AtomicBool>,
+    respond: mpsc::Sender<Result<(), String>>,
+}
+
+/// 降噪工作线程：独占 DfTract 实例，逐个处理投递来的任务。
+fn denoise_worker(rx: mpsc::Receiver<DenoiseJob>) {
+    let mut model: Option<DfTract> = None;
+    while let Ok(job) = rx.recv() {
+        let result = run_denoise_job(&mut model, &job);
+        let _ = job.respond.send(result);
+    }
+}
+
+fn run_denoise_job(model_slot: &mut Option<DfTract>, job: &DenoiseJob) -> Result<(), String> {
+    let wav_bytes = std::fs::read(&job.input_path)
+        .map_err(|error| format!("无法读取降噪输入: {error}"))?;
     let mut reader = hound::WavReader::new(std::io::Cursor::new(wav_bytes))
         .map_err(|error| format!("无法读取 WAV: {error}"))?;
     let input_spec = reader.spec();
@@ -557,20 +628,37 @@ fn denoise_audio(
             .collect::<Result<Vec<_>, _>>()?,
     };
 
-    let attenuation = match preset.as_str() {
+    let attenuation = match job.preset.as_str() {
         "light" => 12.0,
         "strong" => 100.0,
         _ => 24.0,
     };
-    let runtime = RuntimeParams::default_with_ch(1).with_atten_lim(attenuation);
-    let mut model = DfTract::new(DfParams::default(), &runtime)
-        .map_err(|error| format!("无法加载 DeepFilterNet3 模型: {error}"))?;
+    if model_slot.is_none() {
+        // 首次加载前通知前端，界面显示「正在加载模型」而不是卡在 0%。
+        let _ = job.app.emit("denoise-progress", -1.0f32);
+        *model_slot = Some(
+            DfTract::new(DfParams::default(), &RuntimeParams::default_with_ch(1))
+                .map_err(|error| format!("无法加载 DeepFilterNet3 模型: {error}"))?,
+        );
+    }
+    let model = model_slot.as_mut().expect("模型刚刚已加载");
+    model.set_atten_lim(attenuation);
+    // DfTract 是流式处理器，内部滚动缓冲与归一化状态会跨 process 调用累积。
+    // 复用前必须重置，否则上一段音频的状态会串到下一段开头。
+    model
+        .init()
+        .map_err(|error| format!("无法重置降噪模型状态: {error}"))?;
+    let nb_df = model.nb_df;
+    for df_state in &mut model.df_states {
+        df_state.reset();
+        df_state.init_norm_states(nb_df);
+    }
     let hop_size = model.hop_size;
     let mut enhanced = Vec::with_capacity(samples.len());
 
     let total_chunks = samples.chunks(hop_size).len().max(1);
     for (chunk_index, chunk) in samples.chunks(hop_size).enumerate() {
-        if state.denoise_cancelled.load(Ordering::Relaxed) {
+        if job.cancelled.load(Ordering::Relaxed) {
             return Err("降噪已取消".to_string());
         }
         let mut input = vec![0.0; hop_size];
@@ -582,7 +670,7 @@ fn denoise_audio(
             .process(input.view(), output.view_mut())
             .map_err(|error| format!("DeepFilterNet3 处理失败: {error}"))?;
         enhanced.extend(output.into_raw_vec());
-        let _ = app.emit(
+        let _ = job.app.emit(
             "denoise-progress",
             ((chunk_index + 1) as f32 / total_chunks as f32) * 100.0,
         );
@@ -596,7 +684,7 @@ fn denoise_audio(
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::create(&output_path, spec)
+    let mut writer = hound::WavWriter::create(&job.output_path, spec)
         .map_err(|error| format!("无法创建降噪结果: {error}"))?;
     for sample in enhanced {
         writer

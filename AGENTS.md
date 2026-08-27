@@ -42,7 +42,13 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 3. **DeepFilterNet 降噪只接受 48 kHz 单声道 16-bit WAV**（`denoise_audio` 有校验）。采样率/声道不匹配由前端 `noiseReduction.ts` 的 `renderBuffer`（OfflineAudioContext）在处理前后做转换，不要把重采样塞进 Rust 侧。
 4. **临时录音文件命名约定 `gap-gone-*.wav` 且必须位于系统 temp 目录**。`validate_temp_recording_path`（被 `delete_recording_file` / `denoise_audio` 复用）依赖该前缀与父目录做安全校验，改命名前先改校验。降噪临时路径由 `prepare_denoise_files` 生成，保证前缀合法。
 5. **大文件禁止走 `Vec<u8>` 命令参数/返回值**。Tauri v2 自定义命令的参数走 JSON 数字数组序列化，长录音会卡死 IPC。一律走「临时文件 + 路径传参」：前端用 `@tauri-apps/plugin-fs` 的 `writeFile`/`readFile`（二进制 raw 传输），Rust 命令只收发路径字符串。capabilities 需含 `fs:allow-temp-read` / `fs:allow-temp-write`。
-6. 录音错误通过 Tauri 事件 `recording-error` 上报前端；电平通过 `recording-level` 上报。
+6. **DfTract 不是 Send（内含 Rc），不能放进 Tauri State**。降噪模型常驻 `gap-gone-denoise` 工作线程并缓存复用；命令只投递 `DenoiseJob`。复用前必须 `init()` + `DFState::reset()` + `init_norm_states()` 重置流式状态，否则上一段音频的归一化状态会串扰下一段。
+7. **设备选择用 cpal `Device::id()`（平台稳定 ID）**，不要用设备名——两台同名 USB 麦会选错。名称只做显示 label 和兜底匹配。
+8. 录音错误通过 Tauri 事件 `recording-error` 上报前端；电平通过 `recording-level` 上报；降噪进度通过 `denoise-progress` 上报（-1 表示正在加载模型）。
+
+## 安全基线
+
+- `tauri.conf.json` 配了严格 CSP（生产）与 `devCsp`（开发，含 Vite HMR 的 ws 与内联脚本豁免）。注意：**只设 `csp` 不设 `devCsp` 时开发模式也会套用生产 CSP，会卡死 Vite HMR**。新增前端资源类型（外部字体、media 元素、wasm 等）时两个 CSP 都要同步评估。
 
 ## 跨平台与 CI
 

@@ -76,6 +76,12 @@ macOS 回归建议：正常录音→停止→试听、暂停/继续、录音中�
 - 新增 `.github/workflows/build-macos.yml`（macos-latest，Apple Silicon），与 Windows 流水线同结构（npm ci + rust-cache + tauri build），手动触发。改 df-tract/tract 等重依赖后两条流水线都要跑。
 - 注意：macOS 产物为 ad-hoc 签名，自用没问题；对外分发会被 Gatekeeper 拦截，需要另配 Apple 开发者证书与公证流程。
 
+**4. 三项细节优化（2026-08-27 晚）**
+
+- **CSP 安全基线**：`tauri.conf.json` 原为 `csp: null`。现配置生产严格 CSP（`script-src 'self'`、禁内联脚本）+ 独立 `devCsp`（放行 Vite HMR 的 `ws://localhost:1420` 与 React 内联 preamble）。注意 Tauri 规则：只设 `csp` 不设 `devCsp` 时开发模式会套用生产 CSP，HMR 直接挂掉。
+- **设备 ID 稳定化**：录音设备选择原先直接用设备名当 ID，Mac 上接两台同名 USB 麦会选错。现改用 cpal `Device::id()`（WASAPI endpoint ID / CoreAudio UID），名称只做显示与兜底匹配。
+- **DeepFilterNet 模型缓存**：`denoise_audio` 原先每次调用都重建 DfTract（解析 tract 图 + 初始化运行时，数秒等待）。由于 DfTract 内含 `Rc` 不是 `Send`，无法放进 Tauri State，现改为常驻 `gap-gone-denoise` 工作线程缓存复用，命令只投递任务。复用前通过 `init()` + `DFState::reset()` + `init_norm_states()` 重置流式状态，防止上一段音频的归一化状态串扰。首次加载时 Rust 发 `denoise-progress = -1`，前端显示「正在加载降噪模型…」而不是卡在 0%。
+
 ## 编辑语义
 
 波形每行表示 10 秒，默认窗口为 1200×800，单行波形宽度为 1000px。
@@ -97,6 +103,8 @@ macOS 回归建议：正常录音→停止→试听、暂停/继续、录音中�
 
 - `Space`：播放 / 暂停。播放中点击波形会跳转并继续播放，暂停时点击只移动播放头。
 - `D`：检测静音并生成候选预览。
+- `X`：切换到切除工具，再按一次返回默认（点按定位）模式。
+- `C`：切换到恢复工具，再按一次返回默认（点按定位）模式。
 - `R`：空闲时开始录音。
 - `Shift+R`：恢复最近一次已经应用的自动检测结果。
 - `P`：录音中暂停 / 继续。

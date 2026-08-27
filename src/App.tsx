@@ -613,12 +613,14 @@ function App() {
         return;
       }
 
-      const isRecordingShortcut = ["KeyP", "KeyR", "KeyS"].includes(
+      // 工具栏按钮点击后焦点留在按钮上，这些快捷键仍要生效，
+      // 因此焦点守卫只放行清单内的按键。
+      const isToolbarShortcut = ["KeyP", "KeyR", "KeyS", "KeyX", "KeyC"].includes(
         event.code,
       );
       if (
         target instanceof HTMLElement &&
-        !isRecordingShortcut &&
+        !isToolbarShortcut &&
         target.closest("select, button")
       ) {
         return;
@@ -682,6 +684,17 @@ function App() {
         event.preventDefault();
         handleDetectSilence();
       } else if (
+        (event.code === "KeyX" || event.code === "KeyC") &&
+        !hasPrimaryModifier &&
+        !event.shiftKey &&
+        audioBuffer &&
+        recorder.status !== "recording"
+      ) {
+        // X = 切除，C = 恢复；再按一次回到默认（点按定位）模式，与按钮行为一致。
+        event.preventDefault();
+        const tool: EditMode = event.code === "KeyX" ? "cut" : "restore";
+        setEditMode(editMode === tool ? "seek" : tool);
+      } else if (
         event.code === "KeyH" ||
         event.key === "?" ||
         (event.code === "Slash" && event.shiftKey)
@@ -700,6 +713,7 @@ function App() {
     audioBuffer,
     cancelRecordingCountdown,
     confirmRecording,
+    editMode,
     editState.autoRegions.length,
     handleExport,
     handleDetectSilence,
@@ -795,8 +809,9 @@ function App() {
             className={editMode === "cut" ? "btn-tool-active" : ""}
             onClick={() => setEditMode(editMode === "cut" ? "seek" : "cut")}
             disabled={!audioBuffer}
+            aria-keyshortcuts="X"
           >
-            切除
+            切除 <span className="shortcut-key">X</span>
           </button>
           <button
             className={editMode === "restore" ? "btn-tool-active" : ""}
@@ -804,8 +819,9 @@ function App() {
               setEditMode(editMode === "restore" ? "seek" : "restore")
             }
             disabled={!audioBuffer}
+            aria-keyshortcuts="C"
           >
-            恢复
+            恢复 <span className="shortcut-key">C</span>
           </button>
           <button onClick={undo} disabled={!history.length}>
             撤销 <span className="shortcut-key">⌘/Ctrl+Z</span>
@@ -886,7 +902,10 @@ function App() {
           {denoiseProgress !== null && (
             <>
               <span className="denoise-progress">
-                降噪 {Math.round(denoiseProgress)}%
+                {/* Rust 端首次加载模型时发 -1，之后才是真实百分比 */}
+                {denoiseProgress < 0
+                  ? "正在加载降噪模型…"
+                  : `降噪 ${Math.round(denoiseProgress)}%`}
               </span>
               <button onClick={() => void cancelDenoiseProcessing()}>
                 取消降噪

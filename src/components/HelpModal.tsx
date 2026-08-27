@@ -176,6 +176,12 @@ export default function HelpModal({
               <span className="help-modal-kbd">S</span>：停止录音
             </li>
             <li>
+              <span className="help-modal-kbd">X</span>：切换到切除工具（再按一次返回）
+            </li>
+            <li>
+              <span className="help-modal-kbd">C</span>：切换到恢复工具（再按一次返回）
+            </li>
+            <li>
               <span className="help-modal-kbd">⌘/Ctrl+Z</span>：撤销；
               <span className="help-modal-kbd">⌘/Ctrl+Shift+Z</span>：重做
             </li>
