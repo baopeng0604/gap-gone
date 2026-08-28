@@ -4,16 +4,21 @@
   min-height: 100vh; /* Allow growth */
   width: 100%; /* Fix horizontal scroll caused by 100vw */
   max-width: 100vw;
-  overflow-x: hidden;
+  /* 注意：这里必须用 clip 而不是 hidden——hidden 会创建滚动容器，
+     导致内部 sticky 元素（吸顶工具栏/吸底转录面板）失效 */
+  overflow-x: clip;
   background-color: #121212;
   color: #e0e0e0;
 }
 
-/* 转录文字面板 */
+/* 转录文字面板：吸底常驻，列表内部单独滚动 */
 .transcript-panel {
+  position: sticky;
+  bottom: 0.5rem;
+  z-index: 15;
   width: min(1000px, calc(100vw - 2rem));
   margin: 0.5rem auto 1.5rem;
-  background: rgba(30, 30, 30, 0.8);
+  background: rgba(30, 30, 30, 0.96);
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 8px;
   overflow: hidden;
@@ -94,9 +99,9 @@
 .waveform-word {
   position: absolute;
   top: 4px;
-  font-size: 12px;
-  line-height: 18px;
-  color: #9e9e9e;
+  font-size: 15px;
+  line-height: 22px;
+  color: #c8c8c8;
   white-space: nowrap;
 }
 
@@ -107,6 +112,13 @@
 .waveform-word-deleted {
   color: #555555;
   text-decoration: line-through;
+}
+
+.recording-glitch-hint {
+  font-size: 0.75rem;
+  color: #e6b84e;
+  font-weight: normal;
+  margin-left: 0.5rem;
 }
 
 .toolbar-time {
@@ -124,20 +136,22 @@
 }
 
 .controls {
-  position: fixed; /* Keep visible */
-  top: 2rem;
-  left: 50%;
+  /* 流式布局 + 吸顶：高度变化时下方内容自然下移，不再需要给波形/弹窗留写死的 padding/top */
+  position: sticky;
+  top: 0.5rem;
   display: flex;
   flex-direction: column;
   flex-wrap: wrap;
-  width: min(1000px, calc(100vw - 2rem));
+  /* 自适应宽度：内容少时维持 1000px 观感，按钮变多时整体加宽而不是换行 */
+  width: fit-content;
+  min-width: min(1000px, calc(100vw - 2rem));
   max-width: calc(100vw - 2rem);
+  margin: 0.5rem auto 0;
   gap: 0.3rem;
   align-items: center;
-  transform: translateX(-50%);
   box-sizing: border-box;
   z-index: 20;
-  background: rgba(30, 30, 30, 0.8);
+  background: rgba(30, 30, 30, 0.92);
   padding: 0.3rem;
   border-radius: 6px;
   backdrop-filter: blur(4px);
@@ -163,10 +177,10 @@
 }
 
 .controls button {
-  font-size: 0.8rem;
-  padding: 0.35rem 0.9rem;
-  /* outline: solid 1px red; */
+  font-size: 0.78rem;
+  padding: 0.32rem 0.6rem;
   line-height: 1.2;
+  white-space: nowrap;
 }
 
 .toolbar-group {
@@ -192,8 +206,25 @@
 .toolbar-divider {
   width: 1px;
   height: 22px;
-  margin: 0 0.15rem;
+  margin: 0;
   background: rgba(255, 255, 255, 0.22);
+}
+
+/* 窄屏渐进降级：先丢快捷键徽标，再丢分组标签，保持两行排布 */
+@media (max-width: 1120px) {
+  .controls .shortcut-key {
+    display: none;
+  }
+}
+
+@media (max-width: 960px) {
+  .controls .toolbar-label {
+    display: none;
+  }
+
+  .controls button {
+    padding: 0.3rem 0.45rem;
+  }
 }
 
 .noise-preset {
@@ -273,7 +304,6 @@
   overflow-x: auto;
   min-height: 0;
   padding: 1rem;
-  padding-top: 8.5rem; /* Space for the centered two-row toolbar */
   box-sizing: border-box;
 }
 
@@ -394,11 +424,12 @@ button:disabled {
 .recording-countdown,
 .inline-error,
 .inline-notice {
-  position: fixed;
-  left: 50%;
-  transform: translateX(-50%);
+  /* 流式卡片：跟在吸顶工具栏后面自然排布，不再用 fixed + 写死的 top */
+  position: relative;
+  margin: 0.75rem auto 0;
   z-index: 30;
   width: min(760px, calc(100vw - 2rem));
+  box-sizing: border-box;
   border: 1px solid #3e5d43;
   border-radius: 10px;
   background: rgba(30, 30, 30, 0.96);
@@ -406,7 +437,6 @@ button:disabled {
 }
 
 .recording-panel {
-  top: 8rem;
   padding: 1rem;
 }
 
@@ -421,7 +451,6 @@ button:disabled {
 }
 
 .recording-countdown {
-  top: 8rem;
   display: flex;
   align-items: center;
   padding: 1rem;
@@ -448,7 +477,6 @@ button:disabled {
 }
 
 .recording-setup {
-  top: 8rem;
   display: flex;
   align-items: center;
   gap: 0.65rem;
@@ -606,7 +634,6 @@ button:disabled {
 }
 
 .recording-review {
-  top: 8rem;
   padding: 0.75rem 1rem;
 }
 
@@ -617,7 +644,6 @@ button:disabled {
 
 .inline-error,
 .inline-notice {
-  top: 12.5rem;
   padding: 0.6rem 0.8rem;
   color: #f1d28a;
 }

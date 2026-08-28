@@ -664,9 +664,16 @@ function App() {
 
       // 工具栏按钮点击后焦点留在按钮上，这些快捷键仍要生效，
       // 因此焦点守卫只放行清单内的按键。
-      const isToolbarShortcut = ["KeyP", "KeyR", "KeyS", "KeyX", "KeyC"].includes(
-        event.code,
-      );
+      // Space 必须放行：否则焦点在按钮上时，浏览器默认行为会用空格
+      // 激活该按钮（曾导致按 Space 误触发「选择」而不是播放）。
+      const isToolbarShortcut = [
+        "KeyP",
+        "KeyR",
+        "KeyS",
+        "KeyX",
+        "KeyC",
+        "Space",
+      ].includes(event.code);
       if (
         target instanceof HTMLElement &&
         !isToolbarShortcut &&
@@ -924,7 +931,7 @@ function App() {
             onClick={restoreLastAutoDetection}
             disabled={!editState.autoRegions.length || isProcessing}
           >
-            恢复本次检测 <span className="shortcut-key">Shift+R</span>
+            恢复检测 <span className="shortcut-key">Shift+R</span>
           </button>
         </div>
         <span className="toolbar-divider" aria-hidden="true" />
@@ -1072,6 +1079,11 @@ function App() {
               {recorder.isPaused ? "已暂停" : "正在录音"}{" "}
               {formatTimeStandard(recorder.duration)}
             </strong>
+            {recorder.glitchCount > 0 && (
+              <span className="recording-glitch-hint">
+                采集毛刺 ×{recorder.glitchCount}（已自动忽略，不影响继续录音）
+              </span>
+            )}
             <label>
               输入设备
               <select

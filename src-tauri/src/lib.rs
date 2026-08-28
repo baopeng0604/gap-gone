@@ -3,7 +3,7 @@ use std::{
     io::BufWriter,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -75,6 +75,9 @@ struct RecordingStarted {
 struct RecordingLevel {
     rms: f32,
     peak: f32,
+    /// 截至目前被容忍的瞬时 underrun/overrun（Xrun）次数。
+    /// 这类毛刺只丢极少采样，不致命，不中断录音。
+    glitches: u32,
 }
 
 #[derive(Clone, Serialize)]
@@ -145,6 +148,7 @@ fn spawn_wav_writer(
     path: &PathBuf,
     spec: hound::WavSpec,
     sample_rate: u32,
+    glitches: Arc<AtomicUsize>,
 ) -> Result<mpsc::Sender<WriterCommand>, String> {
     let writer: hound::WavWriter<BufWriter<File>> = hound::WavWriter::create(path, spec)
         .map_err(|error| format!("无法创建临时录音文件: {error}"))?;
@@ -175,6 +179,7 @@ fn spawn_wav_writer(
                                 RecordingLevel {
                                     rms,
                                     peak: peak.min(1.0),
+                                    glitches: glitches.load(Ordering::Relaxed) as u32,
                                 },
                             );
                             sum_sq = 0.0;
@@ -237,9 +242,19 @@ fn recover_failed_recording(app: AppHandle, error: cpal::Error) {
 fn make_error_callback(
     app: AppHandle,
     errored: Arc<AtomicBool>,
+    glitches: Arc<AtomicUsize>,
 ) -> impl FnMut(cpal::Error) + Send + 'static {
     move |error: cpal::Error| {
-        // 音频线程上只做标记，清理交给独立线程。
+        // Xrun（buffer underrun/overrun）是瞬时毛刺：系统调度抖动、
+        // 杀毒扫描等都可能触发，丢的是极少量采样，流本身还活着。
+        // 只计数（由写入线程随电平事件上报），不拆录音。
+        // 上一版的「任何错误都回收」把它当成了致命错误，导致几分钟就断录。
+        if error.kind() == cpal::ErrorKind::Xrun {
+            glitches.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // 真致命错误（设备拔出、流失效等）：音频线程上只做标记，
+        // 清理交给独立线程。
         if errored.swap(true, Ordering::Relaxed) {
             return;
         }
@@ -371,7 +386,14 @@ fn start_recording(
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let writer_tx = spawn_wav_writer(app.clone(), &path, spec, config.sample_rate)?;
+    let glitches = Arc::new(AtomicUsize::new(0));
+    let writer_tx = spawn_wav_writer(
+        app.clone(),
+        &path,
+        spec,
+        config.sample_rate,
+        Arc::clone(&glitches),
+    )?;
     let errored = Arc::new(AtomicBool::new(false));
 
     let stream = match sample_format {
@@ -385,7 +407,7 @@ fn start_recording(
                     let _ = writer_tx.send(WriterCommand::Samples(mono));
                 }
             },
-            make_error_callback(app.clone(), Arc::clone(&errored)),
+            make_error_callback(app.clone(), Arc::clone(&errored), Arc::clone(&glitches)),
             None,
         ),
         SampleFormat::I16 => device.build_input_stream(
@@ -401,7 +423,7 @@ fn start_recording(
                     let _ = writer_tx.send(WriterCommand::Samples(mono));
                 }
             },
-            make_error_callback(app.clone(), Arc::clone(&errored)),
+            make_error_callback(app.clone(), Arc::clone(&errored), Arc::clone(&glitches)),
             None,
         ),
         SampleFormat::U16 => device.build_input_stream(
@@ -417,7 +439,7 @@ fn start_recording(
                     let _ = writer_tx.send(WriterCommand::Samples(mono));
                 }
             },
-            make_error_callback(app.clone(), Arc::clone(&errored)),
+            make_error_callback(app.clone(), Arc::clone(&errored), Arc::clone(&glitches)),
             None,
         ),
         other => return Err(format!("暂不支持录音格式 {other:?}")),

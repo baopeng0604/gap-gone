@@ -101,13 +101,6 @@ function formatSrtTime(seconds: number): string {
   return `${pad2(hours)}:${pad2(minutes)}:${pad2(secs)},${String(millis).padStart(3, "0")}`;
 }
 
-function formatClock(seconds: number): string {
-  const total = Math.max(0, Math.floor(seconds));
-  const minutes = Math.floor(total / 60);
-  const secs = total % 60;
-  return `${pad2(minutes)}:${pad2(secs)}`;
-}
-
 export function buildSrt(segments: TranscriptSegment[]): string {
   return segments
     .map(
@@ -118,9 +111,9 @@ export function buildSrt(segments: TranscriptSegment[]): string {
 }
 
 export function buildTxt(segments: TranscriptSegment[]): string {
-  return segments
-    .map((segment) => `[${formatClock(segment.start)}] ${segment.text}`)
-    .join("\n");
+  // 纯文字稿：整段文本，不带时间戳（按句分行仅为了阅读分段）。
+  // 带时间戳的逐段对照是 SRT 的职责。
+  return segments.map((segment) => segment.text).join("\n");
 }
 
 /** 导出字幕/文字稿，系统保存对话框选位置。返回是否成功保存。 */

@@ -38,7 +38,7 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 ## 硬约束（踩过坑的）
 
 1. **Windows WASAPI 共享模式只接受设备默认混音格式**。`start_recording` 不能改声道数/采样率，否则 `Initialize` 返回 `AUDCLNT_E_UNSUPPORTED_FORMAT`。多声道在回调里 `downmix_to_mono` 下混。macOS 上不少 USB 麦默认 44.1 kHz，同样不要改设备格式。
-2. **音频回调是实时线程**。不要在 cpal 回调里做磁盘 IO、锁竞争、跨进程 emit 等重活，否则 WASAPI 缓冲区超期（underrun/overrun，`AUDCLNT_E_BUFFER_ERROR`）。
+2. **音频回调是实时线程**。不要在 cpal 回调里做磁盘 IO、锁竞争、跨进程 emit 等重活，否则 WASAPI 缓冲区超期（underrun/overrun，`AUDCLNT_E_BUFFER_ERROR`）。**注意区分错误级别**：`ErrorKind::Xrun` 是瞬时毛刺（丢极少采样，流还活着），只计数上报（`recording-level.glitches`），绝不能拆流；只有设备拔出等致命错误才走回收流程。
 3. **DeepFilterNet 降噪只接受 48 kHz 单声道 16-bit WAV**（`denoise_audio` 有校验）。采样率/声道不匹配由前端 `noiseReduction.ts` 的 `renderBuffer`（OfflineAudioContext）在处理前后做转换，不要把重采样塞进 Rust 侧。
 4. **临时录音文件命名约定 `gap-gone-*.wav` 且必须位于系统 temp 目录**。`validate_temp_recording_path`（被 `delete_recording_file` / `denoise_audio` 复用）依赖该前缀与父目录做安全校验，改命名前先改校验。降噪临时路径由 `prepare_denoise_files` 生成，保证前缀合法。
 5. **大文件禁止走 `Vec<u8>` 命令参数/返回值**。Tauri v2 自定义命令的参数走 JSON 数字数组序列化，长录音会卡死 IPC。一律走「临时文件 + 路径传参」：前端用 `@tauri-apps/plugin-fs` 的 `writeFile`/`readFile`（二进制 raw 传输），Rust 命令只收发路径字符串。capabilities 需含 `fs:allow-temp-read` / `fs:allow-temp-write`。

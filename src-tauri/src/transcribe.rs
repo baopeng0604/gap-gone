@@ -370,10 +370,16 @@ fn collect_transcript(
         }
     }
 
-    // 句子聚合。
+    // 句子聚合：标点优先；口语化演讲常常整段无标点（实测一句话能超过 1 分钟），
+    // 所以加时长兜底——超过 8s 后在 >0.4s 的词间停顿处下刀，15s 硬切。
+    const SOFT_LIMIT_SECS: f32 = 8.0;
+    const HARD_LIMIT_SECS: f32 = 15.0;
+    const PAUSE_SPLIT_SECS: f32 = 0.4;
+
     let mut text = String::new();
     let mut start: Option<f32> = None;
     let mut last_ts = 0.0f32;
+    let mut prev_ts: Option<f32> = None;
     let mut flush = |text: &mut String, start: &mut Option<f32>, end: f32| {
         let trimmed = text.trim();
         if !trimmed.is_empty() {
@@ -388,11 +394,20 @@ fn collect_transcript(
     };
 
     for (token, ts) in &kept {
+        let gap = prev_ts.map(|p| ts - p).unwrap_or(0.0);
+        let segment_duration = start.map(|s| ts - s).unwrap_or(0.0);
+        let overtime = segment_duration > SOFT_LIMIT_SECS && gap > PAUSE_SPLIT_SECS;
+        let forced = segment_duration > HARD_LIMIT_SECS;
+        if !text.is_empty() && (overtime || forced) {
+            // 在当前词之前切开：上一段的结束取上一个词的时间。
+            flush(&mut text, &mut start, prev_ts.unwrap_or(*ts) + 0.3);
+        }
         if start.is_none() {
             start = Some(*ts);
         }
         text.push_str(token);
         last_ts = *ts;
+        prev_ts = Some(*ts);
         let is_sentence_end = token
             .chars()
             .last()

@@ -4,7 +4,7 @@ import type { Region } from "../utils/regionUtils";
 import type { TranscriptWord } from "../utils/transcribe";
 
 /** 词带高度：有转录词时波形行下方多出一条文字带。 */
-const WORD_STRIP_HEIGHT = 26;
+const WORD_STRIP_HEIGHT = 32;
 
 interface WaveformRowProps {
   buffer: AudioBuffer;
@@ -439,10 +439,10 @@ const WaveformRow = ({
     let prevRight = -Infinity;
     return words.map((word) => {
       const rawLeft = (word.start - startTime) * pxPerSec;
-      // 估算字宽：全角 13px，半角 7.5px，最小 4px。
+      // 估算字宽：全角 16px，半角 9px，最小 5px。
       const estWidth = Array.from(word.text).reduce(
-        (acc, ch) => acc + (ch.charCodeAt(0) > 0xff ? 13 : 7.5),
-        4,
+        (acc, ch) => acc + (ch.charCodeAt(0) > 0xff ? 16 : 9),
+        5,
       );
       const left = Math.min(Math.max(rawLeft, prevRight + 1), width - 8);
       prevRight = left + estWidth;

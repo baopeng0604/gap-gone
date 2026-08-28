@@ -52,6 +52,7 @@ export function useRecorder() {
   const [level, setLevel] = useState<MonitorLevel>(emptyLevel);
   const [peakHoldDb, setPeakHoldDb] = useState(Number.NEGATIVE_INFINITY);
   const [clipLatched, setClipLatched] = useState(false);
+  const [glitchCount, setGlitchCount] = useState(0);
   const [status, setStatus] = useState<RecorderStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
@@ -230,6 +231,7 @@ export function useRecorder() {
     pausedRef.current = false;
     pausedAtRef.current = null;
     pausedDurationRef.current = 0;
+    setGlitchCount(0);
     stopMeter();
     if (isTauriDesktop()) {
       try {
@@ -237,9 +239,11 @@ export function useRecorder() {
           deviceId: selectedDeviceId || null,
         });
         nativePathRef.current = result.path;
-        nativeUnlistenRef.current = await listen<{ rms: number; peak: number }>(
-          "recording-level",
-          (event) => {
+        nativeUnlistenRef.current = await listen<{
+          rms: number;
+          peak: number;
+          glitches?: number;
+        }>("recording-level", (event) => {
             if (pausedRef.current) return;
             const rmsDb = toDb(event.payload.rms);
             const peakDb = toDb(event.payload.peak);
@@ -251,6 +255,8 @@ export function useRecorder() {
             });
             setPeakHoldDb((current) => Math.max(current, peakDb));
             if (event.payload.peak >= 0.999) setClipLatched(true);
+            // Xrun 毛刺计数：瞬时缓冲抖动不致命，只提示不中断。
+            setGlitchCount(event.payload.glitches ?? 0);
           },
         );
         // Rust 端录音流出错（WASAPI underrun/overrun、设备拔出等）时会回收流，
@@ -444,6 +450,15 @@ export function useRecorder() {
     });
   }, [cleanupNative, recordedBlob, stopMeter]);
 
+  // 最长录制时长：15 分钟。超时自动停止并保留已录内容（走正常停止流程），
+  // 双路径（原生/Web Media）共用这一道闸门。
+  const MAX_RECORDING_SECONDS = 15 * 60;
+  useEffect(() => {
+    if (status !== "recording" || duration < MAX_RECORDING_SECONDS) return;
+    setError("已到达最长录制时长 15 分钟，录音已自动停止并保留");
+    void stopRecording();
+  }, [duration, status, stopRecording]);
+
   const pauseRecording = useCallback(async () => {
     if (status !== "recording" || pausedRef.current) return;
 
@@ -530,6 +545,7 @@ export function useRecorder() {
     level,
     peakHoldDb,
     clipLatched,
+    glitchCount,
     clearClip,
     status,
     error,
