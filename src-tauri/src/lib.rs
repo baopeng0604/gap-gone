@@ -32,6 +32,8 @@ pub(crate) struct RecordingManager {
     transcribe_cancelled: Arc<AtomicBool>,
     /// 转录工作线程的任务入口（SenseVoice 识别器常驻该线程）。
     transcribe_tx: Mutex<Option<mpsc::Sender<transcribe::TranscribeJob>>>,
+    /// 自定义模型目录（设置页可改）；None = 应用数据目录默认值。
+    transcribe_model_dir: Mutex<Option<PathBuf>>,
 }
 
 /// 写入线程的指令。实时音频回调里只入队采样块，
@@ -758,7 +760,10 @@ pub fn run() {
             transcribe::download_transcribe_model,
             transcribe::prepare_transcribe_file,
             transcribe::start_transcription,
-            transcribe::cancel_transcribe
+            transcribe::cancel_transcribe,
+            transcribe::get_transcribe_model_dir,
+            transcribe::set_transcribe_model_dir,
+            transcribe::open_transcribe_model_dir
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

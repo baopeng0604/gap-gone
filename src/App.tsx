@@ -25,9 +25,16 @@ import {
   cancelTranscribe,
   checkTranscribeModel,
   downloadTranscribeModel,
+  getAutoTranscribe,
+  getCustomModelDir,
+  getTranscribeModelDir,
   isTauriDesktop,
   onTranscribeProgress,
+  openTranscribeModelDir,
   runTranscription,
+  setAutoTranscribe,
+  setCustomModelDir,
+  setTranscribeModelDir,
   type TranscriptResult,
   type TranscribeProgress,
 } from "./utils/transcribe";
@@ -101,6 +108,10 @@ function App() {
     useState<SilencePreset>("natural");
   const [hasEnhancedAudio, setHasEnhancedAudio] = useState(false);
   const [showRecordingSetup, setShowRecordingSetup] = useState(false);
+  const [modelDirInput, setModelDirInput] = useState("");
+  const [autoTranscribeEnabled, setAutoTranscribeEnabled] = useState(
+    getAutoTranscribe(),
+  );
   const [recordingCountdown, setRecordingCountdown] = useState<number | null>(
     null,
   );
@@ -119,6 +130,8 @@ function App() {
   const animationFrameRef = useRef<number | null>(null);
   const recordingCountdownRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const waveformViewRef = useRef<HTMLDivElement>(null);
+  const followRowRef = useRef(-1);
   const playbackRef = useRef<{
     token: number;
     segments: Region[];
@@ -162,6 +175,38 @@ function App() {
       document.removeEventListener("contextmenu", preventContextMenu);
     };
   }, []);
+
+  // 应用启动时把 localStorage 里的自定义模型目录同步给 Rust；
+  // 打开设置页时拉取当前生效目录用于展示。
+  useEffect(() => {
+    if (!isTauriDesktop()) return;
+    const custom = getCustomModelDir();
+    if (custom) void setTranscribeModelDir(custom).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (!showRecordingSetup || !isTauriDesktop()) return;
+    void getTranscribeModelDir().then(setModelDirInput).catch(() => undefined);
+  }, [showRecordingSetup]);
+
+  // 播放光标跟随：播放头所在行滚出可视区时，把它拉回视口中间；
+  // 行仍可见时不动（不打断用户自己浏览）。
+  useEffect(() => {
+    if (!isPlaying || !audioBuffer) return;
+    const rowIndex = Math.floor(currentTime / 10);
+    if (rowIndex === followRowRef.current) return;
+    followRowRef.current = rowIndex;
+    const container =
+      waveformViewRef.current?.querySelector(".waveform-score-container");
+    const row = container?.children[rowIndex] as HTMLElement | undefined;
+    if (!row) return;
+    const rect = row.getBoundingClientRect();
+    // 顶部给吸顶工具栏留 ~110px，底部到视口边缘。
+    const visible = rect.top >= 110 && rect.bottom <= window.innerHeight;
+    if (!visible) {
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  }, [currentTime, isPlaying, audioBuffer]);
 
   const setPosition = useCallback((position: number) => {
     currentTimeRef.current = position;
@@ -511,6 +556,11 @@ function App() {
       setTranscript(null);
       resetEditing();
       recorder.clearReview();
+      // 设置页「自动转录」开启时，确定编辑后自动开始转录。
+      // 注意必须传 decoded：audioBuffer 状态此刻尚未更新。
+      if (autoTranscribeEnabled) {
+        void handleTranscribe(decoded);
+      }
     } catch {
       setNoiseNotice("无法解析这段录音");
     } finally {
@@ -549,8 +599,9 @@ function App() {
     await cancelDeepFilterProcessing();
   };
 
-  const handleTranscribe = async () => {
-    if (!audioBuffer || !audioContextRef.current || !isTauriDesktop()) return;
+  const handleTranscribe = async (source?: AudioBuffer) => {
+    const target = source ?? audioBuffer;
+    if (!target || !audioContextRef.current || !isTauriDesktop()) return;
     stopPlayback(false);
     setIsProcessing(true);
     setTranscribeProgress({ stage: "load", percent: -1 });
@@ -562,7 +613,7 @@ function App() {
         setNoiseNotice("首次使用转录需下载 SenseVoice 模型（约 230MB），下载中…");
         await downloadTranscribeModel();
       }
-      const result = await runTranscription(audioBuffer);
+      const result = await runTranscription(target);
       setTranscript(result);
       setNoiseNotice(
         result.segments.length
@@ -672,6 +723,9 @@ function App() {
         "KeyS",
         "KeyX",
         "KeyC",
+        "KeyN",
+        "KeyT",
+        "KeyB",
         "Space",
       ].includes(event.code);
       if (
@@ -750,6 +804,37 @@ function App() {
         event.preventDefault();
         const tool: EditMode = event.code === "KeyX" ? "cut" : "restore";
         setEditMode(editMode === tool ? "seek" : tool);
+      } else if (
+        event.code === "KeyN" &&
+        !hasPrimaryModifier &&
+        audioBuffer &&
+        !isProcessing &&
+        recorder.status !== "recording"
+      ) {
+        // N = 一键降噪
+        event.preventDefault();
+        void handleNoiseReduction();
+      } else if (
+        event.code === "KeyT" &&
+        !hasPrimaryModifier &&
+        audioBuffer &&
+        !isProcessing &&
+        recorder.status !== "recording" &&
+        isTauriDesktop()
+      ) {
+        // T = 转录文字
+        event.preventDefault();
+        void handleTranscribe();
+      } else if (
+        event.code === "KeyB" &&
+        !hasPrimaryModifier &&
+        hasEnhancedAudio &&
+        !isProcessing &&
+        recorder.status !== "recording"
+      ) {
+        // B = 恢复原始（撤回已确认的降噪版本）
+        event.preventDefault();
+        restoreOriginal();
       } else if (
         event.code === "KeyH" ||
         event.key === "?" ||
@@ -836,7 +921,7 @@ function App() {
             onClick={() => setShowRecordingSetup((visible) => !visible)}
             disabled={recordingCountdown !== null || isStartingRecording}
           >
-            录音设置
+            设置
           </button>
         </div>
         <span className="toolbar-divider" aria-hidden="true" />
@@ -953,7 +1038,7 @@ function App() {
             onClick={() => void handleNoiseReduction()}
             disabled={!audioBuffer || isProcessing}
           >
-            一键降噪
+            一键降噪 <span className="shortcut-key">N</span>
           </button>
           {denoiseProgress !== null && (
             <>
@@ -980,7 +1065,7 @@ function App() {
             </>
           )}
           <button onClick={restoreOriginal} disabled={!hasEnhancedAudio}>
-            恢复原始
+            恢复原始 <span className="shortcut-key">B</span>
           </button>
         </div>
         {isTauriDesktop() && (
@@ -991,7 +1076,7 @@ function App() {
                 onClick={() => void handleTranscribe()}
                 disabled={!audioBuffer || isProcessing}
               >
-                转录文字
+                转录文字 <span className="shortcut-key">T</span>
               </button>
               {transcribeProgress && (
                 <>
@@ -1046,27 +1131,76 @@ function App() {
         recorder.status !== "recording" &&
         recordingCountdown === null && (
         <section className="recording-setup">
-          <label>
-            录音设备
-            <select
-              value={recorder.selectedDeviceId}
-              onChange={(event) =>
-                recorder.setSelectedDeviceId(event.target.value)
-              }
-            >
-              {recorder.devices.length === 0 && (
-                <option value="">点击刷新设备列表</option>
-              )}
-              {recorder.devices.map((device) => (
-                <option key={device.deviceId} value={device.deviceId}>
-                  {device.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <button onClick={() => void recorder.refreshDevices()}>刷新</button>
-          <button onClick={() => setShowRecordingSetup(false)}>确定</button>
-          <small>录音格式：48 kHz / mono / PCM WAV</small>
+          <div className="setup-row">
+            <label>
+              录音设备
+              <select
+                value={recorder.selectedDeviceId}
+                onChange={(event) =>
+                  recorder.setSelectedDeviceId(event.target.value)
+                }
+              >
+                {recorder.devices.length === 0 && (
+                  <option value="">点击刷新设备列表</option>
+                )}
+                {recorder.devices.map((device) => (
+                  <option key={device.deviceId} value={device.deviceId}>
+                    {device.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button onClick={() => void recorder.refreshDevices()}>刷新</button>
+          </div>
+          {isTauriDesktop() && (
+            <>
+              <div className="setup-row">
+                <label className="setup-grow">
+                  转录模型目录
+                  <input
+                    type="text"
+                    value={modelDirInput}
+                    placeholder="默认：应用数据目录/models/sense-voice"
+                    onChange={(event) => setModelDirInput(event.target.value)}
+                  />
+                </label>
+                <button
+                  onClick={() => {
+                    const value = modelDirInput.trim();
+                    setCustomModelDir(value || null);
+                    void setTranscribeModelDir(value || null).catch(() =>
+                      setNoiseNotice("模型目录保存失败"),
+                    );
+                  }}
+                >
+                  保存
+                </button>
+                <button
+                  onClick={() => void openTranscribeModelDir()}
+                  title="在文件管理器中打开模型目录"
+                >
+                  打开目录
+                </button>
+              </div>
+              <div className="setup-row">
+                <label className="setup-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={autoTranscribeEnabled}
+                    onChange={(event) => {
+                      setAutoTranscribeEnabled(event.target.checked);
+                      setAutoTranscribe(event.target.checked);
+                    }}
+                  />
+                  录音确定编辑后自动转录
+                </label>
+              </div>
+            </>
+          )}
+          <div className="setup-row">
+            <small>录音格式：48 kHz / mono / PCM WAV</small>
+            <button onClick={() => setShowRecordingSetup(false)}>确定</button>
+          </div>
         </section>
         )}
 
@@ -1229,7 +1363,7 @@ function App() {
         </div>
       )}
 
-      <div className="waveform-view">
+      <div className="waveform-view" ref={waveformViewRef}>
         {isProcessing && (
           <div className="loading-overlay">
             <div className="spinner" />

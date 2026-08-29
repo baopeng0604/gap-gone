@@ -17,6 +17,7 @@ use std::{
 use serde::Serialize;
 use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_opener::OpenerExt;
 
 use crate::{validate_temp_recording_path, RecordingManager};
 
@@ -81,11 +82,57 @@ pub struct TranscribeJob {
     pub respond: mpsc::Sender<Result<TranscriptResult, String>>,
 }
 
-fn model_dir(app: &AppHandle) -> Result<PathBuf, String> {
+/// 模型目录：用户自定义优先（RecordingManager.transcribe_model_dir），
+/// 默认应用数据目录 models/sense-voice。
+fn model_dir(app: &AppHandle, state: &State<'_, RecordingManager>) -> Result<PathBuf, String> {
+    if let Some(custom) = state
+        .transcribe_model_dir
+        .lock()
+        .map_err(|_| "模型路径状态不可用".to_string())?
+        .clone()
+    {
+        return Ok(custom);
+    }
     app.path()
         .app_data_dir()
         .map(|dir| dir.join("models").join("sense-voice"))
         .map_err(|error| format!("无法定位应用数据目录: {error}"))
+}
+
+/// 当前生效的模型目录（自定义或默认）。
+#[tauri::command]
+pub fn get_transcribe_model_dir(
+    app: AppHandle,
+    state: State<'_, RecordingManager>,
+) -> Result<String, String> {
+    model_dir(&app, &state).map(|dir| dir.to_string_lossy().to_string())
+}
+
+/// 设置自定义模型目录；传 None 恢复默认。
+#[tauri::command]
+pub fn set_transcribe_model_dir(
+    state: State<'_, RecordingManager>,
+    path: Option<String>,
+) -> Result<(), String> {
+    let mut guard = state
+        .transcribe_model_dir
+        .lock()
+        .map_err(|_| "模型路径状态不可用".to_string())?;
+    *guard = path.filter(|p| !p.trim().is_empty()).map(PathBuf::from);
+    Ok(())
+}
+
+/// 在系统文件管理器中打开模型目录（不存在则先创建）。
+#[tauri::command]
+pub fn open_transcribe_model_dir(
+    app: AppHandle,
+    state: State<'_, RecordingManager>,
+) -> Result<(), String> {
+    let dir = model_dir(&app, &state)?;
+    fs::create_dir_all(&dir).map_err(|error| format!("无法创建模型目录: {error}"))?;
+    app.opener()
+        .open_path(dir.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|error| format!("无法打开模型目录: {error}"))
 }
 
 fn emit_progress(app: &AppHandle, stage: &str, percent: f32) {
@@ -99,8 +146,11 @@ fn emit_progress(app: &AppHandle, stage: &str, percent: f32) {
 }
 
 #[tauri::command]
-pub fn transcribe_model_status(app: AppHandle) -> Result<TranscribeModelStatus, String> {
-    let dir = model_dir(&app)?;
+pub fn transcribe_model_status(
+    app: AppHandle,
+    state: State<'_, RecordingManager>,
+) -> Result<TranscribeModelStatus, String> {
+    let dir = model_dir(&app, &state)?;
     let missing = [MODEL_ONNX, TOKENS_TXT]
         .iter()
         .filter(|name| !dir.join(name).is_file())
@@ -199,7 +249,7 @@ pub fn download_transcribe_model(
     state: State<'_, RecordingManager>,
 ) -> Result<String, String> {
     state.transcribe_cancelled.store(false, Ordering::Relaxed);
-    let dir = model_dir(&app)?;
+    let dir = model_dir(&app, &state)?;
     fs::create_dir_all(&dir).map_err(|error| format!("无法创建模型目录: {error}"))?;
     // tokens.txt 只有几百 KB，给它 1% 进度区间；大头是 229MB 的 onnx。
     download_file(
@@ -248,7 +298,7 @@ pub fn start_transcription(
 ) -> Result<TranscriptResult, String> {
     state.transcribe_cancelled.store(false, Ordering::Relaxed);
     let input_path = validate_temp_recording_path(&input_path)?;
-    let dir = model_dir(&app)?;
+    let dir = model_dir(&app, &state)?;
     if !dir.join(MODEL_ONNX).is_file() || !dir.join(TOKENS_TXT).is_file() {
         return Err("转录模型尚未下载".to_string());
     }

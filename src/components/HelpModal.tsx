@@ -200,6 +200,11 @@ export default function HelpModal({
               <span className="help-modal-kbd">C</span>：切换到恢复工具（再按一次返回）
             </li>
             <li>
+              <span className="help-modal-kbd">N</span>：一键降噪；
+              <span className="help-modal-kbd">B</span>：恢复原始；
+              <span className="help-modal-kbd">T</span>：转录文字
+            </li>
+            <li>
               <span className="help-modal-kbd">⌘/Ctrl+Z</span>：撤销；
               <span className="help-modal-kbd">⌘/Ctrl+Shift+Z</span>：重做
             </li>

@@ -50,6 +50,43 @@ export function checkTranscribeModel(): Promise<TranscribeModelStatus> {
   return invoke<TranscribeModelStatus>("transcribe_model_status");
 }
 
+/** 当前生效的模型目录（自定义优先，否则应用数据目录默认值）。 */
+export function getTranscribeModelDir(): Promise<string> {
+  return invoke<string>("get_transcribe_model_dir");
+}
+
+/** 设置自定义模型目录；传 null 恢复默认。 */
+export function setTranscribeModelDir(path: string | null): Promise<void> {
+  return invoke("set_transcribe_model_dir", { path });
+}
+
+/** 在系统文件管理器中打开模型目录。 */
+export function openTranscribeModelDir(): Promise<void> {
+  return invoke("open_transcribe_model_dir");
+}
+
+/** 自动转录开关（localStorage，默认开）。 */
+export function getAutoTranscribe(): boolean {
+  return localStorage.getItem("gap-gone-auto-transcribe") !== "0";
+}
+
+export function setAutoTranscribe(enabled: boolean) {
+  localStorage.setItem("gap-gone-auto-transcribe", enabled ? "1" : "0");
+}
+
+/** 自定义模型目录（localStorage 持久化，应用启动时同步到 Rust 侧）。 */
+export function getCustomModelDir(): string | null {
+  return localStorage.getItem("gap-gone-model-dir");
+}
+
+export function setCustomModelDir(path: string | null) {
+  if (path && path.trim()) {
+    localStorage.setItem("gap-gone-model-dir", path.trim());
+  } else {
+    localStorage.removeItem("gap-gone-model-dir");
+  }
+}
+
 export function downloadTranscribeModel(): Promise<string> {
   return invoke<string>("download_transcribe_model");
 }
