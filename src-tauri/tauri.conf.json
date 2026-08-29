@@ -14,9 +14,9 @@
     "windows": [
       {
         "title": "Gap Gone",
-        "width": 1200,
+        "width": 1280,
         "height": 800,
-        "minWidth": 1000,
+        "minWidth": 1100,
         "minHeight": 600
       }
     ],

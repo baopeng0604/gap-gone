@@ -39,6 +39,7 @@ import {
   type TranscribeProgress,
 } from "./utils/transcribe";
 import TranscriptPanel from "./components/TranscriptPanel";
+import WaveSidebar from "./components/WaveSidebar";
 import { useRecorder } from "./useRecorder";
 import "./App.css";
 
@@ -119,8 +120,14 @@ function App() {
   const [denoisePreview, setDenoisePreview] = useState<AudioBuffer | null>(null);
   const [denoiseProgress, setDenoiseProgress] = useState<number | null>(null);
   const [transcript, setTranscript] = useState<TranscriptResult | null>(null);
+  // 转录面板显隐与转录数据分离：关闭面板不丢数据，可在设置里重新打开。
+  const [transcriptVisible, setTranscriptVisible] = useState(true);
   const [transcribeProgress, setTranscribeProgress] =
     useState<TranscribeProgress | null>(null);
+  const [playbackLevel, setPlaybackLevel] = useState<{
+    rmsDb: number;
+    peakDb: number;
+  } | null>(null);
   const denoiseBaseRef = useRef<AudioBuffer | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -140,6 +147,7 @@ function App() {
     sourceStartedAt: number;
     sourceOffset: number;
   } | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
   const recorder = useRecorder();
   const deletedRegions = useMemo(
     () =>
@@ -155,6 +163,11 @@ function App() {
       window.AudioContext || (window as typeof window & { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     const context = new AudioContextConstructor();
     audioContextRef.current = context;
+    // 常驻分析节点：所有播放都路由经过它，供右侧音量刻度图读取实时电平。
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.connect(context.destination);
+    analyserRef.current = analyser;
     const preventContextMenu = (event: MouseEvent) => event.preventDefault();
     document.addEventListener("contextmenu", preventContextMenu);
 
@@ -189,24 +202,23 @@ function App() {
     void getTranscribeModelDir().then(setModelDirInput).catch(() => undefined);
   }, [showRecordingSetup]);
 
-  // 播放光标跟随：播放头所在行滚出可视区时，把它拉回视口中间；
-  // 行仍可见时不动（不打断用户自己浏览）。
+  // 换音频后重置跟随行，保证新文件从第 0 行也能触发滚动。
   useEffect(() => {
-    if (!isPlaying || !audioBuffer) return;
+    followRowRef.current = -1;
+  }, [audioBuffer]);
+
+  // 播放跟随：当前行变化时（含点击转录句/波形跳转），把该行滚动到视口居中，
+  // 上一行/下一行同时可见，方便对照调整；行索引不变时早退，不打断手动浏览。
+  useEffect(() => {
+    if (!audioBuffer) return;
     const rowIndex = Math.floor(currentTime / 10);
     if (rowIndex === followRowRef.current) return;
     followRowRef.current = rowIndex;
     const container =
       waveformViewRef.current?.querySelector(".waveform-score-container");
     const row = container?.children[rowIndex] as HTMLElement | undefined;
-    if (!row) return;
-    const rect = row.getBoundingClientRect();
-    // 顶部给吸顶工具栏留 ~110px，底部到视口边缘。
-    const visible = rect.top >= 110 && rect.bottom <= window.innerHeight;
-    if (!visible) {
-      row.scrollIntoView({ block: "center", behavior: "smooth" });
-    }
-  }, [currentTime, isPlaying, audioBuffer]);
+    row?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [currentTime, audioBuffer]);
 
   const setPosition = useCallback((position: number) => {
     currentTimeRef.current = position;
@@ -240,6 +252,7 @@ function App() {
         // The source may already be stopped.
       }
       setIsPlaying(false);
+      setPlaybackLevel(null);
     },
     [getLivePosition, setPosition],
   );
@@ -286,7 +299,7 @@ function App() {
         const segment = segments[segmentIndex];
         const source = audioContextRef.current.createBufferSource();
         source.buffer = audioBuffer;
-        source.connect(audioContextRef.current.destination);
+        source.connect(analyserRef.current ?? audioContextRef.current.destination);
         playbackRef.current = {
           token,
           segments,
@@ -303,6 +316,7 @@ function App() {
           } else {
             playbackRef.current = null;
             setIsPlaying(false);
+            setPlaybackLevel(null);
             setPosition(audioBuffer.duration);
           }
         };
@@ -311,9 +325,27 @@ function App() {
 
       setIsPlaying(true);
       playSegment(index, Math.max(playableOffset, segments[index].start));
+      const analyser = analyserRef.current;
+      const samples = analyser ? new Float32Array(analyser.fftSize) : null;
       const animate = () => {
         if (playbackTokenRef.current !== token || !playbackRef.current) return;
         setPosition(getLivePosition());
+        // 逐帧读取播放波形，换算 RMS/Peak dBFS 供右侧音量刻度图显示。
+        if (analyser && samples) {
+          analyser.getFloatTimeDomainData(samples);
+          let sumSquares = 0;
+          let peak = 0;
+          for (let i = 0; i < samples.length; i++) {
+            const v = samples[i];
+            sumSquares += v * v;
+            const abs = Math.abs(v);
+            if (abs > peak) peak = abs;
+          }
+          const rms = Math.sqrt(sumSquares / samples.length);
+          const toDb = (value: number) =>
+            value > 0 ? 20 * Math.log10(value) : Number.NEGATIVE_INFINITY;
+          setPlaybackLevel({ rmsDb: toDb(rms), peakDb: toDb(peak) });
+        }
         animationFrameRef.current = requestAnimationFrame(animate);
       };
       animationFrameRef.current = requestAnimationFrame(animate);
@@ -615,6 +647,7 @@ function App() {
       }
       const result = await runTranscription(target);
       setTranscript(result);
+      setTranscriptVisible(true);
       setNoiseNotice(
         result.segments.length
           ? `转录完成，共 ${result.segments.length} 句，波形下方显示逐字对照，点击可跳转`
@@ -1195,6 +1228,22 @@ function App() {
                   录音确定编辑后自动转录
                 </label>
               </div>
+              <div className="setup-row">
+                <label
+                  className="setup-checkbox"
+                  title={transcript ? "" : "当前没有转录结果，先执行一次转录"}
+                >
+                  <input
+                    type="checkbox"
+                    checked={transcriptVisible}
+                    disabled={!transcript}
+                    onChange={(event) =>
+                      setTranscriptVisible(event.target.checked)
+                    }
+                  />
+                  显示转录文字面板
+                </label>
+              </div>
             </>
           )}
           <div className="setup-row">
@@ -1389,13 +1438,15 @@ function App() {
         )}
       </div>
 
-      {transcript && audioBuffer && (
+      {audioBuffer && <WaveSidebar level={playbackLevel} />}
+
+      {transcript && audioBuffer && transcriptVisible && (
         <TranscriptPanel
           segments={transcript.segments}
           currentTime={currentTime}
           deletedRegions={deletedRegions}
           onSeek={handleSeek}
-          onClose={() => setTranscript(null)}
+          onClose={() => setTranscriptVisible(false)}
         />
       )}
 
