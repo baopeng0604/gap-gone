@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { readFile } from "@tauri-apps/plugin-fs";
+import { getDeviceId, setDeviceId } from "./utils/settings";
 
 export interface AudioInputDevice {
   deviceId: string;
@@ -47,7 +48,12 @@ function isTauriDesktop() {
 
 export function useRecorder() {
   const [devices, setDevices] = useState<AudioInputDevice[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState("");
+  const [selectedDeviceId, setSelectedDeviceIdRaw] = useState(getDeviceId);
+  // 选择变化即持久化（localStorage），下次启动直接恢复
+  const setSelectedDeviceId = useCallback((id: string) => {
+    setDeviceId(id);
+    setSelectedDeviceIdRaw(id);
+  }, []);
   const [monitorEnabled, setMonitorEnabled] = useState(false);
   const [level, setLevel] = useState<MonitorLevel>(emptyLevel);
   const [peakHoldDb, setPeakHoldDb] = useState(Number.NEGATIVE_INFINITY);
@@ -88,7 +94,13 @@ export function useRecorder() {
           label: device.label || "未命名设备",
         }));
         setDevices(inputs);
-        setSelectedDeviceId((current) => current || inputs[0]?.deviceId || "");
+        // 持久化的设备 id 不在当前列表时（设备被拔）回退默认设备
+        setSelectedDeviceIdRaw((current) => {
+          if (current && inputs.some((device) => device.deviceId === current)) {
+            return current;
+          }
+          return inputs[0]?.deviceId ?? "";
+        });
         return;
       } catch {
         // A webview without the native command falls back to Web Media APIs.
@@ -104,7 +116,7 @@ export function useRecorder() {
           label: device.label || `麦克风 ${index + 1}`,
         }));
       setDevices(inputs);
-      setSelectedDeviceId((current) => {
+      setSelectedDeviceIdRaw((current) => {
         if (current && inputs.some((device) => device.deviceId === current)) {
           return current;
         }

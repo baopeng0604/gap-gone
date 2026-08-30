@@ -268,19 +268,28 @@ fn make_error_callback(
     }
 }
 
+/// Gap Gone 专属临时目录：系统 temp 下的 gap-gone 子目录。
+/// 录音 / 降噪 / 转录的临时文件统一落在这里，便于统计占用与一键清理。
+pub(crate) fn gap_gone_temp_dir() -> PathBuf {
+    std::env::temp_dir().join("gap-gone")
+}
+
 fn temp_recording_path() -> PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    std::env::temp_dir().join(format!("gap-gone-{timestamp}.wav"))
+    let dir = gap_gone_temp_dir();
+    // 目录可能被用户清空或删除，生成路径时确保存在
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("gap-gone-{timestamp}.wav"))
 }
 
-/// 校验路径必须是系统 temp 目录下的 gap-gone-* 文件，
-/// 前端传来的任何读写路径都必须过这层校验，防止越权访问磁盘。
+/// 校验路径必须是 gap-gone 临时目录（系统 temp 下的 gap-gone 子目录）下的
+/// gap-gone-* 文件，前端传来的任何读写路径都必须过这层校验，防止越权访问磁盘。
 pub(crate) fn validate_temp_recording_path(path: &str) -> Result<PathBuf, String> {
     let candidate = PathBuf::from(path);
-    let temp_dir = std::env::temp_dir();
+    let temp_dir = gap_gone_temp_dir();
     let file_name = candidate
         .file_name()
         .and_then(|name| name.to_str())
@@ -308,7 +317,8 @@ fn prepare_denoise_files() -> DenoiseFiles {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let temp_dir = std::env::temp_dir();
+    let temp_dir = gap_gone_temp_dir();
+    let _ = std::fs::create_dir_all(&temp_dir);
     DenoiseFiles {
         input_path: temp_dir
             .join(format!("gap-gone-denoise-input-{timestamp}.wav"))
@@ -569,6 +579,62 @@ fn delete_recording_file(path: String) -> Result<(), String> {
     remove_recording_file(&path)
 }
 
+/// gap-gone 临时目录的占用统计（设置页展示用）。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TempStorageStatus {
+    bytes: u64,
+    file_count: u64,
+}
+
+fn scan_gap_gone_temp_dir() -> TempStorageStatus {
+    let dir = gap_gone_temp_dir();
+    let mut bytes = 0u64;
+    let mut file_count = 0u64;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    bytes += metadata.len();
+                    file_count += 1;
+                }
+            }
+        }
+    }
+    TempStorageStatus { bytes, file_count }
+}
+
+/// 统计 gap-gone 临时目录的占用空间与文件数量。
+/// 目录遍历有磁盘 IO，放 spawn_blocking 避免阻塞 async runtime。
+#[tauri::command]
+async fn temp_storage_status() -> Result<TempStorageStatus, String> {
+    tauri::async_runtime::spawn_blocking(scan_gap_gone_temp_dir)
+        .await
+        .map_err(|_| "临时目录统计失败".to_string())
+}
+
+/// 一键清理 gap-gone 临时目录。
+/// 正在写入的录音文件（写入线程持有句柄）删除会失败，自动跳过，
+/// 不会影响进行中的录音。返回清理后的剩余占用。
+#[tauri::command]
+async fn clear_temp_files() -> Result<TempStorageStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let dir = gap_gone_temp_dir();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    // 删除失败（文件被占用等）直接跳过，继续清其余文件
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        scan_gap_gone_temp_dir()
+    })
+    .await
+    .map_err(|_| "临时目录清理失败".to_string())
+}
+
 #[tauri::command]
 fn denoise_audio(
     app: AppHandle,
@@ -754,6 +820,8 @@ pub fn run() {
             cancel_recording,
             prepare_denoise_files,
             delete_recording_file,
+            temp_storage_status,
+            clear_temp_files,
             denoise_audio,
             cancel_denoise,
             transcribe::transcribe_model_status,

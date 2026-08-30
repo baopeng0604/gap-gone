@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import WaveformScore from "./components/WaveformScore";
 import HelpModal from "./components/HelpModal";
 import {
@@ -9,7 +10,27 @@ import {
   subtractRegion,
   type Region,
 } from "./utils/regionUtils";
-import { exportAudio, saveToDisk } from "./utils/exportUtils";
+import {
+  buildExportBuffer,
+  exportAudio,
+  saveToDisk,
+} from "./utils/exportUtils";
+import { encodeMp3 } from "./utils/mp3Export";
+import { extractKeyword } from "./utils/keywordExtract";
+import {
+  getExportBitrate,
+  getExportFormat,
+  getNoisePreset,
+  getSilencePreset,
+  getTranscriptVisible,
+  setExportBitrate,
+  setExportFormat,
+  setNoisePreset as persistNoisePreset,
+  setSilencePreset as persistSilencePreset,
+  setTranscriptVisible as persistTranscriptVisible,
+  type ExportBitrate,
+  type ExportFormat,
+} from "./utils/settings";
 import { formatTimeStandard } from "./utils/timeUtils";
 import {
   detectSilence,
@@ -66,7 +87,19 @@ function formatDb(value: number) {
   return Number.isFinite(value) ? `${value.toFixed(1)} dBFS` : "-∞ dBFS";
 }
 
-function createExportFileName() {
+interface TempStorageStatus {
+  bytes: number;
+  fileCount: number;
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+}
+
+function createExportFileName(extension: string, keyword: string | null) {
   const now = new Date();
   const pad = (value: number) => value.toString().padStart(2, "0");
   const datePart = [
@@ -79,7 +112,10 @@ function createExportFileName() {
     pad(now.getMinutes()),
     pad(now.getSeconds()),
   ].join("");
-  return `${datePart}-${timePart}-edited-audio.wav`;
+  // 有关键词时「关键词-日期-时间」便于按主题聚簇；否则回退日期命名
+  return keyword
+    ? `${keyword}-${datePart}-${timePart}.${extension}`
+    : `${datePart}-${timePart}-edited-audio.${extension}`;
 }
 
 const METER_MIN_DB = -30;
@@ -105,9 +141,35 @@ function App() {
   const [history, setHistory] = useState<EditState[]>([]);
   const [future, setFuture] = useState<EditState[]>([]);
   const [noiseNotice, setNoiseNotice] = useState<string | null>(null);
-  const [noisePreset, setNoisePreset] = useState<NoisePreset>("medium");
-  const [silencePreset, setSilencePreset] =
-    useState<SilencePreset>("natural");
+  const noticeTimerRef = useRef<number>(0);
+
+  /**
+   * 展示提示：info（成功/结果通知）3 秒后自动消失；
+   * error（失败）常驻，需手动关闭。新提示会替换旧提示并重置计时。
+   */
+  const notify = useCallback((message: string, kind: "info" | "error" = "info") => {
+    window.clearTimeout(noticeTimerRef.current);
+    setNoiseNotice(message);
+    if (kind === "info") {
+      noticeTimerRef.current = window.setTimeout(
+        () => setNoiseNotice(null),
+        3000,
+      );
+    }
+  }, []);
+
+  const dismissNotice = useCallback(() => {
+    window.clearTimeout(noticeTimerRef.current);
+    setNoiseNotice(null);
+  }, []);
+
+  useEffect(() => () => window.clearTimeout(noticeTimerRef.current), []);
+  const [noisePreset, setNoisePreset] = useState<NoisePreset>(
+    getNoisePreset() as NoisePreset,
+  );
+  const [silencePreset, setSilencePreset] = useState<SilencePreset>(
+    getSilencePreset() as SilencePreset,
+  );
   const [hasEnhancedAudio, setHasEnhancedAudio] = useState(false);
   const [showRecordingSetup, setShowRecordingSetup] = useState(false);
   const [modelDirInput, setModelDirInput] = useState("");
@@ -122,7 +184,52 @@ function App() {
   const [denoiseProgress, setDenoiseProgress] = useState<number | null>(null);
   const [transcript, setTranscript] = useState<TranscriptResult | null>(null);
   // 转录面板显隐与转录数据分离：关闭面板不丢数据，可在设置里重新打开。
-  const [transcriptVisible, setTranscriptVisible] = useState(true);
+  const [transcriptVisible, setTranscriptVisibleState] = useState(
+    getTranscriptVisible,
+  );
+  const setTranscriptVisible = useCallback((visible: boolean) => {
+    setTranscriptVisibleState(visible);
+    persistTranscriptVisible(visible);
+  }, []);
+  // 导出格式与 MP3 码率（设置页可改，跨启动保留）
+  const [exportFormat, setExportFormatState] =
+    useState<ExportFormat>(getExportFormat);
+  const [exportBitrate, setExportBitrateState] =
+    useState<ExportBitrate>(getExportBitrate);
+  // gap-gone 临时目录占用统计（设置页展示 + 一键清理）
+  const [tempStorage, setTempStorage] = useState<TempStorageStatus | null>(
+    null,
+  );
+  const [isClearingTemp, setIsClearingTemp] = useState(false);
+
+  const refreshTempStorage = useCallback(async () => {
+    try {
+      setTempStorage(
+        await invoke<TempStorageStatus>("temp_storage_status"),
+      );
+    } catch {
+      setTempStorage(null);
+    }
+  }, []);
+
+  // 打开设置页时拉一次临时目录占用统计
+  useEffect(() => {
+    if (showRecordingSetup && isTauriDesktop()) {
+      void refreshTempStorage();
+    }
+  }, [showRecordingSetup, refreshTempStorage]);
+
+  const handleClearTempFiles = useCallback(async () => {
+    setIsClearingTemp(true);
+    try {
+      setTempStorage(await invoke<TempStorageStatus>("clear_temp_files"));
+    } catch {
+      notify("临时文件清理失败", "error");
+    } finally {
+      setIsClearingTemp(false);
+    }
+  }, []);
+
   const [transcribeProgress, setTranscribeProgress] =
     useState<TranscribeProgress | null>(null);
   const [playbackLevel, setPlaybackLevel] = useState<{
@@ -403,7 +510,7 @@ function App() {
       setTranscript(null);
       resetEditing();
     } catch {
-      setNoiseNotice("无法解析音频文件");
+      notify("无法解析音频文件", "error");
     } finally {
       event.target.value = "";
       setIsProcessing(false);
@@ -481,14 +588,14 @@ function App() {
         );
         setDetectedSilenceRegions(candidates);
         if (candidates.length) {
-          setNoiseNotice(
+          notify(
             `使用“${silencePresetLabels[silencePreset]}”预设检测到 ${candidates.length} 个静音候选片段，请检查波形后应用`,
           );
         } else {
-          setNoiseNotice("未检测到符合条件的静音片段");
+          notify("未检测到符合条件的静音片段");
         }
       } catch {
-        setNoiseNotice("静音分析失败");
+        notify("静音分析失败", "error");
       } finally {
         setIsProcessing(false);
       }
@@ -506,12 +613,12 @@ function App() {
       ),
     });
     setDetectedSilenceRegions([]);
-    setNoiseNotice("已应用静音检测结果，可用“恢复本次检测”撤回");
+    notify("已应用静音检测结果，可用“恢复本次检测”撤回");
   };
 
   const clearSilenceDetection = () => {
     setDetectedSilenceRegions([]);
-    setNoiseNotice("已清除待应用的静音候选");
+    notify("已清除待应用的静音候选");
   };
 
   const restoreLastAutoDetection = useCallback(() => {
@@ -521,7 +628,7 @@ function App() {
       ...editState,
       autoRegions: [],
     });
-    setNoiseNotice("已恢复本次自动检测结果，手动切除保持不变");
+    notify("已恢复本次自动检测结果，手动切除保持不变");
   }, [editState, stopPlayback]);
 
   const cancelRecordingCountdown = () => {
@@ -545,7 +652,9 @@ function App() {
       return;
     }
 
-    // 倒计时语音（CC0，三个数字对齐到 0/1/2s，共 2.68s），恰在开录前喊完
+    // 倒计时语音（CC0，三个数字对齐到 0/1/2s，共 2.68s），恰在开录前喊完。
+    // 界面文案与音频解耦：前两拍显示「准备」，最后一拍显示「开始」，
+    // 后续换更短的提示音时只需调整这里的拍数与间隔。
     const countdownAudio = new Audio(countdownSfx);
     countdownAudio.volume = 0.7;
     countdownAudioRef.current = countdownAudio;
@@ -580,17 +689,31 @@ function App() {
     if (!audioBuffer) return;
     setIsProcessing(true);
     try {
-      const blob = exportAudio(audioBuffer, deletedRegions);
-      const saved = await saveToDisk(blob, createExportFileName());
-      if (saved) setNoiseNotice("导出成功");
+      // MP3 为默认格式（纯 JS 编码，分块让出主线程）；WAV 走同步 PCM 编码
+      const blob =
+        exportFormat === "mp3"
+          ? await encodeMp3(
+              buildExportBuffer(audioBuffer, deletedRegions),
+              exportBitrate,
+            )
+          : exportAudio(audioBuffer, deletedRegions);
+      const saved = await saveToDisk(
+        blob,
+        createExportFileName(
+          exportFormat,
+          transcript ? extractKeyword(transcript.segments) : null,
+        ),
+      );
+      if (saved) notify("导出成功");
     } catch (cause) {
-      setNoiseNotice(
+      notify(
         cause instanceof Error ? cause.message : "导出失败，请重试",
+        "error",
       );
     } finally {
       setIsProcessing(false);
     }
-  }, [audioBuffer, deletedRegions]);
+  }, [audioBuffer, deletedRegions, exportBitrate, exportFormat, transcript]);
 
   const confirmRecording = async () => {
     if (!recorder.recordedBlob || !audioContextRef.current) return;
@@ -611,7 +734,7 @@ function App() {
         void handleTranscribe(decoded);
       }
     } catch {
-      setNoiseNotice("无法解析这段录音");
+      notify("无法解析这段录音", "error");
     } finally {
       setIsProcessing(false);
     }
@@ -633,11 +756,11 @@ function App() {
       denoiseBaseRef.current = audioBuffer;
       setDenoisePreview(result.buffer);
       setAudioBuffer(result.buffer);
-      setNoiseNotice(
+      notify(
         `${result.engine} 已生成${noisePreset === "light" ? "轻度" : noisePreset === "strong" ? "强度" : "中度"}降噪试听，请播放确认`,
       );
     } catch {
-      setNoiseNotice("降噪已取消或失败，原始音频未改变");
+      notify("降噪已取消或失败，原始音频未改变", "error");
     } finally {
       setDenoiseProgress(null);
       setIsProcessing(false);
@@ -659,22 +782,23 @@ function App() {
       // 首次使用先下载模型（约 230MB），之后本地离线可用。
       const status = await checkTranscribeModel();
       if (!status.ready) {
-        setNoiseNotice("首次使用转录需下载 SenseVoice 模型（约 230MB），下载中…");
+        notify("首次使用转录需下载 SenseVoice 模型（约 230MB），下载中…");
         await downloadTranscribeModel();
       }
       const result = await runTranscription(target);
       setTranscript(result);
       setTranscriptVisible(true);
-      setNoiseNotice(
+      notify(
         result.segments.length
           ? `转录完成，共 ${result.segments.length} 句，波形下方显示逐字对照，点击可跳转`
           : "转录完成，但没有识别到语音内容",
       );
     } catch (cause) {
-      setNoiseNotice(
+      notify(
         String(cause).includes("取消")
           ? "转录已取消"
           : `转录失败：${cause instanceof Error ? cause.message : cause}`,
+        String(cause).includes("取消") ? "info" : "error",
       );
     } finally {
       unlisten();
@@ -688,7 +812,7 @@ function App() {
     setDenoisePreview(null);
     denoiseBaseRef.current = null;
     setHasEnhancedAudio(true);
-    setNoiseNotice("降噪版本已确认");
+    notify("降噪版本已确认");
   };
 
   const cancelNoiseReduction = () => {
@@ -699,7 +823,7 @@ function App() {
     }
     setDenoisePreview(null);
     denoiseBaseRef.current = null;
-    setNoiseNotice("已取消降噪试听");
+    notify("已取消降噪试听");
   };
 
   const restoreOriginal = () => {
@@ -1029,7 +1153,9 @@ function App() {
             className="silence-preset"
             value={silencePreset}
             onChange={(event) => {
-              setSilencePreset(event.target.value as SilencePreset);
+              const preset = event.target.value as SilencePreset;
+              setSilencePreset(preset);
+              persistSilencePreset(preset);
               setDetectedSilenceRegions([]);
             }}
             disabled={!audioBuffer || isProcessing}
@@ -1074,9 +1200,11 @@ function App() {
           <select
             className="noise-preset"
             value={noisePreset}
-            onChange={(event) =>
-              setNoisePreset(event.target.value as NoisePreset)
-            }
+            onChange={(event) => {
+              const preset = event.target.value as NoisePreset;
+              setNoisePreset(preset);
+              persistNoisePreset(preset);
+            }}
             disabled={!audioBuffer || isProcessing}
             aria-label="降噪强度"
           >
@@ -1149,7 +1277,8 @@ function App() {
         <span className="toolbar-divider" aria-hidden="true" />
         <div className="toolbar-group" aria-label="输出和帮助">
           <button onClick={handleExport} disabled={!audioBuffer || isProcessing}>
-            导出 WAV <span className="shortcut-key">⌘/Ctrl+S</span>
+            导出 {exportFormat === "mp3" ? "MP3" : "WAV"}{" "}
+            <span className="shortcut-key">⌘/Ctrl+S</span>
           </button>
           <button onClick={() => setHelpOpen(true)}>
             帮助 <span className="shortcut-key">H</span>
@@ -1164,9 +1293,12 @@ function App() {
           role="status"
           aria-live="assertive"
         >
-          <strong>准备录音</strong>
-          <span className="countdown-number">{recordingCountdown}</span>
-          <p>倒计时结束后开始录音</p>
+          <span className="countdown-number">
+            {recordingCountdown > 1 ? "准备" : "开始"}
+          </span>
+          <p>
+            {recordingCountdown > 1 ? "倒计时结束后开始录音" : "马上开始录音"}
+          </p>
           <button
             onClick={cancelRecordingCountdown}
             title="快捷键 Esc：取消倒计时"
@@ -1182,7 +1314,7 @@ function App() {
         recordingCountdown === null && (
         <section className="recording-setup">
           <div className="setup-row">
-            <label>
+            <label className="setup-grow">
               录音设备
               <select
                 value={recorder.selectedDeviceId}
@@ -1201,6 +1333,7 @@ function App() {
               </select>
             </label>
             <button onClick={() => void recorder.refreshDevices()}>刷新</button>
+            <button onClick={() => setShowRecordingSetup(false)}>确定</button>
           </div>
           {isTauriDesktop() && (
             <>
@@ -1210,7 +1343,7 @@ function App() {
                   <input
                     type="text"
                     value={modelDirInput}
-                    placeholder="默认：应用数据目录/models/sense-voice"
+                    placeholder="默认：~/models/sense-voice"
                     onChange={(event) => setModelDirInput(event.target.value)}
                   />
                 </label>
@@ -1219,7 +1352,7 @@ function App() {
                     const value = modelDirInput.trim();
                     setCustomModelDir(value || null);
                     void setTranscribeModelDir(value || null).catch(() =>
-                      setNoiseNotice("模型目录保存失败"),
+                      notify("模型目录保存失败", "error"),
                     );
                   }}
                 >
@@ -1261,11 +1394,69 @@ function App() {
                   显示转录文字面板
                 </label>
               </div>
+              <div className="setup-row">
+                <small>
+                  临时文件目录：{tempStorage
+                    ? `${formatBytes(tempStorage.bytes)} · ${tempStorage.fileCount} 个文件`
+                    : "统计中…"}
+                </small>
+                <button
+                  disabled={isClearingTemp || !tempStorage}
+                  onClick={() => void handleClearTempFiles()}
+                >
+                  {isClearingTemp ? "清理中…" : "一键清理"}
+                </button>
+              </div>
             </>
           )}
           <div className="setup-row">
+            <label className="setup-checkbox">导出格式</label>
+            <label className="setup-checkbox">
+              <input
+                type="radio"
+                name="export-format"
+                checked={exportFormat === "mp3"}
+                onChange={() => {
+                  setExportFormatState("mp3");
+                  setExportFormat("mp3");
+                }}
+              />
+              MP3（默认）
+            </label>
+            <label className="setup-checkbox">
+              <input
+                type="radio"
+                name="export-format"
+                checked={exportFormat === "wav"}
+                onChange={() => {
+                  setExportFormatState("wav");
+                  setExportFormat("wav");
+                }}
+              />
+              WAV
+            </label>
+          </div>
+          {exportFormat === "mp3" && (
+            <div className="setup-row">
+              <label className="setup-checkbox">MP3 码率</label>
+              {([96, 128, 192] as const).map((bitrate) => (
+                <label className="setup-checkbox" key={bitrate}>
+                  <input
+                    type="radio"
+                    name="export-bitrate"
+                    checked={exportBitrate === bitrate}
+                    onChange={() => {
+                      setExportBitrateState(bitrate);
+                      setExportBitrate(bitrate);
+                    }}
+                  />
+                  {bitrate} kbps{bitrate === 128 ? "（推荐）" : ""}
+                </label>
+              ))}
+            </div>
+          )}
+          <div className="setup-row">
             <small>录音格式：48 kHz / mono / PCM WAV</small>
-            <button onClick={() => setShowRecordingSetup(false)}>确定</button>
           </div>
         </section>
         )}
@@ -1425,7 +1616,7 @@ function App() {
       {noiseNotice && (
         <div className="inline-notice" role="status">
           {noiseNotice}
-          <button onClick={() => setNoiseNotice(null)}>关闭</button>
+          <button onClick={dismissNotice}>关闭</button>
         </div>
       )}
 

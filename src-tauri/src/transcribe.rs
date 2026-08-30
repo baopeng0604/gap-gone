@@ -19,7 +19,7 @@ use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceM
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
-use crate::{validate_temp_recording_path, RecordingManager};
+use crate::{gap_gone_temp_dir, validate_temp_recording_path, RecordingManager};
 
 /// 模型版本：sherpa-onnx 官方维护者发布的 SenseVoice-Small 多语言 int8。
 /// 主站 HuggingFace，国内镜像 hf-mirror.com，两边文件一致。
@@ -83,7 +83,7 @@ pub struct TranscribeJob {
 }
 
 /// 模型目录：用户自定义优先（RecordingManager.transcribe_model_dir），
-/// 默认应用数据目录 models/sense-voice。
+/// 默认用户主目录 ~/models/sense-voice。
 fn model_dir(app: &AppHandle, state: &State<'_, RecordingManager>) -> Result<PathBuf, String> {
     if let Some(custom) = state
         .transcribe_model_dir
@@ -94,9 +94,9 @@ fn model_dir(app: &AppHandle, state: &State<'_, RecordingManager>) -> Result<Pat
         return Ok(custom);
     }
     app.path()
-        .app_data_dir()
+        .home_dir()
         .map(|dir| dir.join("models").join("sense-voice"))
-        .map_err(|error| format!("无法定位应用数据目录: {error}"))
+        .map_err(|error| format!("无法定位用户主目录: {error}"))
 }
 
 /// 当前生效的模型目录（自定义或默认）。
@@ -271,7 +271,7 @@ pub fn download_transcribe_model(
     Ok(dir.to_string_lossy().to_string())
 }
 
-/// 生成转录输入的临时 WAV 路径（gap-gone- 前缀 + temp 目录，
+/// 生成转录输入的临时 WAV 路径（gap-gone 临时目录下的 gap-gone- 前缀文件，
 /// 过 validate_temp_recording_path 校验）。
 #[tauri::command]
 pub fn prepare_transcribe_file() -> String {
@@ -279,8 +279,9 @@ pub fn prepare_transcribe_file() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    std::env::temp_dir()
-        .join(format!("gap-gone-transcribe-{timestamp}.wav"))
+    let dir = gap_gone_temp_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("gap-gone-transcribe-{timestamp}.wav"))
         .to_string_lossy()
         .to_string()
 }

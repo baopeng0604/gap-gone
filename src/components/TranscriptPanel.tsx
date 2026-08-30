@@ -1,6 +1,10 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Region } from "../utils/regionUtils";
-import { exportTranscript, type TranscriptSegment } from "../utils/transcribe";
+import {
+  copyTranscriptText,
+  exportTranscript,
+  type TranscriptSegment,
+} from "../utils/transcribe";
 
 interface TranscriptPanelProps {
   segments: TranscriptSegment[];
@@ -34,6 +38,19 @@ export default function TranscriptPanel({
     (segment) => currentTime >= segment.start && currentTime < segment.end,
   );
   const activeRef = useRef<HTMLButtonElement | null>(null);
+  const [copied, setCopied] = useState(false);
+  const copyResetRef = useRef<number>(0);
+
+  // 复制成功后按钮短暂显示「已复制」，2 秒恢复。
+  const handleCopy = async () => {
+    const ok = await copyTranscriptText(segments);
+    if (!ok) return;
+    setCopied(true);
+    window.clearTimeout(copyResetRef.current);
+    copyResetRef.current = window.setTimeout(() => setCopied(false), 2000);
+  };
+
+  useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
 
   // 播放句高亮跟随滚动；用户手动滚动离开时不强行拉回（nearest 不打扰）。
   useEffect(() => {
@@ -50,6 +67,9 @@ export default function TranscriptPanel({
           </button>
           <button onClick={() => void exportTranscript(segments, "txt")}>
             导出 TXT
+          </button>
+          <button onClick={() => void handleCopy()}>
+            {copied ? "已复制" : "复制 TXT"}
           </button>
           <button onClick={onClose}>关闭</button>
         </span>

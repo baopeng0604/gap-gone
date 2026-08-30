@@ -16,11 +16,12 @@ export async function saveToDisk(blob: Blob, defaultName: string) {
 
   const arrayBuffer = await blob.arrayBuffer();
   const uint8Array = new Uint8Array(arrayBuffer);
+  const extension = defaultName.split(".").pop()?.toLowerCase() ?? "wav";
 
   try {
     const path = await save({
       defaultPath: defaultName,
-      filters: [{ name: "Audio", extensions: ["wav"] }],
+      filters: [{ name: extension.toUpperCase(), extensions: [extension] }],
     });
 
     if (path) {
@@ -45,10 +46,13 @@ export function getKeptRegions(deletedRegions: Region[], totalDuration: number):
   return getTimelineKeptRegions(deletedRegions, totalDuration);
 }
 
-export function exportAudio(
+/**
+ * 按保留区间拼接出导出用 AudioBuffer（WAV / MP3 共用）。
+ */
+export function buildExportBuffer(
   buffer: AudioBuffer,
   deletedRegions: Region[]
-): Blob {
+): AudioBuffer {
   const keptRegions = getKeptRegions(deletedRegions, buffer.duration);
   if (keptRegions.length === 0) {
     throw new Error("不能导出空音频，请至少恢复一段内容");
@@ -80,7 +84,7 @@ export function exportAudio(
       const startSample = Math.floor(region.start * sampleRate);
       const endSample = Math.floor(region.end * sampleRate);
       const length = endSample - startSample;
-      
+
       if (startSample < inputData.length && length > 0) {
         const chunk = inputData.slice(
           startSample,
@@ -95,7 +99,14 @@ export function exportAudio(
     }
   }
 
-  return bufferToWav(outputBuffer);
+  return outputBuffer;
+}
+
+export function exportAudio(
+  buffer: AudioBuffer,
+  deletedRegions: Region[]
+): Blob {
+  return bufferToWav(buildExportBuffer(buffer, deletedRegions));
 }
 
 // Simple WAV encoder
@@ -130,15 +141,17 @@ export function bufferToWav(abuffer: AudioBuffer): Blob {
   for (let i = 0; i < abuffer.numberOfChannels; i++)
     channels.push(abuffer.getChannelData(i));
 
-  while (pos < abuffer.length) {
+  // 独立帧索引：pos 在写头部时已推进到 44，直接复用会跳过前 44 帧
+  let frame = 0;
+  while (frame < abuffer.length) {
     for (let i = 0; i < numOfChan; i++) {
       // interleave channels
-      let sample = Math.max(-1, Math.min(1, channels[i][pos])); // clamp
-      sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0; // scale to 16-bit
-      view.setInt16(44 + offset, sample, true);
+      let sample = Math.max(-1, Math.min(1, channels[i][frame])); // clamp
+      sample = sample < 0 ? sample * 32768 : sample * 32767; // scale to 16-bit
+      view.setInt16(44 + offset, sample | 0, true);
       offset += 2;
     }
-    pos++;
+    frame++;
   }
 
   return new Blob([buffer], { type: "audio/wav" });

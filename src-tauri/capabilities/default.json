@@ -14,6 +14,8 @@
     "fs:allow-write-file",
     "fs:write-files",
     "fs:allow-temp-read",
-    "fs:allow-temp-write"
+    "fs:allow-temp-write",
+    "fs:allow-temp-read-recursive",
+    "fs:allow-temp-write-recursive"
   ]
 }

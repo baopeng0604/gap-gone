@@ -4,6 +4,7 @@ import { writeFile } from "@tauri-apps/plugin-fs";
 import { save } from "@tauri-apps/plugin-dialog";
 import { bufferToWav } from "./exportUtils";
 import { renderBuffer } from "./noiseReduction";
+import { SETTINGS_KEYS } from "./settings";
 
 export interface TranscriptSegment {
   start: number;
@@ -67,23 +68,39 @@ export function openTranscribeModelDir(): Promise<void> {
 
 /** 自动转录开关（localStorage，默认开）。 */
 export function getAutoTranscribe(): boolean {
-  return localStorage.getItem("gap-gone-auto-transcribe") !== "0";
+  try {
+    return localStorage.getItem(SETTINGS_KEYS.autoTranscribe) !== "0";
+  } catch {
+    return true;
+  }
 }
 
 export function setAutoTranscribe(enabled: boolean) {
-  localStorage.setItem("gap-gone-auto-transcribe", enabled ? "1" : "0");
+  try {
+    localStorage.setItem(SETTINGS_KEYS.autoTranscribe, enabled ? "1" : "0");
+  } catch {
+    // localStorage 不可用时静默降级
+  }
 }
 
 /** 自定义模型目录（localStorage 持久化，应用启动时同步到 Rust 侧）。 */
 export function getCustomModelDir(): string | null {
-  return localStorage.getItem("gap-gone-model-dir");
+  try {
+    return localStorage.getItem(SETTINGS_KEYS.modelDir);
+  } catch {
+    return null;
+  }
 }
 
 export function setCustomModelDir(path: string | null) {
-  if (path && path.trim()) {
-    localStorage.setItem("gap-gone-model-dir", path.trim());
-  } else {
-    localStorage.removeItem("gap-gone-model-dir");
+  try {
+    if (path && path.trim()) {
+      localStorage.setItem(SETTINGS_KEYS.modelDir, path.trim());
+    } else {
+      localStorage.removeItem(SETTINGS_KEYS.modelDir);
+    }
+  } catch {
+    // localStorage 不可用时静默降级
   }
 }
 
@@ -138,6 +155,15 @@ function formatSrtTime(seconds: number): string {
   return `${pad2(hours)}:${pad2(minutes)}:${pad2(secs)},${String(millis).padStart(3, "0")}`;
 }
 
+/** 句末标点：软上限下遇到句号/问号/叹号即收段。 */
+const SENTENCE_END = /[。！？!?…]$/;
+/** 语音停顿达到该秒数视为话题边界，强制分段。 */
+const PARAGRAPH_PAUSE_SECONDS = 1.5;
+/** 段落软上限：达到后在下一个句末标点处分段。 */
+const PARAGRAPH_SOFT_LIMIT = 120;
+/** 段落硬上限：无标点也强制分段，避免一段无限长。 */
+const PARAGRAPH_HARD_LIMIT = 200;
+
 export function buildSrt(segments: TranscriptSegment[]): string {
   return segments
     .map(
@@ -148,9 +174,62 @@ export function buildSrt(segments: TranscriptSegment[]): string {
 }
 
 export function buildTxt(segments: TranscriptSegment[]): string {
-  // 纯文字稿：整段文本，不带时间戳（按句分行仅为了阅读分段）。
+  // 纯文字稿（自动分句分段，不带时间戳）：
+  // SenseVoice 的 segment 是短语音碎片，直接逐行输出会碎不成文。
+  // 分段规则：① 相邻句间语音停顿 ≥ PARAGRAPH_PAUSE 秒视为话题边界；
+  // ② 段落积累到软上限后，在句末标点处收段；③ 无标点时到硬上限强制收段。
+  // 段内拼接：中文直接相连，英文词之间补空格。
   // 带时间戳的逐段对照是 SRT 的职责。
-  return segments.map((segment) => segment.text).join("\n");
+  const paragraphs: string[] = [];
+  let current = "";
+
+  const endParagraph = () => {
+    const trimmed = current.trim();
+    if (trimmed) paragraphs.push(trimmed);
+    current = "";
+  };
+
+  segments.forEach((segment, index) => {
+    const text = segment.text.trim();
+    if (!text) return;
+    const needsSpace =
+      /[A-Za-z0-9,;:.]$/.test(current) && /^[A-Za-z0-9]/.test(text);
+    current += (needsSpace ? " " : "") + text;
+
+    const next = segments[index + 1];
+    const pause = next ? next.start - segment.end : Infinity;
+    if (
+      pause >= PARAGRAPH_PAUSE_SECONDS ||
+      current.length >= PARAGRAPH_HARD_LIMIT ||
+      (current.length >= PARAGRAPH_SOFT_LIMIT && SENTENCE_END.test(text))
+    ) {
+      endParagraph();
+    }
+  });
+  endParagraph();
+  return paragraphs.join("\n\n");
+}
+
+/** 把纯文字稿（自动分段版）复制到系统剪贴板，返回是否成功。 */
+export async function copyTranscriptText(
+  segments: TranscriptSegment[],
+): Promise<boolean> {
+  const content = buildTxt(segments);
+  try {
+    await navigator.clipboard.writeText(content);
+    return true;
+  } catch {
+    // 剪贴板 API 不可用时的兜底（隐藏 textarea + execCommand）
+    const textarea = document.createElement("textarea");
+    textarea.value = content;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(textarea);
+    return ok;
+  }
 }
 
 /** 导出字幕/文字稿，系统保存对话框选位置。返回是否成功保存。 */
