@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Region } from "../utils/regionUtils";
 import {
+  copySrtText,
   copyTranscriptText,
   exportTranscript,
   type TranscriptSegment,
@@ -38,16 +39,19 @@ export default function TranscriptPanel({
     (segment) => currentTime >= segment.start && currentTime < segment.end,
   );
   const activeRef = useRef<HTMLButtonElement | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [copiedKind, setCopiedKind] = useState<"txt" | "srt" | null>(null);
   const copyResetRef = useRef<number>(0);
 
   // 复制成功后按钮短暂显示「已复制」，2 秒恢复。
-  const handleCopy = async () => {
-    const ok = await copyTranscriptText(segments);
+  const handleCopy = async (kind: "txt" | "srt") => {
+    const ok =
+      kind === "txt"
+        ? await copyTranscriptText(segments)
+        : await copySrtText(segments);
     if (!ok) return;
-    setCopied(true);
+    setCopiedKind(kind);
     window.clearTimeout(copyResetRef.current);
-    copyResetRef.current = window.setTimeout(() => setCopied(false), 2000);
+    copyResetRef.current = window.setTimeout(() => setCopiedKind(null), 2000);
   };
 
   useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
@@ -68,8 +72,11 @@ export default function TranscriptPanel({
           <button onClick={() => void exportTranscript(segments, "txt")}>
             导出 TXT
           </button>
-          <button onClick={() => void handleCopy()}>
-            {copied ? "已复制" : "复制 TXT"}
+          <button onClick={() => void handleCopy("txt")}>
+            {copiedKind === "txt" ? "已复制" : "复制 TXT"}
+          </button>
+          <button onClick={() => void handleCopy("srt")}>
+            {copiedKind === "srt" ? "已复制" : "复制 SRT"}
           </button>
           <button onClick={onClose}>关闭</button>
         </span>

@@ -45,11 +45,11 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 1. **Windows WASAPI 共享模式只接受设备默认混音格式**。`start_recording` 不能改声道数/采样率，否则 `Initialize` 返回 `AUDCLNT_E_UNSUPPORTED_FORMAT`。多声道在回调里 `downmix_to_mono` 下混。macOS 上不少 USB 麦默认 44.1 kHz，同样不要改设备格式。
 2. **音频回调是实时线程**。不要在 cpal 回调里做磁盘 IO、锁竞争、跨进程 emit 等重活，否则 WASAPI 缓冲区超期（underrun/overrun，`AUDCLNT_E_BUFFER_ERROR`）。**注意区分错误级别**：`ErrorKind::Xrun` 是瞬时毛刺（丢极少采样，流还活着），只计数上报（`recording-level.glitches`），绝不能拆流；只有设备拔出等致命错误才走回收流程。
 3. **DeepFilterNet 降噪只接受 48 kHz 单声道 16-bit WAV**（`denoise_audio` 有校验）。采样率/声道不匹配由前端 `noiseReduction.ts` 的 `renderBuffer`（OfflineAudioContext）在处理前后做转换，不要把重采样塞进 Rust 侧。
-4. **临时录音文件命名约定** **`gap-gone-*.wav`** **且必须位于系统 temp 目录下的 `gap-gone/` 子目录**（Rust 侧统一用 `gap_gone_temp_dir()` 生成路径）。`validate_temp_recording_path`（被 `delete_recording_file` / `denoise_audio` 复用）依赖该前缀与父目录做安全校验，改命名或目录前先改校验。降噪临时路径由 `prepare_denoise_files` 生成，保证前缀合法。
+4. **临时录音文件命名约定** **`gap-gone-*.wav`** **且必须位于系统 temp 目录下的** **`gap-gone/`** **子目录**（Rust 侧统一用 `gap_gone_temp_dir()` 生成路径）。`validate_temp_recording_path`（被 `delete_recording_file` / `denoise_audio` 复用）依赖该前缀与父目录做安全校验，改命名或目录前先改校验。降噪临时路径由 `prepare_denoise_files` 生成，保证前缀合法。
 5. **大文件禁止走** **`Vec<u8>`** **命令参数/返回值**。Tauri v2 自定义命令的参数走 JSON 数字数组序列化，长录音会卡死 IPC。一律走「临时文件 + 路径传参」：前端用 `@tauri-apps/plugin-fs` 的 `writeFile`/`readFile`（二进制 raw 传输），Rust 命令只收发路径字符串。capabilities 需同时含 `fs:allow-temp-read(-recursive)` / `fs:allow-temp-write(-recursive)`——**非递归权限只授权 temp 顶层文件，不含子目录**（踩过坑：临时文件移入 `temp/gap-gone/` 后读取被拒，报「无法完成录音文件」）。capability 是构建期注入的，改动后必须完全重启 `pnpm tauri dev`。
 6. **DfTract 不是 Send（内含 Rc），不能放进 Tauri State**。降噪模型常驻 `gap-gone-denoise` 工作线程并缓存复用；命令只投递 `DenoiseJob`。复用前必须 `init()` + `DFState::reset()` + `init_norm_states()` 重置流式状态，否则上一段音频的归一化状态会串扰下一段。SenseVoice 转录同理常驻 `gap-gone-transcribe` 线程。
 7. **设备选择用 cpal** **`Device::id()`（平台稳定 ID）**，不要用设备名——两台同名 USB 麦会选错。名称只做显示 label 和兜底匹配。
-8. **大模型不进安装包**。SenseVoice 模型（\~230MB）运行时下载到 `~/models/sense-voice/`（用户主目录，0.1.6 起默认；此前为 `app_data_dir/models/sense-voice/`。HF 主站 + hf-mirror 镜像，`.partial` 过渡文件），支持用户手动放置；`transcribe_model_status` 是唯一就绪判定。
+8. **大模型不进安装包**。SenseVoice 模型（\~230MB）运行时下载到 `~/models/sense-voice/`（用户主目录，0.1.6 起默认；此前为 `app_data_dir/models/sense-voice/`。HF 主站 + hf-mirror 镜像，`.partial` 过渡文件），支持用户手动放置；`transcribe_model_status` 是唯一就绪判定。标点恢复模型（CT-Transformer int8，75MB）同理下载到 `~/models/punctuation-ct-zh-en/`（HF ranger810 单文件镜像），由转录线程懒加载，**失败自动降级为无标点输出**（`TranscriptResult.punctuated` 标记），绝不阻塞转录。
 9. 录音错误通过 Tauri 事件 `recording-error` 上报前端；电平通过 `recording-level` 上报；降噪进度通过 `denoise-progress` 上报（-1 表示正在加载模型）；转录进度通过 `transcribe-progress` 上报（stage: download/load/transcribe）。
 
 ## 安全基线

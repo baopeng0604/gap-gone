@@ -15,7 +15,10 @@ use std::{
 };
 
 use serde::Serialize;
-use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig};
+use sherpa_onnx::{
+    OfflinePunctuation, OfflinePunctuationConfig, OfflineRecognizer, OfflineRecognizerConfig,
+    OfflineSenseVoiceModelConfig,
+};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
@@ -30,6 +33,14 @@ const MODEL_URLS: [&str; 2] = [
 ];
 const MODEL_ONNX: &str = "model.int8.onnx";
 const TOKENS_TXT: &str = "tokens.txt";
+
+/// 标点恢复模型：CT-Transformer zh-en int8（约 75MB，源自 ModelScope
+/// punc_ct-transformer_zh-cn-common-vocab272727）。HF 上是官方 GitHub
+/// 发布包的单文件镜像，避免 Rust 侧解压 tar.bz2。
+const PUNCT_REPO: &str =
+    "ranger810/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8";
+const PUNCT_DIR_NAME: &str = "punctuation-ct-zh-en";
+const PUNCT_ONNX: &str = "model.int8.onnx";
 
 /// 分块目标时长（秒）。整段一次性 decode 无法给进度也无法取消，
 /// 按 ~60s 在低能量点切块，块间检查取消标记并汇报进度。
@@ -72,6 +83,8 @@ pub struct TranscriptResult {
     pub segments: Vec<TranscriptSegment>,
     /// 字词级，供波形词带。
     pub words: Vec<TranscriptWord>,
+    /// 是否成功施加了标点恢复（模型不可用时为 false，前端据此提示）。
+    pub punctuated: bool,
 }
 
 pub struct TranscribeJob {
@@ -169,6 +182,7 @@ fn download_file(
     app: &AppHandle,
     dir: &PathBuf,
     name: &str,
+    repo: &str,
     cancelled: &AtomicBool,
     progress_base: f32,
     progress_span: f32,
@@ -180,7 +194,7 @@ fn download_file(
     let partial = dir.join(format!("{name}.partial"));
     let mut last_error = String::new();
     for base in MODEL_URLS {
-        let url = format!("{}/{name}", base.replace("{repo}", MODEL_REPO));
+        let url = format!("{}/{name}", base.replace("{repo}", repo));
         let response = match ureq::get(&url).call() {
             Ok(response) => response,
             Err(error) => {
@@ -256,6 +270,7 @@ pub fn download_transcribe_model(
         &app,
         &dir,
         TOKENS_TXT,
+        MODEL_REPO,
         &state.transcribe_cancelled,
         0.0,
         1.0,
@@ -264,6 +279,7 @@ pub fn download_transcribe_model(
         &app,
         &dir,
         MODEL_ONNX,
+        MODEL_REPO,
         &state.transcribe_cancelled,
         1.0,
         99.0,
@@ -337,10 +353,47 @@ pub fn start_transcription(
 
 fn transcribe_worker(rx: mpsc::Receiver<TranscribeJob>) {
     let mut recognizer: Option<OfflineRecognizer> = None;
+    let mut punctuator: Option<OfflinePunctuation> = None;
+    // 标点模型下载失败后本次会话不再自动重试（避免每次转录都等网络超时）；
+    // 用户手动放置模型文件后仍会尝试加载（下载跳过、只走加载）。
+    let mut punct_download_failed = false;
     while let Ok(job) = rx.recv() {
-        let result = run_transcribe_job(&mut recognizer, &job);
+        let result = run_transcribe_job(
+            &mut recognizer,
+            &mut punctuator,
+            &mut punct_download_failed,
+            &job,
+        );
         let _ = job.respond.send(result);
     }
+}
+
+/// 准备标点恢复器：模型文件缺失则先下载（约 75MB，一次性），
+/// 任何一步失败都返回 None——标点是增益功能，绝不阻塞转录本身。
+fn prepare_punctuator(
+    app: &AppHandle,
+    cancelled: &AtomicBool,
+    download_failed: &mut bool,
+) -> Option<OfflinePunctuation> {
+    let dir = app
+        .path()
+        .home_dir()
+        .ok()?
+        .join("models")
+        .join(PUNCT_DIR_NAME);
+    fs::create_dir_all(&dir).ok()?;
+    if !dir.join(PUNCT_ONNX).is_file() && !*download_failed {
+        emit_progress(app, "punctuation", 0.0);
+        if download_file(app, &dir, PUNCT_ONNX, PUNCT_REPO, cancelled, 0.0, 100.0).is_err() {
+            *download_failed = true;
+            return None;
+        }
+    }
+    emit_progress(app, "punctuation", -1.0);
+    let mut config = OfflinePunctuationConfig::default();
+    config.model.ct_transformer = Some(dir.join(PUNCT_ONNX).to_string_lossy().to_string());
+    config.model.num_threads = 1;
+    OfflinePunctuation::create(&config)
 }
 
 /// 在目标切分点附近找能量最低的 100ms 窗口作为切块边界，
@@ -483,6 +536,8 @@ fn collect_transcript(
 
 fn run_transcribe_job(
     recognizer_slot: &mut Option<OfflineRecognizer>,
+    punctuator_slot: &mut Option<OfflinePunctuation>,
+    punct_download_failed: &mut bool,
     job: &TranscribeJob,
 ) -> Result<TranscriptResult, String> {
     let wav_bytes =
@@ -568,5 +623,26 @@ fn run_transcribe_job(
             ((chunk_index + 1) as f32 / total as f32) * 100.0,
         );
     }
-    Ok(TranscriptResult { segments, words })
+
+    // 标点恢复：对每个句子补全标点（长音频切块识别的块边界必丢标点，
+    // 口语标点也稀疏）。只处理 segments——词带锚定波形时间戳，动不得。
+    if punctuator_slot.is_none() {
+        *punctuator_slot = prepare_punctuator(&job.app, &job.cancelled, punct_download_failed);
+    }
+    let punctuated = punctuator_slot.is_some();
+    if let Some(punctuator) = punctuator_slot.as_ref() {
+        for segment in &mut segments {
+            if let Some(punctuated_text) = punctuator.add_punctuation(&segment.text) {
+                if !punctuated_text.trim().is_empty() {
+                    segment.text = punctuated_text;
+                }
+            }
+        }
+    }
+
+    Ok(TranscriptResult {
+        segments,
+        words,
+        punctuated,
+    })
 }

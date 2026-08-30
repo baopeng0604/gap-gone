@@ -652,9 +652,10 @@ function App() {
       return;
     }
 
-    // 倒计时语音（CC0，三个数字对齐到 0/1/2s，共 2.68s），恰在开录前喊完。
-    // 界面文案与音频解耦：前两拍显示「准备」，最后一拍显示「开始」，
-    // 后续换更短的提示音时只需调整这里的拍数与间隔。
+    // 倒计时语音（CC0，"3、2、1"对齐 0/1/2s，全长 2.68s；总时长 2s 时
+    // 开录瞬间会把尾音掐断，后续换更短的提示音即可完全对齐）。
+    // 界面文案与音频解耦：0.25s 步进计时，总 2s——前 1.5s 显示「准备」，
+    // 最后 0.5s 显示「开始」，提示"现在就要开口"。
     const countdownAudio = new Audio(countdownSfx);
     countdownAudio.volume = 0.7;
     countdownAudioRef.current = countdownAudio;
@@ -662,7 +663,8 @@ function App() {
       // 自动播放被拒时静默失败，倒计时照常进行
     });
 
-    let remaining = 3;
+    // remaining 以 0.25s 为单位：8 → 0，共 2 秒。
+    let remaining = 8;
     setRecordingCountdown(remaining);
     recordingCountdownRef.current = window.setInterval(() => {
       remaining -= 1;
@@ -682,7 +684,7 @@ function App() {
         return;
       }
       setRecordingCountdown(remaining);
-    }, 1000);
+    }, 250);
   };
 
   const handleExport = useCallback(async () => {
@@ -793,6 +795,9 @@ function App() {
           ? `转录完成，共 ${result.segments.length} 句，波形下方显示逐字对照，点击可跳转`
           : "转录完成，但没有识别到语音内容",
       );
+      if (!result.punctuated) {
+        notify("标点模型不可用（下载失败或无网络），本次输出无标点", "error");
+      }
     } catch (cause) {
       notify(
         String(cause).includes("取消")
@@ -1265,6 +1270,10 @@ function App() {
                       "正在加载转录模型…"}
                     {transcribeProgress.stage === "transcribe" &&
                       `转录 ${Math.round(transcribeProgress.percent)}%`}
+                    {transcribeProgress.stage === "punctuation" &&
+                      (transcribeProgress.percent < 0
+                        ? "正在准备标点模型…"
+                        : `下载标点模型 ${Math.round(transcribeProgress.percent)}%`)}
                   </span>
                   <button onClick={() => void cancelTranscribe()}>
                     取消转录
@@ -1294,10 +1303,10 @@ function App() {
           aria-live="assertive"
         >
           <span className="countdown-number">
-            {recordingCountdown > 1 ? "准备" : "开始"}
+            {recordingCountdown > 2 ? "准备" : "开始"}
           </span>
           <p>
-            {recordingCountdown > 1 ? "倒计时结束后开始录音" : "马上开始录音"}
+            {recordingCountdown > 2 ? "倒计时结束后开始录音" : "马上开始录音"}
           </p>
           <button
             onClick={cancelRecordingCountdown}

@@ -24,9 +24,11 @@ export interface TranscriptResult {
   segments: TranscriptSegment[];
   /** 字词级：波形词带。 */
   words: TranscriptWord[];
+  /** 是否成功施加标点恢复（标点模型不可用时为 false）。 */
+  punctuated: boolean;
 }
 
-export type TranscribeStage = "download" | "load" | "transcribe";
+export type TranscribeStage = "download" | "load" | "transcribe" | "punctuation";
 
 export interface TranscribeProgress {
   stage: TranscribeStage;
@@ -164,11 +166,82 @@ const PARAGRAPH_SOFT_LIMIT = 120;
 /** 段落硬上限：无标点也强制分段，避免一段无限长。 */
 const PARAGRAPH_HARD_LIMIT = 200;
 
+/** 单条字幕上限：时长（秒）与字符数（约两行 21 字）。 */
+const SRT_MAX_CUE_SECS = 7;
+const SRT_MAX_CUE_CHARS = 42;
+/** 停顿超过该值不合并（话题边界）。 */
+const SRT_MERGE_PAUSE_SECS = 0.6;
+
+/**
+ * 字幕分句：每个 segment 内部按句末标点拆成单句，
+ * 时间戳按字符占比在 start/end 间线性插值（误差远小于字幕可读阈值）。
+ * 标点恢复（0.1.10）之前 segment 靠时长兜底切分，一条里常挤着多个句子。
+ */
+function splitSegmentIntoSentences(segment: TranscriptSegment): TranscriptSegment[] {
+  const text = segment.text.trim();
+  if (!text) return [];
+  const sentences: string[] = [];
+  let current = "";
+  for (const char of text) {
+    current += char;
+    if (/[。！？!?…]/.test(char)) {
+      sentences.push(current);
+      current = "";
+    }
+  }
+  if (current.trim()) sentences.push(current);
+  if (sentences.length <= 1) {
+    return [{ ...segment, text }];
+  }
+  const duration = segment.end - segment.start;
+  const totalChars = sentences.reduce((sum, s) => sum + s.length, 0);
+  let cursor = segment.start;
+  return sentences.map((sentence) => {
+    const share = (sentence.length / totalChars) * duration;
+    const piece = {
+      start: cursor,
+      end: cursor + share,
+      text: sentence.trim(),
+    };
+    cursor += share;
+    return piece;
+  });
+}
+
+/**
+ * 组装字幕条：碎句（过短）合并到前一条，超长不合并。
+ * 返回最终的 segment 列表（时间轴连续）。
+ */
+function mergeShortCues(cues: TranscriptSegment[]): TranscriptSegment[] {
+  const merged: TranscriptSegment[] = [];
+  for (const cue of cues) {
+    const previous = merged[merged.length - 1];
+    const pause = previous ? cue.start - previous.end : Infinity;
+    const joinedChars = previous ? previous.text.length + cue.text.length : 0;
+    const joinedSecs = previous ? cue.end - previous.start : Infinity;
+    if (
+      previous &&
+      pause <= SRT_MERGE_PAUSE_SECS &&
+      joinedChars <= SRT_MAX_CUE_CHARS &&
+      joinedSecs <= SRT_MAX_CUE_SECS
+    ) {
+      previous.text += cue.text;
+      previous.end = cue.end;
+    } else {
+      merged.push({ ...cue });
+    }
+  }
+  return merged;
+}
+
 export function buildSrt(segments: TranscriptSegment[]): string {
-  return segments
+  // 分句分段：先按句末标点拆多句长条，再合并停顿极短的碎句，
+  // 让每条字幕尽量是「一句完整的话」且时长/长度适合阅读。
+  const cues = mergeShortCues(segments.flatMap(splitSegmentIntoSentences));
+  return cues
     .map(
-      (segment, index) =>
-        `${index + 1}\n${formatSrtTime(segment.start)} --> ${formatSrtTime(segment.end)}\n${segment.text}`,
+      (cue, index) =>
+        `${index + 1}\n${formatSrtTime(cue.start)} --> ${formatSrtTime(cue.end)}\n${cue.text}`,
     )
     .join("\n\n");
 }
@@ -210,11 +283,8 @@ export function buildTxt(segments: TranscriptSegment[]): string {
   return paragraphs.join("\n\n");
 }
 
-/** 把纯文字稿（自动分段版）复制到系统剪贴板，返回是否成功。 */
-export async function copyTranscriptText(
-  segments: TranscriptSegment[],
-): Promise<boolean> {
-  const content = buildTxt(segments);
+/** 写文本到系统剪贴板，返回是否成功（含 execCommand 兜底）。 */
+async function copyText(content: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(content);
     return true;
@@ -230,6 +300,20 @@ export async function copyTranscriptText(
     document.body.removeChild(textarea);
     return ok;
   }
+}
+
+/** 把纯文字稿（自动分段版）复制到系统剪贴板，返回是否成功。 */
+export async function copyTranscriptText(
+  segments: TranscriptSegment[],
+): Promise<boolean> {
+  return copyText(buildTxt(segments));
+}
+
+/** 把 SRT 字幕（分句优化版）复制到系统剪贴板，返回是否成功。 */
+export async function copySrtText(
+  segments: TranscriptSegment[],
+): Promise<boolean> {
+  return copyText(buildSrt(segments));
 }
 
 /** 导出字幕/文字稿，系统保存对话框选位置。返回是否成功保存。 */
