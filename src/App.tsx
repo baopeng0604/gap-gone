@@ -41,6 +41,7 @@ import {
 import TranscriptPanel from "./components/TranscriptPanel";
 import WaveSidebar from "./components/WaveSidebar";
 import { useRecorder } from "./useRecorder";
+import countdownSfx from "./assets/countdown.mp3";
 import "./App.css";
 
 type EditMode = "seek" | "select" | "cut" | "restore";
@@ -136,6 +137,7 @@ function App() {
   const playbackTokenRef = useRef(0);
   const animationFrameRef = useRef<number | null>(null);
   const recordingCountdownRef = useRef<number | null>(null);
+  const countdownAudioRef = useRef<HTMLAudioElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const waveformViewRef = useRef<HTMLDivElement>(null);
   const followRowRef = useRef(-1);
@@ -184,6 +186,8 @@ function App() {
       if (recordingCountdownRef.current !== null) {
         window.clearInterval(recordingCountdownRef.current);
       }
+      countdownAudioRef.current?.pause();
+      countdownAudioRef.current = null;
       void context.close();
       document.removeEventListener("contextmenu", preventContextMenu);
     };
@@ -525,6 +529,8 @@ function App() {
       window.clearInterval(recordingCountdownRef.current);
       recordingCountdownRef.current = null;
     }
+    countdownAudioRef.current?.pause();
+    countdownAudioRef.current = null;
     setRecordingCountdown(null);
   };
 
@@ -539,6 +545,14 @@ function App() {
       return;
     }
 
+    // 倒计时语音（CC0，三个数字对齐到 0/1/2s，共 2.68s），恰在开录前喊完
+    const countdownAudio = new Audio(countdownSfx);
+    countdownAudio.volume = 0.7;
+    countdownAudioRef.current = countdownAudio;
+    void countdownAudio.play().catch(() => {
+      // 自动播放被拒时静默失败，倒计时照常进行
+    });
+
     let remaining = 3;
     setRecordingCountdown(remaining);
     recordingCountdownRef.current = window.setInterval(() => {
@@ -548,6 +562,9 @@ function App() {
           window.clearInterval(recordingCountdownRef.current);
           recordingCountdownRef.current = null;
         }
+        // 正常情况音频已播完；pause 兜底，避免残留外放被录进录音开头
+        countdownAudioRef.current?.pause();
+        countdownAudioRef.current = null;
         setRecordingCountdown(null);
         setIsStartingRecording(true);
         void recorder.startRecording().finally(() => {

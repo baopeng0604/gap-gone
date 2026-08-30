@@ -31,7 +31,8 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0.45rem 0.8rem;
+  /* 按钮改小后同步压缩行高，节省垂直空间 */
+  padding: 0.25rem 0.6rem;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
@@ -42,12 +43,20 @@
 
 .transcript-actions {
   display: inline-flex;
-  gap: 0.4rem;
+  gap: 0.3rem;
+}
+
+/* 面板按钮与顶部工具栏（.controls button）同尺寸，覆盖全局 button 的大尺寸 */
+.transcript-actions button {
+  font-size: 0.78rem;
+  padding: 0.32rem 0.6rem;
+  line-height: 1.2;
+  white-space: nowrap;
 }
 
 .transcript-list {
-  /* 约 4 行高度，超出内部滚动 */
-  max-height: 132px;
+  /* 5 行高度（每行约 31.7px + 列表上下 padding），超出内部滚动 */
+  max-height: 168px;
   overflow-y: auto;
   padding: 0.3rem;
 }
@@ -469,9 +478,11 @@
   box-sizing: border-box;
 }
 
-/* 有音频时至少完整露出 3 行波形（含词带），避免可视区过矮 */
+/* 有音频时至少完整露出 3 行波形，避免可视区过矮。
+   border-box 含 padding-bottom 2rem(32px)：3 行含词带 154px×3 + gap 24px×2 = 510，
+   510 + 32 = 542，取 544px 留渲染余量（旧值 516px 会被词带裁掉第三行）。 */
 .waveform-score-container {
-  min-height: 516px;
+  min-height: 544px;
 }
 
 .empty-state {
