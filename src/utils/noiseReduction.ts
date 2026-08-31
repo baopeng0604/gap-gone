@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { readFile, writeFile } from "@tauri-apps/plugin-fs";
 import { bufferToWav } from "./exportUtils";
 import type { Region } from "./regionUtils";
 
@@ -103,17 +104,68 @@ function compatibilityReduction(
   return result;
 }
 
+/** fs 插件返回的 Uint8Array 转成独立 ArrayBuffer，供 decodeAudioData 使用。 */
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer;
+}
+
+/**
+ * 用 OfflineAudioContext 把音频重采样/ remix 到目标格式。
+ * 格式已匹配时原样返回，不做无谓渲染。
+ */
+export async function renderBuffer(
+  buffer: AudioBuffer,
+  channels: number,
+  sampleRate: number,
+): Promise<AudioBuffer> {
+  if (buffer.numberOfChannels === channels && buffer.sampleRate === sampleRate) {
+    return buffer;
+  }
+  const length = Math.max(1, Math.ceil(buffer.duration * sampleRate));
+  const offline = new OfflineAudioContext(channels, length, sampleRate);
+  const sourceNode = offline.createBufferSource();
+  sourceNode.buffer = buffer;
+  sourceNode.connect(offline.destination);
+  sourceNode.start();
+  return offline.startRendering();
+}
+
 async function processWithDeepFilterNet(
   context: AudioContext,
   source: AudioBuffer,
   preset: NoisePreset,
 ): Promise<AudioBuffer> {
-  const wav = bufferToWav(source);
-  const bytes = await invoke<number[]>("denoise_audio", {
-    wavBytes: Array.from(new Uint8Array(await wav.arrayBuffer())),
-    preset,
-  });
-  return context.decodeAudioData(new Uint8Array(bytes).buffer);
+  // DeepFilterNet3 只接受 48 kHz 单声道：先离线重采样/下混，
+  // 处理完再还原回原始格式。44.1 kHz 设备（Mac 上常见）不再静默降级。
+  const prepared = await renderBuffer(source, 1, 48000);
+  const wav = bufferToWav(prepared);
+  // 大文件走「临时文件 + 路径传参」，Vec<u8> 经 JSON 序列化会卡死 IPC。
+  const { inputPath, outputPath } = await invoke<{
+    inputPath: string;
+    outputPath: string;
+  }>("prepare_denoise_files");
+  await writeFile(inputPath, new Uint8Array(await wav.arrayBuffer()));
+  try {
+    await invoke("denoise_audio", { inputPath, outputPath, preset });
+    const bytes = await readFile(outputPath);
+    const denoised = await context.decodeAudioData(toArrayBuffer(bytes));
+    // 还原回原始采样率与声道数，保证回填区间时长度对齐。
+    return await renderBuffer(
+      denoised,
+      source.numberOfChannels,
+      source.sampleRate,
+    );
+  } finally {
+    void invoke("delete_recording_file", { path: inputPath }).catch(
+      () => undefined,
+    );
+    void invoke("delete_recording_file", { path: outputPath }).catch(
+      () => undefined,
+    );
+  }
 }
 
 export async function applyNoiseReduction(
@@ -127,7 +179,9 @@ export async function applyNoiseReduction(
   let processed: AudioBuffer;
   let engine: NoiseReductionResult["engine"] = "兼容性降噪";
 
-  if (isTauriDesktop() && target.sampleRate === 48000 && target.numberOfChannels === 1) {
+  // 采样率/声道不匹配时由 renderBuffer 在 DeepFilterNet 前后做转换，
+  // 桌面端任何设备格式都优先走 DeepFilterNet3。
+  if (isTauriDesktop()) {
     const unlisten = await listen<number>("denoise-progress", (event) =>
       onProgress?.(event.payload),
     );

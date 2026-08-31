@@ -147,6 +147,24 @@ export default function HelpModal({
             </li>
           </ul>
 
+          <h3>转录</h3>
+          <ul>
+            <li>
+              <span className="help-modal-kbd">转录文字</span>：本地 SenseVoice
+              离线识别，首次使用需下载约 230MB 模型
+            </li>
+            <li>
+              字词直接显示在每行波形下方并与波形对齐，点击对应位置即跳转；
+              播放中的字高亮，被切除区间覆盖的字划线置灰
+            </li>
+            <li>
+              波形下方另有句子面板：点击句子跳转，可导出
+              <span className="help-modal-kbd">SRT</span> 字幕和
+              <span className="help-modal-kbd">TXT</span> 文字稿
+            </li>
+            <li>时间戳为字级、约 60ms 分辨率，适合定位内容，不宜直接当切割点</li>
+          </ul>
+
           <h3>录音电平</h3>
           <ul>
             <li>RMS 是平均响度，Peak 是瞬时峰值，单位都是 dBFS。</li>
@@ -174,6 +192,17 @@ export default function HelpModal({
             </li>
             <li>
               <span className="help-modal-kbd">S</span>：停止录音
+            </li>
+            <li>
+              <span className="help-modal-kbd">X</span>：切换到切除工具（再按一次返回）
+            </li>
+            <li>
+              <span className="help-modal-kbd">C</span>：切换到恢复工具（再按一次返回）
+            </li>
+            <li>
+              <span className="help-modal-kbd">N</span>：一键降噪；
+              <span className="help-modal-kbd">B</span>：恢复原始；
+              <span className="help-modal-kbd">T</span>：转录文字
             </li>
             <li>
               <span className="help-modal-kbd">⌘/Ctrl+Z</span>：撤销；

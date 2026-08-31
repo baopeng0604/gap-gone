@@ -22,3 +22,16 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# WorkBuddy
+.workbuddy/
+
+# Temp & generated
+_tmp_*
+vite.config.ts.timestamp-*
+
+# 语音模型文件（~230MB，运行时下载或手动放置，绝不入库）
+models/
+
+# Lock files (project uses pnpm, not npm)
+package-lock.json

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { readFile } from "@tauri-apps/plugin-fs";
+import { getDeviceId, setDeviceId } from "./utils/settings";
 
 export interface AudioInputDevice {
   deviceId: string;
@@ -32,17 +34,31 @@ function toDb(linear: number) {
   return linear > 0 ? 20 * Math.log10(linear) : Number.NEGATIVE_INFINITY;
 }
 
+/** fs 插件返回的 Uint8Array 转成独立 ArrayBuffer，避免 Blob 引用共享缓冲的偏移问题。 */
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer;
+}
+
 function isTauriDesktop() {
   return Boolean((window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
 }
 
 export function useRecorder() {
   const [devices, setDevices] = useState<AudioInputDevice[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState("");
+  const [selectedDeviceId, setSelectedDeviceIdRaw] = useState(getDeviceId);
+  // 选择变化即持久化（localStorage），下次启动直接恢复
+  const setSelectedDeviceId = useCallback((id: string) => {
+    setDeviceId(id);
+    setSelectedDeviceIdRaw(id);
+  }, []);
   const [monitorEnabled, setMonitorEnabled] = useState(false);
   const [level, setLevel] = useState<MonitorLevel>(emptyLevel);
   const [peakHoldDb, setPeakHoldDb] = useState(Number.NEGATIVE_INFINITY);
   const [clipLatched, setClipLatched] = useState(false);
+  const [glitchCount, setGlitchCount] = useState(0);
   const [status, setStatus] = useState<RecorderStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
@@ -64,6 +80,7 @@ export function useRecorder() {
   const discardStopRef = useRef(false);
   const nativePathRef = useRef<string | null>(null);
   const nativeUnlistenRef = useRef<UnlistenFn | null>(null);
+  const nativeErrorUnlistenRef = useRef<UnlistenFn | null>(null);
   const nativeTimerRef = useRef<number | null>(null);
 
   const refreshDevices = useCallback(async () => {
@@ -77,7 +94,13 @@ export function useRecorder() {
           label: device.label || "未命名设备",
         }));
         setDevices(inputs);
-        setSelectedDeviceId((current) => current || inputs[0]?.deviceId || "");
+        // 持久化的设备 id 不在当前列表时（设备被拔）回退默认设备
+        setSelectedDeviceIdRaw((current) => {
+          if (current && inputs.some((device) => device.deviceId === current)) {
+            return current;
+          }
+          return inputs[0]?.deviceId ?? "";
+        });
         return;
       } catch {
         // A webview without the native command falls back to Web Media APIs.
@@ -93,7 +116,7 @@ export function useRecorder() {
           label: device.label || `麦克风 ${index + 1}`,
         }));
       setDevices(inputs);
-      setSelectedDeviceId((current) => {
+      setSelectedDeviceIdRaw((current) => {
         if (current && inputs.some((device) => device.deviceId === current)) {
           return current;
         }
@@ -161,6 +184,8 @@ export function useRecorder() {
   const cleanupNative = useCallback(() => {
     nativeUnlistenRef.current?.();
     nativeUnlistenRef.current = null;
+    nativeErrorUnlistenRef.current?.();
+    nativeErrorUnlistenRef.current = null;
     if (nativeTimerRef.current !== null) {
       window.clearInterval(nativeTimerRef.current);
       nativeTimerRef.current = null;
@@ -218,6 +243,7 @@ export function useRecorder() {
     pausedRef.current = false;
     pausedAtRef.current = null;
     pausedDurationRef.current = 0;
+    setGlitchCount(0);
     stopMeter();
     if (isTauriDesktop()) {
       try {
@@ -225,9 +251,11 @@ export function useRecorder() {
           deviceId: selectedDeviceId || null,
         });
         nativePathRef.current = result.path;
-        nativeUnlistenRef.current = await listen<{ rms: number; peak: number }>(
-          "recording-level",
-          (event) => {
+        nativeUnlistenRef.current = await listen<{
+          rms: number;
+          peak: number;
+          glitches?: number;
+        }>("recording-level", (event) => {
             if (pausedRef.current) return;
             const rmsDb = toDb(event.payload.rms);
             const peakDb = toDb(event.payload.peak);
@@ -239,8 +267,49 @@ export function useRecorder() {
             });
             setPeakHoldDb((current) => Math.max(current, peakDb));
             if (event.payload.peak >= 0.999) setClipLatched(true);
+            // Xrun 毛刺计数：瞬时缓冲抖动不致命，只提示不中断。
+            setGlitchCount(event.payload.glitches ?? 0);
           },
         );
+        // Rust 端录音流出错（WASAPI underrun/overrun、设备拔出等）时会回收流，
+        // 并保留已写入的部分录音；这里读回来直接进入试听，避免整段丢失。
+        nativeErrorUnlistenRef.current = await listen<{
+          message: string;
+          path: string | null;
+        }>("recording-error", async (event) => {
+          const { message, path } = event.payload;
+          let partialBlob: Blob | null = null;
+          if (path) {
+            try {
+              // fs 插件走二进制 raw 传输，长录音不会像 JSON 数组那样卡死 IPC。
+              const bytes = await readFile(path);
+              // 44 字节是 WAV 头，超过说明有实际采样数据。
+              if (bytes.length > 44) {
+                partialBlob = new Blob([toArrayBuffer(bytes)], {
+                  type: "audio/wav",
+                });
+                void invoke("delete_recording_file", { path }).catch(
+                  () => undefined,
+                );
+              }
+            } catch {
+              // 部分录音读取失败时按普通错误处理。
+            }
+          }
+          stopMeter();
+          cleanupNative();
+          setIsPaused(false);
+          if (partialBlob) {
+            setRecordedBlob(partialBlob);
+            setDuration(getElapsedDuration());
+            setStatus("review");
+            setError(`录音中断（${message}），已保留中断前的部分录音，请试听确认`);
+          } else {
+            setRecordedBlob(null);
+            setStatus("error");
+            setError(message || "录音过程中发生错误");
+          }
+        });
         startedAtRef.current = performance.now();
         nativeTimerRef.current = window.setInterval(
           () =>
@@ -249,8 +318,18 @@ export function useRecorder() {
         );
         setStatus("recording");
         return;
-      } catch {
-        // Development webview fallback below keeps browser testing possible.
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        // 仅当命令不存在（浏览器开发预览）时降级到 Web Media API；
+        // 原生录音的真实错误必须直接展示，否则用户只能看到无效的降级报错。
+        const commandMissing =
+          message.includes("start_recording") &&
+          /not found|unknown|no such/i.test(message);
+        if (!commandMissing) {
+          setStatus("error");
+          setError(message || "无法启动录音");
+          return;
+        }
       }
     }
 
@@ -338,6 +417,7 @@ export function useRecorder() {
     }
   }, [
     cleanupAudio,
+    cleanupNative,
     refreshDevices,
     selectedDeviceId,
     startMeter,
@@ -349,9 +429,9 @@ export function useRecorder() {
     if (nativePathRef.current) {
       const activePath = nativePathRef.current;
       return invoke<string>("stop_recording")
-        .then((path) => invoke<number[]>("read_recording", { path }))
+        .then((path) => readFile(path))
         .then((bytes) => {
-          const blob = new Blob([new Uint8Array(bytes)], { type: "audio/wav" });
+          const blob = new Blob([toArrayBuffer(bytes)], { type: "audio/wav" });
           setRecordedBlob(blob);
           setStatus("review");
           setIsPaused(false);
@@ -381,6 +461,15 @@ export function useRecorder() {
       recorderRef.current = null;
     });
   }, [cleanupNative, recordedBlob, stopMeter]);
+
+  // 最长录制时长：15 分钟。超时自动停止并保留已录内容（走正常停止流程），
+  // 双路径（原生/Web Media）共用这一道闸门。
+  const MAX_RECORDING_SECONDS = 15 * 60;
+  useEffect(() => {
+    if (status !== "recording" || duration < MAX_RECORDING_SECONDS) return;
+    setError("已到达最长录制时长 15 分钟，录音已自动停止并保留");
+    void stopRecording();
+  }, [duration, status, stopRecording]);
 
   const pauseRecording = useCallback(async () => {
     if (status !== "recording" || pausedRef.current) return;
@@ -468,6 +557,7 @@ export function useRecorder() {
     level,
     peakHoldDb,
     clipLatched,
+    glitchCount,
     clearClip,
     status,
     error,

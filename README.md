@@ -14,14 +14,14 @@
   - **右键拖拽**: 标记/添加删除区域。
   - **中键拖拽**: 擦除/恢复删除区域。
   - **空格键**: 播放/暂停。
-- **本地录音**: 选择输入设备，录音前 3 秒倒计时，实时查看 RMS/Peak dBFS 电平，录音中可暂停、取消或停止。
+- **本地录音**: 选择输入设备，录音前 2 秒倒计时（「准备」/「开始」），实时查看 RMS/Peak dBFS 电平，录音中可暂停、取消或停止。
 - **削波提示**: -6 dBFS 以上显示黄色预警，检测到数字削波时右侧 CLIP 红标锁存，点击即可清除。
 - **电平刻度**: 录音长条标出 -24、-18、-12、-6 和 -3 dB，越靠右越接近 0 dBFS。
-- **多行波形乐谱**: 每行代表 10 秒，默认 1200×800 窗口完整显示 1000px 波形。
+- **多行波形乐谱**: 每行代表 10 秒，默认 1280×820 窗口完整显示 1000px 波形，最小窗口宽度 1100。
 - **非破坏性编辑**: 手动切除、自动检测、恢复、撤销/重做都不会覆盖原始录音。
 - **智能降噪**: 桌面端使用标准 DeepFilterNet3 离线处理，提供轻、中、强三档并支持试听。
-- **播放时跳过**: 标记的片段在播放和 WAV 导出时都会跳过，成片时长会缩短。
-- **WAV 导出**: 第一阶段导出 48 kHz、单声道 PCM WAV。
+- **播放时跳过**: 标记的片段在播放和导出时都会跳过，成片时长会缩短。
+- **MP3/WAV 导出**: 默认导出 128 kbps 单声道 MP3，可在设置中切换 WAV（48 kHz 单声道 PCM）或调整码率（96/128/192 kbps）。
 
 工具栏分为两行：上排放去静音、降噪、导出和帮助；下排放打开、录音、播放及选择/切除/恢复/撤销/重做。
 
@@ -33,65 +33,103 @@
 
 ## 📦 安装与运行
 
-确保你已经安装了 [Rust](https://www.rust-lang.org/tools/install) 和 [Node.js](https://nodejs.org)。
+### 前提条件
 
-1.  **克隆项目**
+- [Rust](https://www.rust-lang.org/tools/install)（含 cargo）
+- [Node.js](https://nodejs.org)（建议 18+）
+- **Windows 额外要求**：MSVC Build Tools（含 C++ 桌面开发工作负载）+ WebView2 运行时（Windows 10/11 通常已预装）
 
-    ```bash
-    git clone https://github.com/your-username/gap-gone.git
-    cd gap-gone
-    ```
-
-2.  **安装依赖**
-
-    ```bash
-    pnpm install
-    # 或者 npm install / yarn install
-    ```
-
-3.  **启动开发模式**
-
-    ```bash
-    pnpm tauri dev
-    ```
-
-4.  **构建应用**
-    ```bash
-    pnpm tauri build
-    ```
-
-### 前端构建产物
-
-`pnpm build` 只构建前端静态资源，输出到：
-
-```text
-dist/
-```
-
-不要直接双击 `dist/index.html`，因为资源路径和部分 Tauri API 需要通过 HTTP 服务加载。查看生产前端请运行：
+### 克隆项目
 
 ```bash
-pnpm preview --host 127.0.0.1
+git clone https://github.com/your-username/gap-gone.git
+cd gap-gone
 ```
 
-开发模式使用 `http://127.0.0.1:1420/`。如果该地址仍显示旧界面，请停止旧的 Vite 进程后重新运行：
+### 安装依赖
 
 ```bash
-pnpm dev --host 127.0.0.1
+# npm（默认）
+npm install
+
+# 或 pnpm
+pnpm install
 ```
 
-`pnpm tauri build` 通常会在 `src-tauri/target/release/bundle/` 下生成 macOS、Windows 或 Linux 安装产物；macOS 应用一般位于 `macos/gap-gone.app`，磁盘镜像位于 `dmg/`。
+> 项目默认配置为 npm（`tauri.conf.json` 中 `beforeBuildCommand` 为 `npm run build`）。切换到 pnpm 时需同步修改该配置并提交 `pnpm-lock.yaml`。
+
+### 启动开发模式
+
+```bash
+# npm
+npm run tauri dev
+
+# pnpm
+pnpm tauri dev
+```
+
+开发服务器地址：`http://localhost:1420/`。如果仍显示旧界面，停止旧 Vite 进程后重新运行即可。
+
+### 构建应用
+
+```bash
+# npm
+npm run tauri build
+
+# pnpm
+pnpm tauri build
+```
+
+> 首次编译需下载并编译全部 Rust 依赖（含 DeepFilterNet3 + tract），耗时约 30–60 分钟；后续增量编译会快很多。
+
+### 构建产物位置
+
+构建完成后，产物位于 `src-tauri/target/release/`：
+
+| 平台 | 可执行文件 | 安装包 |
+|---|---|---|
+| **Windows** | `gap-gone.exe` | `bundle/nsis/gap-gone_0.1.0_x64-setup.exe`（NSIS）、`bundle/msi/*.msi`（MSI） |
+| **macOS** | `gap-gone.app` | `bundle/dmg/gap-gone_*.dmg` |
+| **Linux** | — | `bundle/deb/*.deb`、`bundle/appimage/*.AppImage` |
+
+可执行文件可直接双击运行，安装包用于分发。
+
+### 仅构建前端
+
+```bash
+# npm
+npm run build
+
+# pnpm
+pnpm build
+```
+
+输出到 `dist/`。不要直接双击 `dist/index.html`，资源路径和部分 Tauri API 需要通过 HTTP 服务加载。预览前端：
+
+```bash
+npm run preview -- --host 127.0.0.1
+# 或 pnpm preview --host 127.0.0.1
+```
+
+### CI 自动构建（GitHub Actions）
+
+项目内置 `.github/workflows/build-windows.yml`，可在 GitHub Actions 上自动构建 Windows 安装包：
+
+- **手动触发**：仓库 Actions 页面 → 选中 "Build Windows App" → Run workflow（可选择任意分支）
+- **推送触发**（可选）：取消 `on.push` 部分的注释即可在推送时自动构建
+
+构建产物会作为 Artifact 上传，可在 Actions 运行页面下载。
 
 ## 🎮 使用指南
 
 1. 先打开录音设置选择麦克风，点击 **“确定”** 关闭设置窗口，再点击 **“录音”**，或直接打开音频文件。
-2. 点击录音后先显示 3、2、1；倒计时期间可以取消，结束后才开始采集。
+2. 点击录音后先显示 2 秒倒计时（「准备」→「开始」）；倒计时期间可以取消，结束后才开始采集。
 3. 录音时查看 RMS、Peak 和峰值保持 dBFS，可点击 **“暂停”**、**“取消”** 或 **“停止录音”**。
 4. 停止录音后选择 **“取消”** 或 **“确定并编辑”**。
 5. 在编辑页选择去静音预设，点击 **“检测静音”**，检查波形候选区间后点击 **“应用检测”**；不满意时可 **“清除候选”** 或 **“恢复本次检测”**。
 6. 使用选择、切除、恢复和撤销/重做工具；选择切除或恢复后也可以直接拖拽波形。
 7. 选择降噪强度，点击 **“一键降噪”**，播放试听后确认或取消。
-8. 满意后点击 **“导出 WAV”**，保存处理后的音频文件；默认文件名会带有精确到秒的日期时间前缀，例如 `20260823-233600-edited-audio.wav`。
+8. 满意后点击 **“导出 MP3”**（或设置中切换的格式），保存处理后的音频文件；默认文件名会带有精确到秒的日期时间前缀，例如 `20260823-233600-edited-audio.mp3`。
 
 ## ⌨️ 快捷键与鼠标操作
 
@@ -102,7 +140,7 @@ pnpm dev --host 127.0.0.1
 - `P`：录音中暂停 / 继续。
 - `S`：录音中停止并进入录音结果预览。
 - `⌘/Ctrl+Z`：撤销；`⌘/Ctrl+Shift+Z`：重做。
-- `⌘/Ctrl+S`：导出 WAV。
+- `⌘/Ctrl+S`：导出音频（默认 MP3，可在设置中切换 WAV）。
 - `O`：打开音频文件。
 - `Enter`：录音结束后确定并进入编辑。
 - `Esc`：取消录音倒计时、录音中取消并返回编辑页，或取消录音结果；帮助打开时关闭帮助。
