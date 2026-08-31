@@ -209,7 +209,7 @@ export function useRecorder() {
       const rms = Math.sqrt(sum / data.length);
       const rmsDb = toDb(rms);
       const peakDb = toDb(peak);
-      setLevel({ rms: Math.min(1, rms * 3.2), peak, rmsDb, peakDb });
+      setLevel({ rms, peak, rmsDb, peakDb });
       setPeakHoldDb((current) => Math.max(current, peakDb));
       if (peak >= 0.999) setClipLatched(true);
       setDuration(getElapsedDuration());
@@ -260,7 +260,7 @@ export function useRecorder() {
             const rmsDb = toDb(event.payload.rms);
             const peakDb = toDb(event.payload.peak);
             setLevel({
-              rms: Math.min(1, event.payload.rms * 3.2),
+              rms: event.payload.rms,
               peak: event.payload.peak,
               rmsDb,
               peakDb,
@@ -462,12 +462,12 @@ export function useRecorder() {
     });
   }, [cleanupNative, recordedBlob, stopMeter]);
 
-  // 最长录制时长：15 分钟。超时自动停止并保留已录内容（走正常停止流程），
+  // 最长录制时长：30 分钟。超时自动停止并保留已录内容（走正常停止流程），
   // 双路径（原生/Web Media）共用这一道闸门。
-  const MAX_RECORDING_SECONDS = 15 * 60;
+  const MAX_RECORDING_SECONDS = 30 * 60;
   useEffect(() => {
     if (status !== "recording" || duration < MAX_RECORDING_SECONDS) return;
-    setError("已到达最长录制时长 15 分钟，录音已自动停止并保留");
+    setError("已到达最长录制时长 30 分钟，录音已自动停止并保留");
     void stopRecording();
   }, [duration, status, stopRecording]);
 

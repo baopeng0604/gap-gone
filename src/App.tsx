@@ -119,11 +119,100 @@ function createExportFileName(extension: string, keyword: string | null) {
 }
 
 const METER_MIN_DB = -30;
-const METER_MARKS = [-24, -18, -12, -6, -3];
+const METER_MARKS = [-24, -18, -12, -6, -3, 0];
 
 function meterPosition(db: number) {
   if (!Number.isFinite(db)) return 0;
   return Math.max(0, Math.min(1, (db - METER_MIN_DB) / -METER_MIN_DB));
+}
+
+/**
+ * 录音峰值表的视觉弹道：升起贴峰值，约 60 dB/s 落下；
+ * 峰值针保持 1.2s 再下落。数字读数仍用瞬时值，这里只驱动条子。
+ */
+function usePeakMeterBallistics(peakDb: number, running: boolean) {
+  const [barDb, setBarDb] = useState(Number.NEGATIVE_INFINITY);
+  const [holdDb, setHoldDb] = useState(Number.NEGATIVE_INFINITY);
+  const peakDbRef = useRef(peakDb);
+  peakDbRef.current = peakDb;
+
+  useEffect(() => {
+    if (!running) {
+      setBarDb(Number.NEGATIVE_INFINITY);
+      setHoldDb(Number.NEGATIVE_INFINITY);
+      return;
+    }
+    let bar = Number.NEGATIVE_INFINITY;
+    let hold = Number.NEGATIVE_INFINITY;
+    let holdUntil = 0;
+    let last = performance.now();
+    let frame = 0;
+    const tick = (now: number) => {
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      const target = Number.isFinite(peakDbRef.current)
+        ? peakDbRef.current
+        : Number.NEGATIVE_INFINITY;
+      if (!Number.isFinite(bar) || target >= bar) {
+        bar = target;
+      } else {
+        bar = Math.max(target, bar - 60 * dt);
+      }
+      if (!Number.isFinite(hold) || target >= hold) {
+        hold = target;
+        holdUntil = now + 1200;
+      } else if (now > holdUntil) {
+        hold = Math.max(target, hold - 40 * dt);
+      }
+      setBarDb(bar);
+      setHoldDb(hold);
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [running]);
+
+  return { barDb, holdDb };
+}
+
+function toDb(value: number) {
+  return value > 0 ? 20 * Math.log10(value) : Number.NEGATIVE_INFINITY;
+}
+
+/** 从当前播放位置取一小窗采样算 RMS/Peak，不依赖 AnalyserNode 过音频图。 */
+function levelFromBuffer(buffer: AudioBuffer, time: number, windowSize = 2048) {
+  const channel = buffer.getChannelData(0);
+  const start = Math.max(
+    0,
+    Math.min(channel.length - 1, Math.floor(time * buffer.sampleRate)),
+  );
+  const end = Math.min(channel.length, start + windowSize);
+  const count = Math.max(1, end - start);
+  let sumSquares = 0;
+  let peak = 0;
+  for (let i = start; i < end; i++) {
+    const sample = channel[i];
+    sumSquares += sample * sample;
+    const abs = Math.abs(sample);
+    if (abs > peak) peak = abs;
+  }
+  return {
+    rmsDb: toDb(Math.sqrt(sumSquares / count)),
+    peakDb: toDb(peak),
+  };
+}
+
+/** 整段音频真实峰值（dBFS）。波形画布按 ±1.0 原样映射，峰值近 0 才会顶满行高。 */
+function bufferTruePeakDb(buffer: AudioBuffer) {
+  let peak = 0;
+  for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+    const data = buffer.getChannelData(channel);
+    for (let i = 0; i < data.length; i++) {
+      const abs = Math.abs(data[i]);
+      if (abs > peak) peak = abs;
+    }
+  }
+  return toDb(peak);
 }
 
 function App() {
@@ -256,8 +345,11 @@ function App() {
     sourceStartedAt: number;
     sourceOffset: number;
   } | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
   const recorder = useRecorder();
+  const recordingMeter = usePeakMeterBallistics(
+    recorder.level.peakDb,
+    recorder.status === "recording" && !recorder.isPaused,
+  );
   const deletedRegions = useMemo(
     () =>
       normalizeRegions([
@@ -266,17 +358,16 @@ function App() {
       ]),
     [editState],
   );
+  const filePeakDb = useMemo(
+    () => (audioBuffer ? bufferTruePeakDb(audioBuffer) : null),
+    [audioBuffer],
+  );
 
   useEffect(() => {
     const AudioContextConstructor =
       window.AudioContext || (window as typeof window & { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     const context = new AudioContextConstructor();
     audioContextRef.current = context;
-    // 常驻分析节点：所有播放都路由经过它，供右侧音量刻度图读取实时电平。
-    const analyser = context.createAnalyser();
-    analyser.fftSize = 2048;
-    analyser.connect(context.destination);
-    analyserRef.current = analyser;
     const preventContextMenu = (event: MouseEvent) => event.preventDefault();
     document.addEventListener("contextmenu", preventContextMenu);
 
@@ -410,7 +501,9 @@ function App() {
         const segment = segments[segmentIndex];
         const source = audioContextRef.current.createBufferSource();
         source.buffer = audioBuffer;
-        source.connect(analyserRef.current ?? audioContextRef.current.destination);
+        // 必须直连 destination。macOS WKWebView 上把 AnalyserNode 串在
+        // 输出链里会吞掉声音；倒计时用 HTMLAudio 所以不受影响。
+        source.connect(audioContextRef.current.destination);
         playbackRef.current = {
           token,
           segments,
@@ -436,27 +529,11 @@ function App() {
 
       setIsPlaying(true);
       playSegment(index, Math.max(playableOffset, segments[index].start));
-      const analyser = analyserRef.current;
-      const samples = analyser ? new Float32Array(analyser.fftSize) : null;
       const animate = () => {
         if (playbackTokenRef.current !== token || !playbackRef.current) return;
-        setPosition(getLivePosition());
-        // 逐帧读取播放波形，换算 RMS/Peak dBFS 供右侧音量刻度图显示。
-        if (analyser && samples) {
-          analyser.getFloatTimeDomainData(samples);
-          let sumSquares = 0;
-          let peak = 0;
-          for (let i = 0; i < samples.length; i++) {
-            const v = samples[i];
-            sumSquares += v * v;
-            const abs = Math.abs(v);
-            if (abs > peak) peak = abs;
-          }
-          const rms = Math.sqrt(sumSquares / samples.length);
-          const toDb = (value: number) =>
-            value > 0 ? 20 * Math.log10(value) : Number.NEGATIVE_INFINITY;
-          setPlaybackLevel({ rmsDb: toDb(rms), peakDb: toDb(peak) });
-        }
+        const position = getLivePosition();
+        setPosition(position);
+        setPlaybackLevel(levelFromBuffer(audioBuffer, position));
         animationFrameRef.current = requestAnimationFrame(animate);
       };
       animationFrameRef.current = requestAnimationFrame(animate);
@@ -1504,8 +1581,8 @@ function App() {
           <div className="meter-line">
             <div className="meter-wrap">
               <div
-                className={`meter${recorder.level.peakDb >= -6 ? " meter-warning" : ""}`}
-                aria-label="实时输入电平"
+                className={`meter${recordingMeter.barDb >= -6 ? " meter-warning" : ""}`}
+                aria-label="实时输入峰值电平"
               >
                 <div
                   className="meter-rms"
@@ -1514,9 +1591,16 @@ function App() {
                   }}
                 />
                 <div
+                  className="meter-bar"
+                  style={{
+                    transform: `scaleX(${meterPosition(recordingMeter.barDb)})`,
+                  }}
+                />
+                <div
                   className="meter-peak"
                   style={{
-                    left: `${meterPosition(recorder.level.peakDb) * 100}%`,
+                    left: `${meterPosition(recordingMeter.holdDb) * 100}%`,
+                    opacity: Number.isFinite(recordingMeter.holdDb) ? 1 : 0,
                   }}
                 />
                 {METER_MARKS.map((db) => (
@@ -1655,7 +1739,9 @@ function App() {
         )}
       </div>
 
-      {audioBuffer && <WaveSidebar level={playbackLevel} />}
+      {audioBuffer && (
+        <WaveSidebar level={playbackLevel} filePeakDb={filePeakDb} />
+      )}
 
       {transcript && audioBuffer && transcriptVisible && (
         <TranscriptPanel

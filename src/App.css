@@ -126,6 +126,10 @@
   white-space: nowrap;
 }
 
+.sidebar-meter-readout-secondary {
+  color: #777;
+}
+
 .sidebar-meter-body {
   display: flex;
   align-items: stretch;
@@ -725,8 +729,15 @@ button:disabled {
   inset: 0;
   z-index: 0;
   transform-origin: left center;
-  background: rgba(125, 235, 133, 0.85);
-  transition: transform 60ms linear;
+  background: rgba(125, 235, 133, 0.28);
+}
+
+.meter-bar {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  transform-origin: left center;
+  background: rgba(125, 235, 133, 0.9);
 }
 
 .meter-peak {
@@ -734,9 +745,10 @@ button:disabled {
   top: 0;
   bottom: 0;
   z-index: 2;
-  width: 2px;
+  width: 3px;
+  margin-left: -1px;
   background: #fff;
-  transition: left 60ms linear;
+  box-shadow: 0 0 4px rgba(255, 255, 255, 0.8);
 }
 
 .meter-tick {
@@ -763,8 +775,12 @@ button:disabled {
   transform: translateX(-50%);
 }
 
-.meter-warning .meter-rms {
+.meter-warning .meter-bar {
   background: #e6b84e;
+}
+
+.meter-warning .meter-rms {
+  background: rgba(230, 184, 78, 0.3);
 }
 
 .meter-readouts {
