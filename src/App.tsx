@@ -56,9 +56,17 @@ import {
   setAutoTranscribe,
   setCustomModelDir,
   setTranscribeModelDir,
+  transcribeModelStatusText,
   type TranscriptResult,
+  type TranscribeModelStatus,
   type TranscribeProgress,
 } from "./utils/transcribe";
+import {
+  formatLufs,
+  integratedLufsFromBuffer,
+  lufsBand,
+  lufsBandLabel,
+} from "./utils/lufs";
 import TranscriptPanel from "./components/TranscriptPanel";
 import WaveSidebar from "./components/WaveSidebar";
 import { useRecorder } from "./useRecorder";
@@ -85,6 +93,19 @@ const silencePresetLabels: Record<SilencePreset, string> = {
 
 function formatDb(value: number) {
   return Number.isFinite(value) ? `${value.toFixed(1)} dBFS` : "-∞ dBFS";
+}
+
+function LufsReadout({ lufs }: { lufs: number }) {
+  const band = lufsBand(lufs);
+  return (
+    <span
+      className={band ? `lufs-readout lufs-${band}` : "lufs-readout"}
+      title="成片 Integrated LUFS，对照短视频常见目标 -14 LUFS"
+    >
+      {formatLufs(lufs)}
+      {band ? ` ${lufsBandLabel(band)}` : ""}
+    </span>
+  );
 }
 
 interface TempStorageStatus {
@@ -234,18 +255,22 @@ function App() {
 
   /**
    * 展示提示：info（成功/结果通知）3 秒后自动消失；
-   * error（失败）常驻，需手动关闭。新提示会替换旧提示并重置计时。
+   * progress（进行中）留到下一条提示替换；error（失败）常驻，需手动关闭。
+   * 新提示会替换旧提示并重置计时。
    */
-  const notify = useCallback((message: string, kind: "info" | "error" = "info") => {
-    window.clearTimeout(noticeTimerRef.current);
-    setNoiseNotice(message);
-    if (kind === "info") {
-      noticeTimerRef.current = window.setTimeout(
-        () => setNoiseNotice(null),
-        3000,
-      );
-    }
-  }, []);
+  const notify = useCallback(
+    (message: string, kind: "info" | "error" | "progress" = "info") => {
+      window.clearTimeout(noticeTimerRef.current);
+      setNoiseNotice(message);
+      if (kind === "info") {
+        noticeTimerRef.current = window.setTimeout(
+          () => setNoiseNotice(null),
+          3000,
+        );
+      }
+    },
+    [],
+  );
 
   const dismissNotice = useCallback(() => {
     window.clearTimeout(noticeTimerRef.current);
@@ -290,6 +315,15 @@ function App() {
     null,
   );
   const [isClearingTemp, setIsClearingTemp] = useState(false);
+  const [modelStatus, setModelStatus] = useState<TranscribeModelStatus | null>(
+    null,
+  );
+  const [modelDownloadPercent, setModelDownloadPercent] = useState<number | null>(
+    null,
+  );
+  const [modelDownloadError, setModelDownloadError] = useState<string | null>(
+    null,
+  );
 
   const refreshTempStorage = useCallback(async () => {
     try {
@@ -301,12 +335,45 @@ function App() {
     }
   }, []);
 
+  const refreshModelStatus = useCallback(async () => {
+    if (!isTauriDesktop()) return;
+    try {
+      setModelStatus(await checkTranscribeModel());
+    } catch {
+      setModelStatus(null);
+    }
+  }, []);
+
+  const handleDownloadModels = useCallback(async () => {
+    if (!isTauriDesktop() || modelDownloadPercent !== null) return;
+    setModelDownloadError(null);
+    setModelDownloadPercent(0);
+    const unlisten = await onTranscribeProgress((progress) => {
+      if (progress.stage === "download" || progress.stage === "punctuation") {
+        setModelDownloadPercent(Math.max(0, progress.percent));
+      }
+    });
+    try {
+      await downloadTranscribeModel();
+      await refreshModelStatus();
+    } catch (cause) {
+      setModelDownloadError(
+        cause instanceof Error ? cause.message : String(cause),
+      );
+      await refreshModelStatus();
+    } finally {
+      unlisten();
+      setModelDownloadPercent(null);
+    }
+  }, [modelDownloadPercent, refreshModelStatus]);
+
   // 打开设置页时拉一次临时目录占用统计
   useEffect(() => {
     if (showRecordingSetup && isTauriDesktop()) {
       void refreshTempStorage();
+      void refreshModelStatus();
     }
-  }, [showRecordingSetup, refreshTempStorage]);
+  }, [showRecordingSetup, refreshTempStorage, refreshModelStatus]);
 
   const handleClearTempFiles = useCallback(async () => {
     setIsClearingTemp(true);
@@ -361,6 +428,13 @@ function App() {
   const filePeakDb = useMemo(
     () => (audioBuffer ? bufferTruePeakDb(audioBuffer) : null),
     [audioBuffer],
+  );
+  const timelineLufs = useMemo(
+    () =>
+      audioBuffer
+        ? integratedLufsFromBuffer(audioBuffer, deletedRegions)
+        : Number.NEGATIVE_INFINITY,
+    [audioBuffer, deletedRegions],
   );
 
   useEffect(() => {
@@ -797,8 +871,9 @@ function App() {
   const confirmRecording = async () => {
     if (!recorder.recordedBlob || !audioContextRef.current) return;
     setIsProcessing(true);
+    let decoded: AudioBuffer | null = null;
     try {
-      const decoded = await audioContextRef.current.decodeAudioData(
+      decoded = await audioContextRef.current.decodeAudioData(
         await recorder.recordedBlob.arrayBuffer(),
       );
       setAudioBuffer(decoded);
@@ -807,15 +882,16 @@ function App() {
       setTranscript(null);
       resetEditing();
       recorder.clearReview();
-      // 设置页「自动转录」开启时，确定编辑后自动开始转录。
-      // 注意必须传 decoded：audioBuffer 状态此刻尚未更新。
-      if (autoTranscribeEnabled) {
-        void handleTranscribe(decoded);
-      }
     } catch {
       notify("无法解析这段录音", "error");
     } finally {
       setIsProcessing(false);
+    }
+    // 设置页「自动转录」开启时，确定编辑后自动开始转录。
+    // 必须在 isProcessing 清掉之后再调，避免 finally 把转录中的状态冲掉。
+    // 必须传 decoded：audioBuffer 状态此刻尚未更新。
+    if (decoded && autoTranscribeEnabled) {
+      void handleTranscribe(decoded);
     }
   };
 
@@ -853,16 +929,28 @@ function App() {
   const handleTranscribe = async (source?: AudioBuffer) => {
     const target = source ?? audioBuffer;
     if (!target || !audioContextRef.current || !isTauriDesktop()) return;
+    if (modelDownloadPercent !== null) return;
     stopPlayback(false);
     setIsProcessing(true);
     setTranscribeProgress({ stage: "load", percent: -1 });
-    const unlisten = await onTranscribeProgress(setTranscribeProgress);
+    notify("正在加载转录模型…", "progress");
+    const unlisten = await onTranscribeProgress((progress) => {
+      setTranscribeProgress(progress);
+      if (progress.stage === "load") {
+        notify("正在加载转录模型…", "progress");
+      }
+    });
     try {
       // 首次使用先下载模型（约 230MB），之后本地离线可用。
       const status = await checkTranscribeModel();
-      if (!status.ready) {
-        notify("首次使用转录需下载 SenseVoice 模型（约 230MB），下载中…");
+      if (!status.ready || !status.punctReady) {
+        if (!status.ready) {
+          notify("首次使用转录需下载 SenseVoice 模型（约 230MB），下载中…", "progress");
+        } else {
+          notify("正在补全标点模型…", "progress");
+        }
         await downloadTranscribeModel();
+        notify("正在加载转录模型…", "progress");
       }
       const result = await runTranscription(target);
       setTranscript(result);
@@ -1075,6 +1163,7 @@ function App() {
         !hasPrimaryModifier &&
         audioBuffer &&
         !isProcessing &&
+        modelDownloadPercent === null &&
         recorder.status !== "recording" &&
         isTauriDesktop()
       ) {
@@ -1334,7 +1423,7 @@ function App() {
             <div className="toolbar-group" aria-label="转录">
               <button
                 onClick={() => void handleTranscribe()}
-                disabled={!audioBuffer || isProcessing}
+                disabled={!audioBuffer || isProcessing || modelDownloadPercent !== null}
               >
                 转录文字 <span className="shortcut-key">T</span>
               </button>
@@ -1343,8 +1432,6 @@ function App() {
                   <span className="denoise-progress">
                     {transcribeProgress.stage === "download" &&
                       `下载模型 ${Math.round(transcribeProgress.percent)}%`}
-                    {transcribeProgress.stage === "load" &&
-                      "正在加载转录模型…"}
                     {transcribeProgress.stage === "transcribe" &&
                       `转录 ${Math.round(transcribeProgress.percent)}%`}
                     {transcribeProgress.stage === "punctuation" &&
@@ -1437,9 +1524,9 @@ function App() {
                   onClick={() => {
                     const value = modelDirInput.trim();
                     setCustomModelDir(value || null);
-                    void setTranscribeModelDir(value || null).catch(() =>
-                      notify("模型目录保存失败", "error"),
-                    );
+                    void setTranscribeModelDir(value || null)
+                      .then(() => refreshModelStatus())
+                      .catch(() => notify("模型目录保存失败", "error"));
                   }}
                 >
                   保存
@@ -1450,6 +1537,34 @@ function App() {
                 >
                   打开目录
                 </button>
+                <button
+                  onClick={() => void handleDownloadModels()}
+                  disabled={modelDownloadPercent !== null || Boolean(transcribeProgress)}
+                  title="下载 SenseVoice 与标点模型；已存在的文件会跳过"
+                >
+                  {modelDownloadPercent !== null
+                    ? `下载中 ${Math.round(modelDownloadPercent)}%`
+                    : "下载模型"}
+                </button>
+              </div>
+              <div className="setup-row">
+                <small
+                  className={
+                    modelDownloadError
+                      ? "model-status is-error"
+                      : modelStatus?.ready && modelStatus.punctReady
+                        ? "model-status is-ready"
+                        : "model-status"
+                  }
+                >
+                  {modelDownloadError
+                    ? `下载失败：${modelDownloadError}`
+                    : modelDownloadPercent !== null
+                      ? `正在下载 ${Math.round(modelDownloadPercent)}%`
+                      : modelStatus
+                        ? transcribeModelStatusText(modelStatus)
+                        : "状态检查中…"}
+                </small>
               </div>
               <div className="setup-row">
                 <label className="setup-checkbox">
@@ -1641,6 +1756,7 @@ function App() {
             <span>RMS {formatDb(recorder.level.rmsDb)}</span>
             <span>Peak {formatDb(recorder.level.peakDb)}</span>
             <span>保持 {formatDb(recorder.peakHoldDb)}</span>
+            <LufsReadout lufs={recorder.level.lufs} />
           </div>
           <label className="monitor-toggle">
             <input
@@ -1714,7 +1830,7 @@ function App() {
       )}
 
       <div className="waveform-view" ref={waveformViewRef}>
-        {isProcessing && (
+        {isProcessing && !transcribeProgress && (
           <div className="loading-overlay">
             <div className="spinner" />
             <p>处理中...</p>
@@ -1740,7 +1856,11 @@ function App() {
       </div>
 
       {audioBuffer && (
-        <WaveSidebar level={playbackLevel} filePeakDb={filePeakDb} />
+        <WaveSidebar
+          level={playbackLevel}
+          filePeakDb={filePeakDb}
+          lufs={timelineLufs}
+        />
       )}
 
       {transcript && audioBuffer && transcriptVisible && (

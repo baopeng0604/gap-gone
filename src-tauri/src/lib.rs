@@ -18,6 +18,7 @@ use ndarray::Array2;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod lufs;
 mod transcribe;
 
 #[derive(Default)]
@@ -80,6 +81,8 @@ struct RecordingLevel {
     /// 截至目前被容忍的瞬时 underrun/overrun（Xrun）次数。
     /// 这类毛刺只丢极少采样，不致命，不中断录音。
     glitches: u32,
+    /// 从开录起累计的 Integrated LUFS；数据不足时为 None。
+    lufs: Option<f32>,
 }
 
 #[derive(Clone, Serialize)]
@@ -163,9 +166,11 @@ fn spawn_wav_writer(
             let mut sum_sq = 0.0f32;
             let mut peak = 0.0f32;
             let mut samples_seen = 0usize;
+            let mut loudness = crate::lufs::IntegratedLoudness::new(sample_rate);
             while let Ok(command) = rx.recv() {
                 match command {
                     WriterCommand::Samples(mono) => {
+                        loudness.push_mono(&mono);
                         for sample in &mono {
                             sum_sq += sample * sample;
                             peak = peak.max(sample.abs());
@@ -182,6 +187,7 @@ fn spawn_wav_writer(
                                     rms,
                                     peak: peak.min(1.0),
                                     glitches: glitches.load(Ordering::Relaxed) as u32,
+                                    lufs: loudness.integrated(),
                                 },
                             );
                             sum_sq = 0.0;

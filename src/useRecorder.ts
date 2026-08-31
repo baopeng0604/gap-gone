@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { readFile } from "@tauri-apps/plugin-fs";
+import { IntegratedLoudness } from "./utils/lufs";
 import { getDeviceId, setDeviceId } from "./utils/settings";
 
 export interface AudioInputDevice {
@@ -14,6 +15,7 @@ export interface MonitorLevel {
   peak: number;
   rmsDb: number;
   peakDb: number;
+  lufs: number;
 }
 
 export type RecorderStatus =
@@ -28,6 +30,7 @@ const emptyLevel: MonitorLevel = {
   peak: 0,
   rmsDb: Number.NEGATIVE_INFINITY,
   peakDb: Number.NEGATIVE_INFINITY,
+  lufs: Number.NEGATIVE_INFINITY,
 };
 
 function toDb(linear: number) {
@@ -70,6 +73,8 @@ export function useRecorder() {
   const contextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const monitorGainRef = useRef<GainNode | null>(null);
+  const lufsMeterRef = useRef<IntegratedLoudness | null>(null);
+  const lufsProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const animationRef = useRef<number | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const startedAtRef = useRef(0);
@@ -173,9 +178,12 @@ export function useRecorder() {
     stopMeter();
     monitorGainRef.current?.disconnect();
     analyserRef.current?.disconnect();
+    lufsProcessorRef.current?.disconnect();
     contextRef.current?.close().catch(() => undefined);
     monitorGainRef.current = null;
     analyserRef.current = null;
+    lufsProcessorRef.current = null;
+    lufsMeterRef.current = null;
     contextRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
@@ -209,7 +217,13 @@ export function useRecorder() {
       const rms = Math.sqrt(sum / data.length);
       const rmsDb = toDb(rms);
       const peakDb = toDb(peak);
-      setLevel({ rms, peak, rmsDb, peakDb });
+      setLevel({
+        rms,
+        peak,
+        rmsDb,
+        peakDb,
+        lufs: lufsMeterRef.current?.integrated() ?? Number.NEGATIVE_INFINITY,
+      });
       setPeakHoldDb((current) => Math.max(current, peakDb));
       if (peak >= 0.999) setClipLatched(true);
       setDuration(getElapsedDuration());
@@ -255,15 +269,21 @@ export function useRecorder() {
           rms: number;
           peak: number;
           glitches?: number;
+          lufs?: number | null;
         }>("recording-level", (event) => {
             if (pausedRef.current) return;
             const rmsDb = toDb(event.payload.rms);
             const peakDb = toDb(event.payload.peak);
+            const lufs =
+              typeof event.payload.lufs === "number"
+                ? event.payload.lufs
+                : Number.NEGATIVE_INFINITY;
             setLevel({
               rms: event.payload.rms,
               peak: event.payload.peak,
               rmsDb,
               peakDb,
+              lufs,
             });
             setPeakHoldDb((current) => Math.max(current, peakDb));
             if (event.payload.peak >= 0.999) setClipLatched(true);
@@ -362,6 +382,20 @@ export function useRecorder() {
       source.connect(analyser);
       contextRef.current = context;
       analyserRef.current = analyser;
+
+      const lufsMeter = new IntegratedLoudness(context.sampleRate, 1);
+      lufsMeterRef.current = lufsMeter;
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      processor.onaudioprocess = (event) => {
+        if (pausedRef.current) return;
+        lufsMeter.pushMono(event.inputBuffer.getChannelData(0));
+      };
+      source.connect(processor);
+      const silent = context.createGain();
+      silent.gain.value = 0;
+      processor.connect(silent);
+      silent.connect(context.destination);
+      lufsProcessorRef.current = processor;
 
       const mimeType = [
         "audio/webm;codecs=opus",

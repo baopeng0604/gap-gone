@@ -74,7 +74,7 @@ export default function HelpModal({
             </li>
             <li>
               <span className="help-modal-kbd">录音设置</span>：选择输入设备、
-              刷新设备列表并查看录音格式
+              刷新设备列表；桌面版还可设置转录模型目录并提前下载模型
             </li>
             <li>
               <span className="help-modal-kbd">录音</span>：请求麦克风权限并开始
@@ -151,7 +151,11 @@ export default function HelpModal({
           <ul>
             <li>
               <span className="help-modal-kbd">转录文字</span>：本地 SenseVoice
-              离线识别，首次使用需下载约 230MB 模型
+              离线识别。设置里可点「下载模型」提前拉齐转录和标点（约 300MB）；
+              也可等首次转录时再下。
+            </li>
+            <li>
+              转录时波形上方提示「正在加载转录模型…」，出结果后替换为完成说明。
             </li>
             <li>
               字词直接显示在每行波形下方并与波形对齐，点击对应位置即跳转；
@@ -169,6 +173,11 @@ export default function HelpModal({
           <ul>
             <li>亮条跟随峰值（升起快、落下带惯性），浅色底是 RMS；白针是峰值保持。</li>
             <li>RMS 是平均响度，Peak 是瞬时峰值，单位都是 dBFS。</li>
+            <li>
+              旁边的 LUFS 是成片 Integrated 响度（对照短视频常见目标 -14 LUFS）：
+              低于 -16 偏弱，-16～-12 达标，高于 -12 偏响。只提示，不拦截。
+            </li>
+            <li>切除和确认降噪后，LUFS 按即将导出的成片重算，已切除区间不计。</li>
             <li>峰值保持显示录音期间出现过的最高峰值。</li>
             <li>电平条按 dBFS 标出 -24、-18、-12、-6、-3 和 0 dB，越接近右侧越容易过载。</li>
             <li>-6 dBFS 以上为黄色预警；最右侧 CLIP 红标亮起表示检测到削波。</li>

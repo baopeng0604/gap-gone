@@ -26,7 +26,7 @@
 
 ## MonitorLevel
 
-录音输入的实时反馈，包括 RMS、Peak、峰值保持和数字削波状态。电平使用 dBFS 表示，-6 dBFS 以上属于预警，数字削波提示可单独清除。MonitorLevel 只描述测量结果，不代表是否把输入声音回放到输出设备。
+录音输入的实时反馈，包括 RMS、Peak、峰值保持、数字削波状态，以及从开录起累计的 Integrated LUFS。电平条使用 dBFS 表示，-6 dBFS 以上属于预警，数字削波提示可单独清除。LUFS 对照短视频常见目标 -14，只提示偏弱/达标/偏响，不拦截。MonitorLevel 只描述测量结果，不代表是否把输入声音回放到输出设备。
 
 ## NoiseReductionVersion
 

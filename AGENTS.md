@@ -49,8 +49,8 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 5. **大文件禁止走** **`Vec<u8>`** **命令参数/返回值**。Tauri v2 自定义命令的参数走 JSON 数字数组序列化，长录音会卡死 IPC。一律走「临时文件 + 路径传参」：前端用 `@tauri-apps/plugin-fs` 的 `writeFile`/`readFile`（二进制 raw 传输），Rust 命令只收发路径字符串。capabilities 需同时含 `fs:allow-temp-read(-recursive)` / `fs:allow-temp-write(-recursive)`——**非递归权限只授权 temp 顶层文件，不含子目录**（踩过坑：临时文件移入 `temp/gap-gone/` 后读取被拒，报「无法完成录音文件」）。capability 是构建期注入的，改动后必须完全重启 `pnpm tauri dev`。
 6. **DfTract 不是 Send（内含 Rc），不能放进 Tauri State**。降噪模型常驻 `gap-gone-denoise` 工作线程并缓存复用；命令只投递 `DenoiseJob`。复用前必须 `init()` + `DFState::reset()` + `init_norm_states()` 重置流式状态，否则上一段音频的归一化状态会串扰下一段。SenseVoice 转录同理常驻 `gap-gone-transcribe` 线程。
 7. **设备选择用 cpal** **`Device::id()`（平台稳定 ID）**，不要用设备名——两台同名 USB 麦会选错。名称只做显示 label 和兜底匹配。
-8. **大模型不进安装包**。SenseVoice 模型（\~230MB）运行时下载到 `~/models/sense-voice/`（用户主目录，0.1.6 起默认；此前为 `app_data_dir/models/sense-voice/`。HF 主站 + hf-mirror 镜像，`.partial` 过渡文件），支持用户手动放置；`transcribe_model_status` 是唯一就绪判定。标点恢复模型（CT-Transformer int8，75MB）同理下载到 `~/models/punctuation-ct-zh-en/`（HF ranger810 单文件镜像），由转录线程懒加载，**失败自动降级为无标点输出**（`TranscriptResult.punctuated` 标记），绝不阻塞转录。
-9. 录音错误通过 Tauri 事件 `recording-error` 上报前端；电平通过 `recording-level` 上报；降噪进度通过 `denoise-progress` 上报（-1 表示正在加载模型）；转录进度通过 `transcribe-progress` 上报（stage: download/load/transcribe）。
+8. **大模型不进安装包**。SenseVoice 模型（\~230MB）运行时下载到 `~/models/sense-voice/`（用户主目录，0.1.6 起默认；此前为 `app_data_dir/models/sense-voice/`。HF 主站 + hf-mirror 镜像，`.partial` 过渡文件），支持用户手动放置；`transcribe_model_status` 是唯一就绪判定（`ready` = 转录文件齐全，`punctReady` = 标点文件齐全）。标点恢复模型（CT-Transformer int8，75MB）下载到 `~/models/punctuation-ct-zh-en/`。设置页「下载模型」一次拉齐两者（已存在则跳过）；转录时若仍缺文件也会再下。标点失败自动降级为无标点输出（`TranscriptResult.punctuated` 标记），绝不阻塞转录。
+9. 录音错误通过 Tauri 事件 `recording-error` 上报前端；电平通过 `recording-level` 上报（含 RMS/Peak 与累计 Integrated `lufs`）；降噪进度通过 `denoise-progress` 上报（-1 表示正在加载模型）；转录进度通过 `transcribe-progress` 上报（stage: download/load/transcribe/punctuation）。
 
 ## 安全基线
 

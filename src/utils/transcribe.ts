@@ -38,7 +38,9 @@ export interface TranscribeProgress {
 
 export interface TranscribeModelStatus {
   ready: boolean;
+  punctReady: boolean;
   modelDir: string;
+  punctDir: string;
   missing: string[];
 }
 
@@ -51,6 +53,13 @@ export function isTauriDesktop() {
 
 export function checkTranscribeModel(): Promise<TranscribeModelStatus> {
   return invoke<TranscribeModelStatus>("transcribe_model_status");
+}
+
+/** 设置页状态文案：文件齐全即成功。 */
+export function transcribeModelStatusText(status: TranscribeModelStatus): string {
+  if (status.ready && status.punctReady) return "模型已就绪";
+  if (status.ready) return "转录已就绪，标点未下载";
+  return "未下载";
 }
 
 /** 当前生效的模型目录（自定义优先，否则应用数据目录默认值）。 */

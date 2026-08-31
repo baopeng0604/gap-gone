@@ -1,6 +1,6 @@
 [package]
 name = "gap-gone"
-version = "0.1.15"
+version = "0.1.17"
 description = "Gap Gone - 录音与音频编辑桌面应用"
 authors = ["you"]
 edition = "2021"

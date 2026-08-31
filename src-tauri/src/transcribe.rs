@@ -50,7 +50,9 @@ const CHUNK_TARGET_SECS: usize = 60;
 #[serde(rename_all = "camelCase")]
 pub struct TranscribeModelStatus {
     pub ready: bool,
+    pub punct_ready: bool,
     pub model_dir: String,
+    pub punct_dir: String,
     pub missing: Vec<String>,
 }
 
@@ -93,6 +95,14 @@ pub struct TranscribeJob {
     pub app: AppHandle,
     pub cancelled: Arc<AtomicBool>,
     pub respond: mpsc::Sender<Result<TranscriptResult, String>>,
+}
+
+/// 标点模型目录：~/models/punctuation-ct-zh-en（与自定义转录目录独立）。
+fn punct_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .home_dir()
+        .map(|dir| dir.join("models").join(PUNCT_DIR_NAME))
+        .map_err(|error| format!("无法定位用户主目录: {error}"))
 }
 
 /// 模型目录：用户自定义优先（RecordingManager.transcribe_model_dir），
@@ -164,6 +174,7 @@ pub fn transcribe_model_status(
     state: State<'_, RecordingManager>,
 ) -> Result<TranscribeModelStatus, String> {
     let dir = model_dir(&app, &state)?;
+    let punct = punct_dir(&app)?;
     let missing = [MODEL_ONNX, TOKENS_TXT]
         .iter()
         .filter(|name| !dir.join(name).is_file())
@@ -171,7 +182,9 @@ pub fn transcribe_model_status(
         .collect::<Vec<_>>();
     Ok(TranscribeModelStatus {
         ready: missing.is_empty(),
+        punct_ready: punct.join(PUNCT_ONNX).is_file(),
         model_dir: dir.to_string_lossy().to_string(),
+        punct_dir: punct.to_string_lossy().to_string(),
         missing,
     })
 }
@@ -189,6 +202,7 @@ fn download_file(
 ) -> Result<(), String> {
     let target = dir.join(name);
     if target.is_file() {
+        emit_progress(app, "download", progress_base + progress_span);
         return Ok(());
     }
     let partial = dir.join(format!("{name}.partial"));
@@ -265,7 +279,7 @@ pub fn download_transcribe_model(
     state.transcribe_cancelled.store(false, Ordering::Relaxed);
     let dir = model_dir(&app, &state)?;
     fs::create_dir_all(&dir).map_err(|error| format!("无法创建模型目录: {error}"))?;
-    // tokens.txt 只有几百 KB，给它 1% 进度区间；大头是 229MB 的 onnx。
+    // tokens.txt 几百 KB；SenseVoice onnx 约 230MB；标点约 75MB。
     download_file(
         &app,
         &dir,
@@ -282,8 +296,20 @@ pub fn download_transcribe_model(
         MODEL_REPO,
         &state.transcribe_cancelled,
         1.0,
-        99.0,
+        73.0,
     )?;
+    let punct = punct_dir(&app)?;
+    fs::create_dir_all(&punct).map_err(|error| format!("无法创建标点模型目录: {error}"))?;
+    download_file(
+        &app,
+        &punct,
+        PUNCT_ONNX,
+        PUNCT_REPO,
+        &state.transcribe_cancelled,
+        74.0,
+        26.0,
+    )?;
+    emit_progress(&app, "download", 100.0);
     Ok(dir.to_string_lossy().to_string())
 }
 
@@ -375,12 +401,7 @@ fn prepare_punctuator(
     cancelled: &AtomicBool,
     download_failed: &mut bool,
 ) -> Option<OfflinePunctuation> {
-    let dir = app
-        .path()
-        .home_dir()
-        .ok()?
-        .join("models")
-        .join(PUNCT_DIR_NAME);
+    let dir = punct_dir(app).ok()?;
     fs::create_dir_all(&dir).ok()?;
     if !dir.join(PUNCT_ONNX).is_file() && !*download_failed {
         emit_progress(app, "punctuation", 0.0);
