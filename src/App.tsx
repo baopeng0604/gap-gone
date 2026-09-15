@@ -644,6 +644,12 @@ function App() {
     setFuture([]);
   };
 
+  /** 设置/录音入口把波形预览与页面滚回顶部，保证提示、倒计时等可见。 */
+  const scrollPreviewToTop = useCallback(() => {
+    waveformViewRef.current?.scrollTo({ top: 0, left: 0 });
+    window.scrollTo({ top: 0, left: 0 });
+  }, []);
+
   const handleFileUpload = async (
     event: React.ChangeEvent<HTMLInputElement>,
   ) => {
@@ -802,6 +808,8 @@ function App() {
     ) {
       return;
     }
+
+    scrollPreviewToTop();
 
     // 倒计时语音（CC0，"3、2、1"对齐 0/1/2s，全长 2.68s；总时长 2s 时
     // 开录瞬间会把尾音掐断，后续换更短的提示音即可完全对齐）。
@@ -1263,7 +1271,12 @@ function App() {
             <span className="shortcut-key">R</span>
           </button>
           <button
-            onClick={() => setShowRecordingSetup((visible) => !visible)}
+            onClick={() => {
+              const next = !showRecordingSetup;
+              setShowRecordingSetup(next);
+              // 进入设置页时滚回顶部，让提示信息/设置内容可见
+              if (next) scrollPreviewToTop();
+            }}
             disabled={recordingCountdown !== null || isStartingRecording}
           >
             设置
