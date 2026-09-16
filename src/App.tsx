@@ -1288,50 +1288,6 @@ function App() {
             {formatTimeStandard(audioBuffer.duration)}
           </div>
         )}
-        <div className="toolbar-group" aria-label="文件和录音">
-          <label className="file-input-label" title="快捷键 O：打开音频">
-            打开
-            <span className="shortcut-key">O</span>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="audio/*"
-              onChange={handleFileUpload}
-              style={{ display: "none" }}
-            />
-          </label>
-          <button
-            onClick={startRecordingWithCountdown}
-            title="快捷键 R：开始录音"
-            aria-keyshortcuts="R"
-            disabled={
-              recorder.status === "recording" ||
-              recorder.status === "requesting-permission" ||
-              recordingCountdown !== null ||
-              isStartingRecording ||
-              isProcessing
-            }
-          >
-            {isStartingRecording
-              ? "启动录音..."
-              : recorder.status === "requesting-permission"
-              ? "请求权限..."
-              : "录音"}
-            <span className="shortcut-key">R</span>
-          </button>
-          <button
-            onClick={() => {
-              const next = !showRecordingSetup;
-              setShowRecordingSetup(next);
-              // 进入设置页时滚回顶部，让提示信息/设置内容可见
-              if (next) scrollPreviewToTop();
-            }}
-            disabled={recordingCountdown !== null || isStartingRecording}
-          >
-            设置
-          </button>
-        </div>
-        <span className="toolbar-divider" aria-hidden="true" />
         <div className="toolbar-group" aria-label="播放">
           <button
             onClick={togglePlayback}
@@ -1378,8 +1334,7 @@ function App() {
             重做 <span className="shortcut-key">⌘/Ctrl+Shift+Z</span>
           </button>
         </div>
-        </div>
-        <div className="controls-row controls-row-secondary">
+        <span className="toolbar-divider" aria-hidden="true" />
         <div className="toolbar-group silence-tools" aria-label="去静音">
           <span className="toolbar-label">去静音</span>
           <select
@@ -1426,6 +1381,51 @@ function App() {
             disabled={!editState.autoRegions.length || isProcessing}
           >
             恢复检测 <span className="shortcut-key">Shift+R</span>
+          </button>
+        </div>
+        </div>
+        <div className="controls-row controls-row-secondary">
+        <div className="toolbar-group" aria-label="文件和录音">
+          <label className="file-input-label" title="快捷键 O：打开音频">
+            打开
+            <span className="shortcut-key">O</span>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="audio/*"
+              onChange={handleFileUpload}
+              style={{ display: "none" }}
+            />
+          </label>
+          <button
+            onClick={startRecordingWithCountdown}
+            title="快捷键 R：开始录音"
+            aria-keyshortcuts="R"
+            disabled={
+              recorder.status === "recording" ||
+              recorder.status === "requesting-permission" ||
+              recordingCountdown !== null ||
+              isStartingRecording ||
+              isProcessing
+            }
+          >
+            {isStartingRecording
+              ? "启动录音..."
+              : recorder.status === "requesting-permission"
+              ? "请求权限..."
+              : "录音"}
+            <span className="shortcut-key">R</span>
+          </button>
+          <button
+            onClick={() => {
+              const next = !showRecordingSetup;
+              setShowRecordingSetup(next);
+              // 进入设置页时滚回顶部，让提示信息/设置内容可见
+              if (next) scrollPreviewToTop();
+            }}
+            disabled={recordingCountdown !== null || isStartingRecording}
+          >
+            设置
           </button>
         </div>
         <span className="toolbar-divider" aria-hidden="true" />

@@ -352,19 +352,19 @@
 
 .controls-row {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: center;
   width: 100%;
   max-width: 100%;
-  gap: 0.3rem;
-}
-
-.controls-row-secondary {
-  order: 1;
+  gap: 0.24rem;
 }
 
 .controls-row-primary {
+  order: 1;
+}
+
+.controls-row-secondary {
   order: 2;
 }
 
