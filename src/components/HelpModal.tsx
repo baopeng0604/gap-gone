@@ -146,9 +146,11 @@ export default function HelpModal({
               <span className="help-modal-kbd">恢复原始</span>：撤回已确认的降噪版本
             </li>
             <li>
-              <span className="help-modal-kbd">响度标准化</span>：按成片 Integrated
-              响度一键把整段归一至 <span className="help-modal-kbd">-16 LUFS</span>，
-              统一各段响度；仍可用<span className="help-modal-kbd">恢复原始</span>回退
+              <span className="help-modal-kbd">响度标准化</span>：先对超过 -6 dBFS 的
+              大音量段做轻度压峰，再按成片 Integrated 响度一键把整段归一至
+              <span className="help-modal-kbd">-16 LUFS</span>，末端把真峰值限制到
+              -1 dBFS 兜底、避免削波；仍可用
+              <span className="help-modal-kbd">恢复原始</span>回退
             </li>
           </ul>
 

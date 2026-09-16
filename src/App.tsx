@@ -63,8 +63,10 @@ import {
 } from "./utils/transcribe";
 import {
   applyLufsGain,
+  compressLoudness,
   formatLufs,
   integratedLufsFromBuffer,
+  limitTruePeak,
   lufsBand,
   lufsBandLabel,
 } from "./utils/lufs";
@@ -144,6 +146,11 @@ const METER_MIN_DB = -30;
 const METER_MARKS = [-24, -18, -12, -6, -3, 0];
 /** 一键响度标准化的目标 Integrated LUFS（2026-09 起从 -14 草案定为 -16，播客/流媒体平衡点）。 */
 const LUFS_TARGET = -16;
+/** 响度标准化：先对 >-6dBFS 大音量段轻度压缩，末端真峰值限制到 -1dBFS。 */
+const LUFS_COMPRESS_THRESHOLD_DB = -6;
+const LUFS_COMPRESS_RATIO = 1.5;
+const LUFS_CEILING_DB = -1;
+const LUFS_CEILING_RATIO = 20;
 
 function meterPosition(db: number) {
   if (!Number.isFinite(db)) return 0;
@@ -937,22 +944,30 @@ function App() {
     await cancelDeepFilterProcessing();
   };
 
-  /** 一键响度标准化：按成片 integrate 响度算增益，把整段归一到 LUFS_TARGET。 */
+  /** 一键响度标准化：压缩压峰 → 按成片响度归一到 LUFS_TARGET → 末端限幅，避免削波。 */
   const handleLoudnessNormalize = useCallback(() => {
     if (!audioBuffer) return;
-    const current = integratedLufsFromBuffer(audioBuffer, deletedRegions);
+    // 1) 先对 >-6dBFS 大音量段轻度压峰，为后续提升留余量。
+    const compressed = compressLoudness(
+      audioBuffer,
+      LUFS_COMPRESS_THRESHOLD_DB,
+      LUFS_COMPRESS_RATIO,
+    );
+    const current = integratedLufsFromBuffer(compressed, deletedRegions);
     if (!Number.isFinite(current)) {
       notify("无法测量当前响度，请先留出可导出的音频内容", "error");
       return;
     }
-    const gainDb = LUFS_TARGET - current;
-    const applied = applyLufsGain(audioBuffer, gainDb);
-    setAudioBuffer(applied);
-    const after = integratedLufsFromBuffer(applied, deletedRegions);
+    // 2) 压缩后重新归一到目标响度。
+    const gained = applyLufsGain(compressed, LUFS_TARGET - current);
+    // 3) 末端真峰值限制到 -1dBFS，作为削波兜底。
+    const result = limitTruePeak(gained, LUFS_CEILING_DB, LUFS_CEILING_RATIO);
+    setAudioBuffer(result);
+    const after = integratedLufsFromBuffer(result, deletedRegions);
     notify(
       `响度已标准化：${formatLufs(current)} → ${
         Number.isFinite(after) ? formatLufs(after) : formatLufs(LUFS_TARGET)
-      }`,
+      }（先压 >-6dBFS 峰，末端限到 -1dBFS）`,
     );
   }, [audioBuffer, deletedRegions, notify]);
 
@@ -1460,8 +1475,26 @@ function App() {
               <button onClick={cancelNoiseReduction}>取消试听</button>
             </>
           )}
+          <button
+            onClick={handleLoudnessNormalize}
+            disabled={!audioBuffer || isProcessing}
+            aria-keyshortcuts="L"
+            title="快捷键 L：压缩压峰后把成片响度归一至 -16 LUFS，末端限幅防削波"
+          >
+            响度标准化 <span className="shortcut-key">L</span>
+          </button>
           <button onClick={restoreOriginal} disabled={!hasEnhancedAudio}>
             恢复原始 <span className="shortcut-key">B</span>
+          </button>
+        </div>
+        <span className="toolbar-divider" aria-hidden="true" />
+        <div className="toolbar-group" aria-label="输出和帮助">
+          <button onClick={handleExport} disabled={!audioBuffer || isProcessing}>
+            导出 {exportFormat === "mp3" ? "MP3" : "WAV"}{" "}
+            <span className="shortcut-key">⌘/Ctrl+S</span>
+          </button>
+          <button onClick={() => setHelpOpen(true)}>
+            帮助 <span className="shortcut-key">H</span>
           </button>
         </div>
         {isTauriDesktop() && (
@@ -1494,27 +1527,6 @@ function App() {
             </div>
           </>
         )}
-        <span className="toolbar-divider" aria-hidden="true" />
-        <div className="toolbar-group" aria-label="输出和帮助">
-          <button onClick={handleExport} disabled={!audioBuffer || isProcessing}>
-            导出 {exportFormat === "mp3" ? "MP3" : "WAV"}{" "}
-            <span className="shortcut-key">⌘/Ctrl+S</span>
-          </button>
-          <button onClick={() => setHelpOpen(true)}>
-            帮助 <span className="shortcut-key">H</span>
-          </button>
-        </div>
-        <span className="toolbar-divider" aria-hidden="true" />
-        <div className="toolbar-group" aria-label="响度">
-          <button
-            onClick={handleLoudnessNormalize}
-            disabled={!audioBuffer || isProcessing}
-            aria-keyshortcuts="L"
-            title="快捷键 L：把成片响度归一至 -16 LUFS"
-          >
-            响度标准化 <span className="shortcut-key">L</span>
-          </button>
-        </div>
         </div>
       </div>
 

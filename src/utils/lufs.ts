@@ -230,3 +230,68 @@ export function applyLufsGain(
   }
   return output;
 }
+
+/** soft-knee 单采样压缩：|in|>thresh 时超量按 ratio 压缩，阈值处连续，无硬切。 */
+function softKneeSample(
+  sample: number,
+  thresholdLin: number,
+  ratio: number,
+): number {
+  const magnitude = Math.abs(sample);
+  if (magnitude <= thresholdLin) return sample;
+  const sign = sample < 0 ? -1 : 1;
+  const over = magnitude - thresholdLin;
+  return sign * (thresholdLin + over / ratio);
+}
+
+/**
+ * 分声道 dataframe 应用 soft-knee 处理器，返回新 AudioBuffer。
+ */
+function processChannels(
+  buffer: AudioBuffer,
+  apply: (sample: number) => number,
+): AudioBuffer {
+  const output = new AudioBuffer({
+    length: buffer.length,
+    numberOfChannels: buffer.numberOfChannels,
+    sampleRate: buffer.sampleRate,
+  });
+  for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+    const input = buffer.getChannelData(channel);
+    const target = output.getChannelData(channel);
+    for (let i = 0; i < input.length; i++) {
+      target[i] = apply(input[i]);
+    }
+  }
+  return output;
+}
+
+/**
+ * 轻度向下压缩：对超过 thresholdDb（如 -6 dBFS）的大音量段，把超出部分按
+ * ratio 压缩（soft-knee，阈值处连续），降低波峰、为后续归一留余量。
+ */
+export function compressLoudness(
+  buffer: AudioBuffer,
+  thresholdDb: number,
+  ratio: number,
+): AudioBuffer {
+  const threshold = 10 ** (thresholdDb / 20);
+  return processChannels(buffer, (sample) =>
+    softKneeSample(sample, threshold, ratio),
+  );
+}
+
+/**
+ * 末端真峰值限制：把超过 ceilingDb（如 -1 dBFS）的部分按大 ratio 软收敛到
+ * ceiling 附近，作为削波的最终保险。soft-knee 连续，不产生硬削波方波。
+ */
+export function limitTruePeak(
+  buffer: AudioBuffer,
+  ceilingDb: number,
+  ratio: number,
+): AudioBuffer {
+  const ceiling = 10 ** (ceilingDb / 20);
+  return processChannels(buffer, (sample) =>
+    softKneeSample(sample, ceiling, ratio),
+  );
+}
