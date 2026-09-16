@@ -145,6 +145,11 @@ export default function HelpModal({
             <li>
               <span className="help-modal-kbd">恢复原始</span>：撤回已确认的降噪版本
             </li>
+            <li>
+              <span className="help-modal-kbd">响度标准化</span>：按成片 Integrated
+              响度一键把整段归一至 <span className="help-modal-kbd">-16 LUFS</span>，
+              统一各段响度；仍可用<span className="help-modal-kbd">恢复原始</span>回退
+            </li>
           </ul>
 
           <h3>转录</h3>
@@ -213,6 +218,10 @@ export default function HelpModal({
               <span className="help-modal-kbd">N</span>：一键降噪；
               <span className="help-modal-kbd">B</span>：恢复原始；
               <span className="help-modal-kbd">T</span>：转录文字
+            </li>
+            <li>
+              <span className="help-modal-kbd">L</span>：一键响度标准化，把成片响度
+              归一至 -16 LUFS
             </li>
             <li>
               <span className="help-modal-kbd">⌘/Ctrl+Z</span>：撤销；

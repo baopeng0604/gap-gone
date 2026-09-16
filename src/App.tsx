@@ -62,6 +62,7 @@ import {
   type TranscribeProgress,
 } from "./utils/transcribe";
 import {
+  applyLufsGain,
   formatLufs,
   integratedLufsFromBuffer,
   lufsBand,
@@ -141,6 +142,8 @@ function createExportFileName(extension: string, keyword: string | null) {
 
 const METER_MIN_DB = -30;
 const METER_MARKS = [-24, -18, -12, -6, -3, 0];
+/** 一键响度标准化的目标 Integrated LUFS（2026-09 起从 -14 草案定为 -16，播客/流媒体平衡点）。 */
+const LUFS_TARGET = -16;
 
 function meterPosition(db: number) {
   if (!Number.isFinite(db)) return 0;
@@ -934,6 +937,25 @@ function App() {
     await cancelDeepFilterProcessing();
   };
 
+  /** 一键响度标准化：按成片 integrate 响度算增益，把整段归一到 LUFS_TARGET。 */
+  const handleLoudnessNormalize = useCallback(() => {
+    if (!audioBuffer) return;
+    const current = integratedLufsFromBuffer(audioBuffer, deletedRegions);
+    if (!Number.isFinite(current)) {
+      notify("无法测量当前响度，请先留出可导出的音频内容", "error");
+      return;
+    }
+    const gainDb = LUFS_TARGET - current;
+    const applied = applyLufsGain(audioBuffer, gainDb);
+    setAudioBuffer(applied);
+    const after = integratedLufsFromBuffer(applied, deletedRegions);
+    notify(
+      `响度已标准化：${formatLufs(current)} → ${
+        Number.isFinite(after) ? formatLufs(after) : formatLufs(LUFS_TARGET)
+      }`,
+    );
+  }, [audioBuffer, deletedRegions, notify]);
+
   const handleTranscribe = async (source?: AudioBuffer) => {
     const target = source ?? audioBuffer;
     if (!target || !audioContextRef.current || !isTauriDesktop()) return;
@@ -1076,6 +1098,7 @@ function App() {
         "KeyX",
         "KeyC",
         "KeyN",
+        "KeyL",
         "KeyT",
         "KeyB",
         "Space",
@@ -1167,6 +1190,16 @@ function App() {
         event.preventDefault();
         void handleNoiseReduction();
       } else if (
+        event.code === "KeyL" &&
+        !hasPrimaryModifier &&
+        audioBuffer &&
+        !isProcessing &&
+        recorder.status !== "recording"
+      ) {
+        // L = 一键响度标准化（统一到 -16 LUFS）
+        event.preventDefault();
+        handleLoudnessNormalize();
+      } else if (
         event.code === "KeyT" &&
         !hasPrimaryModifier &&
         audioBuffer &&
@@ -1211,6 +1244,7 @@ function App() {
     editState.autoRegions.length,
     handleExport,
     handleDetectSilence,
+    handleLoudnessNormalize,
     helpOpen,
     isProcessing,
     isStartingRecording,
@@ -1468,6 +1502,17 @@ function App() {
           </button>
           <button onClick={() => setHelpOpen(true)}>
             帮助 <span className="shortcut-key">H</span>
+          </button>
+        </div>
+        <span className="toolbar-divider" aria-hidden="true" />
+        <div className="toolbar-group" aria-label="响度">
+          <button
+            onClick={handleLoudnessNormalize}
+            disabled={!audioBuffer || isProcessing}
+            aria-keyshortcuts="L"
+            title="快捷键 L：把成片响度归一至 -16 LUFS"
+          >
+            响度标准化 <span className="shortcut-key">L</span>
           </button>
         </div>
         </div>

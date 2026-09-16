@@ -204,3 +204,29 @@ export function integratedLufsFromBuffer(
   }
   return meter.integrated();
 }
+
+/**
+ * 对整段音频应用线性响度增益（dB → linear 缩放各声道采样）。
+ * 生成新 AudioBuffer，不修改源 buffer；增益削波时 clamp 到 [-1,1]。
+ * 采样率/声道无关，天然兼容任意 buffer。
+ */
+export function applyLufsGain(
+  buffer: AudioBuffer,
+  gainDb: number,
+): AudioBuffer {
+  const gainLinear = 10 ** (gainDb / 20);
+  const output = new AudioBuffer({
+    length: buffer.length,
+    numberOfChannels: buffer.numberOfChannels,
+    sampleRate: buffer.sampleRate,
+  });
+  for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+    const input = buffer.getChannelData(channel);
+    const target = output.getChannelData(channel);
+    for (let i = 0; i < input.length; i++) {
+      const sample = input[i] * gainLinear;
+      target[i] = sample > 1 ? 1 : sample < -1 ? -1 : sample;
+    }
+  }
+  return output;
+}
