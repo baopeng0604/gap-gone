@@ -151,7 +151,7 @@
   display: flex;
   align-items: stretch;
   width: 100%;
-  height: min(38vh, 420px);
+  height: min(54vh, 600px);
 }
 
 .sidebar-meter-track {

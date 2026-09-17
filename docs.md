@@ -20,7 +20,7 @@ Gap Gone 是面向博客作者和内容创作者的本地录音、去静音和�
 录音采样率跟随设备默认格式（Windows WASAPI 与 macOS CoreAudio 都只接受设备原生格式，常见为 48 kHz，部分 USB 麦为 44.1 kHz），统一在回调中下混为单声道 PCM WAV。macOS 和 Windows 使用 Rust/CPAL 原生采集，浏览器开发环境保留 Web Media API 回退。
 
 录音电平中，-6 dBFS 以上显示黄色预警；检测到数字削波时，右侧 CLIP 标记会锁存为红色。点击红色标记只会清除提示，不会修改录音。
-长条电平条按 dBFS 刻度标出 -24、-18、-12、-6 和 -3 dB，越靠右代表电平越高、越接近 0 dBFS。
+长条电平条按 dBFS 从 -60 到 0 每 6 dB 标出一格，越靠右代表电平越高、越接近 0 dBFS。
 
 ### 录音流稳定性：buffer underrun/overrun 修复记录（2026-08-27）
 

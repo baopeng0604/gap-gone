@@ -13,8 +13,8 @@ interface WaveSidebarProps {
   lufs: number;
 }
 
-const MIN_DB = -30;
-const MARKS = [-24, -18, -12, -6, 0];
+const MIN_DB = -60;
+const MARKS = [-60, -54, -48, -42, -36, -30, -24, -18, -12, -6, 0];
 
 function meterPosition(db: number) {
   if (!Number.isFinite(db)) return 0;

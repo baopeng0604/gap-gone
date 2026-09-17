@@ -142,8 +142,8 @@ function createExportFileName(extension: string, keyword: string | null) {
     : `${datePart}-${timePart}-edited-audio.${extension}`;
 }
 
-const METER_MIN_DB = -30;
-const METER_MARKS = [-24, -18, -12, -6, -3, 0];
+const METER_MIN_DB = -60;
+const METER_MARKS = [-60, -54, -48, -42, -36, -30, -24, -18, -12, -6, 0];
 /** 一键响度标准化的目标 Integrated LUFS（2026-09 起从 -14 草案定为 -16，播客/流媒体平衡点）。 */
 const LUFS_TARGET = -16;
 /** 响度标准化：先对 >-6dBFS 大音量段轻度压缩，末端真峰值限制到 -1dBFS。 */
