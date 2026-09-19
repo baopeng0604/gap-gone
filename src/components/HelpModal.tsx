@@ -79,7 +79,7 @@ export default function HelpModal({
             <li>
               <span className="help-modal-kbd">录音</span>：请求麦克风权限并开始
               3 秒倒计时；倒计时结束后开始 48 kHz 单声道录音。录音中按
-              <span className="help-modal-kbd">P</span>暂停/继续、
+              <span className="help-modal-kbd">Space</span>暂停/继续、
               <span className="help-modal-kbd">S</span>停止，或按
               <span className="help-modal-kbd">Esc</span>取消并返回编辑页
             </li>
@@ -148,7 +148,7 @@ export default function HelpModal({
             <li>
               <span className="help-modal-kbd">响度标准化</span>：先对超过 -6 dBFS 的
               大音量段做轻度压峰，再按成片 Integrated 响度一键把整段归一至
-              <span className="help-modal-kbd">-16 LUFS</span>，末端把真峰值限制到
+              <span className="help-modal-kbd">-20 LUFS</span>，末端把真峰值限制到
               -1 dBFS 兜底、避免削波；仍可用
               <span className="help-modal-kbd">恢复原始</span>回退
             </li>
@@ -182,7 +182,7 @@ export default function HelpModal({
             <li>RMS 是平均响度，Peak 是瞬时峰值，单位都是 dBFS。</li>
             <li>
               旁边的 LUFS 是成片 Integrated 响度（对照短视频常见目标 -14 LUFS）：
-              低于 -16 偏弱，-16～-12 达标，高于 -12 偏响。只提示，不拦截。
+              低于 -20 偏弱，-20～-16 达标，高于 -16 偏响。只提示，不拦截。
             </li>
             <li>切除和确认降噪后，LUFS 按即将导出的成片重算，已切除区间不计。</li>
             <li>峰值保持显示录音期间出现过的最高峰值。</li>
@@ -194,7 +194,10 @@ export default function HelpModal({
 
           <h3>快捷键</h3>
           <ul>
-            <li><span className="help-modal-kbd">Space</span>：播放 / 暂停</li>
+            <li>
+              <span className="help-modal-kbd">Space</span>：编辑态播放 / 暂停；
+              录音中暂停 / 继续录音
+            </li>
             <li>
               <span className="help-modal-kbd">D</span>：检测静音（只生成候选预览）
             </li>
@@ -203,9 +206,6 @@ export default function HelpModal({
             </li>
             <li>
               <span className="help-modal-kbd">Shift+R</span>：恢复最近一次应用的自动检测
-            </li>
-            <li>
-              <span className="help-modal-kbd">P</span>：暂停 / 继续录音
             </li>
             <li>
               <span className="help-modal-kbd">S</span>：停止录音
@@ -223,7 +223,7 @@ export default function HelpModal({
             </li>
             <li>
               <span className="help-modal-kbd">L</span>：一键响度标准化，把成片响度
-              归一至 -16 LUFS
+              归一至 -20 LUFS
             </li>
             <li>
               <span className="help-modal-kbd">⌘/Ctrl+Z</span>：撤销；

@@ -14,8 +14,8 @@ export type LufsBand = "quiet" | "ok" | "loud";
 
 export function lufsBand(lufs: number): LufsBand | null {
   if (!Number.isFinite(lufs)) return null;
-  if (lufs < -16) return "quiet";
-  if (lufs > -12) return "loud";
+  if (lufs < -20) return "quiet";
+  if (lufs > -16) return "loud";
   return "ok";
 }
 

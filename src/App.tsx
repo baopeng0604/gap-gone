@@ -144,8 +144,8 @@ function createExportFileName(extension: string, keyword: string | null) {
 
 const METER_MIN_DB = -60;
 const METER_MARKS = [-60, -54, -48, -42, -36, -30, -24, -18, -12, -6, 0];
-/** 一键响度标准化的目标 Integrated LUFS（2026-09 起从 -14 草案定为 -16，播客/流媒体平衡点）。 */
-const LUFS_TARGET = -16;
+/** 一键响度标准化的目标 Integrated LUFS（2026-09 定为 -20：在 -16 易过破与 -24 偏保守之间取中）。 */
+const LUFS_TARGET = -20;
 /** 响度标准化：先对 >-6dBFS 大音量段轻度压缩，末端真峰值限制到 -1dBFS。 */
 const LUFS_COMPRESS_THRESHOLD_DB = -6;
 const LUFS_COMPRESS_RATIO = 1.5;
@@ -821,6 +821,9 @@ function App() {
 
     scrollPreviewToTop();
 
+    // 播放中直接开录会导致录音和回放混在一起，先停掉播放再进倒计时。
+    stopPlayback(true);
+
     // 倒计时语音（CC0，"3、2、1"对齐 0/1/2s，全长 2.68s；总时长 2s 时
     // 开录瞬间会把尾音掐断，后续换更短的提示音即可完全对齐）。
     // 界面文案与音频解耦：0.25s 步进计时，总 2s——前 1.5s 显示「准备」，
@@ -1107,7 +1110,6 @@ function App() {
       // Space 必须放行：否则焦点在按钮上时，浏览器默认行为会用空格
       // 激活该按钮（曾导致按 Space 误触发「选择」而不是播放）。
       const isToolbarShortcut = [
-        "KeyP",
         "KeyR",
         "KeyS",
         "KeyX",
@@ -1171,15 +1173,6 @@ function App() {
           event.preventDefault();
           startRecordingWithCountdown();
         }
-      } else if (
-        event.code === "KeyP" &&
-        !hasPrimaryModifier &&
-        recorder.status === "recording"
-      ) {
-        event.preventDefault();
-        void (recorder.isPaused
-          ? recorder.resumeRecording()
-          : recorder.pauseRecording());
       } else if (event.code === "KeyD" && audioBuffer && !isProcessing) {
         event.preventDefault();
         handleDetectSilence();
@@ -1211,7 +1204,7 @@ function App() {
         !isProcessing &&
         recorder.status !== "recording"
       ) {
-        // L = 一键响度标准化（统一到 -16 LUFS）
+        // L = 一键响度标准化（统一到 -20 LUFS）
         event.preventDefault();
         handleLoudnessNormalize();
       } else if (
@@ -1245,7 +1238,18 @@ function App() {
         setHelpOpen(true);
       } else if (event.code === "Space") {
         event.preventDefault();
-        togglePlayback();
+        if (recorder.status === "recording") {
+          // 录音中 Space = 暂停/继续录音（P 键已移除，统一到 Space）。
+          void (recorder.isPaused
+            ? recorder.resumeRecording()
+            : recorder.pauseRecording());
+        } else if (
+          recordingCountdown === null &&
+          recorder.status !== "review"
+        ) {
+          // 倒计时与录音待确认期间吞掉 Space，防止误触旧音频回放造成混音。
+          togglePlayback();
+        }
       }
     };
 
@@ -1479,7 +1483,7 @@ function App() {
             onClick={handleLoudnessNormalize}
             disabled={!audioBuffer || isProcessing}
             aria-keyshortcuts="L"
-            title="快捷键 L：压缩压峰后把成片响度归一至 -16 LUFS，末端限幅防削波"
+            title="快捷键 L：压缩压峰后把成片响度归一至 -20 LUFS，末端限幅防削波"
           >
             响度标准化 <span className="shortcut-key">L</span>
           </button>
@@ -1846,11 +1850,11 @@ function App() {
                   ? recorder.resumeRecording()
                   : recorder.pauseRecording())
               }
-              title="快捷键 P：暂停/继续录音"
-              aria-keyshortcuts="P"
+              title="快捷键 Space：暂停/继续录音"
+              aria-keyshortcuts="Space"
             >
               {recorder.isPaused ? "继续" : "暂停"}{" "}
-              <span className="shortcut-key">P</span>
+              <span className="shortcut-key">Space</span>
             </button>
             <button
               onClick={recorder.cancelRecording}
