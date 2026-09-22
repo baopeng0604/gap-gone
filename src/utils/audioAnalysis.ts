@@ -5,8 +5,10 @@ export interface SilenceDetectionOptions {
   thresholdDb?: number;
   minDuration?: number; // seconds, default 0.3
   padding?: number; // legacy symmetric padding override
-  leadingPadding?: number; // seconds to keep before the next speech
-  trailingPadding?: number; // seconds to keep after the previous speech
+  /** 区间起点侧保留量：上一句收尾后留下的静音。 */
+  leadingPadding?: number;
+  /** 区间终点侧保留量：下一句起头前留下的静音。 */
+  trailingPadding?: number;
 }
 
 export type SilencePreset = "compact" | "natural" | "relaxed";
@@ -15,9 +17,13 @@ export const SILENCE_PRESETS: Record<
   SilencePreset,
   Pick<SilenceDetectionOptions, "minDuration" | "leadingPadding" | "trailingPadding">
 > = {
-  compact: { minDuration: 0.2, leadingPadding: 0.06, trailingPadding: 0.06 },
-  natural: { minDuration: 0.3, leadingPadding: 0.12, trailingPadding: 0.12 },
-  relaxed: { minDuration: 0.4, leadingPadding: 0.18, trailingPadding: 0.18 },
+  // 终点侧（下一句起头前）比起点侧留得更多：检测出的静音末尾容易越过下一句的
+  // 起音——中值滤波会把孤立的起音块按邻居的安静值压回去，滞回又要求高出阈值
+  // 6 dB 才退出，于是区间会多咬进几十毫秒的语音。留白不足时，下一句听着就是
+  // "突然冒出来"。上一句收尾那边没有这个问题，保持较小的留白即可。
+  compact: { minDuration: 0.2, leadingPadding: 0.06, trailingPadding: 0.15 },
+  natural: { minDuration: 0.3, leadingPadding: 0.12, trailingPadding: 0.25 },
+  relaxed: { minDuration: 0.4, leadingPadding: 0.18, trailingPadding: 0.35 },
 };
 
 /** 默认阈值 -36.5 dBFS（等价早先硬编码的线性 0.015）。 */
@@ -137,8 +143,16 @@ export function detectSilence(
   return mergeNearby(raw, GAP_TOLERANCE)
     .filter((region) => region.end - region.start >= minDuration)
     .map((region) => ({
-      start: Math.min(buffer.duration, region.start + leadingPadding),
-      end: Math.max(0, region.end - trailingPadding),
+      // 贴住音频首尾的静音不设保留量：前后都没有声音要保护，
+      // 留一小截只会变成切不掉的尾巴（或开头）。
+      start:
+        region.start <= 0
+          ? 0
+          : Math.min(buffer.duration, region.start + leadingPadding),
+      end:
+        region.end >= buffer.duration
+          ? buffer.duration
+          : Math.max(0, region.end - trailingPadding),
     }))
     .filter((region) => region.end > region.start);
 }

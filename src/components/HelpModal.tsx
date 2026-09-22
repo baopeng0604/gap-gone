@@ -115,8 +115,11 @@ export default function HelpModal({
               跳过区间；<span className="help-modal-kbd">清除候选</span>：放弃预览
             </li>
             <li>
-              <span className="help-modal-kbd">紧凑/自然/宽松</span>：控制每个
-              静音区间两端保留的声音，默认是自然
+              <span className="help-modal-kbd">紧凑/自然/宽松</span>：控制静音
+              区间两端保留的声音（秒，格式为"上一句收尾后 / 下一句起头前"）
+              ——紧凑 0.06 / 0.15、自然 0.12 / 0.25（默认）、宽松 0.18 / 0.35。
+              起头前留得更多，否则下一句听起来会突然冒出来；贴住音频开头/结尾
+              的静音则整段切掉，不留这一小截
             </li>
             <li>
               <span className="help-modal-kbd">静音阈值</span>：设置里的分贝值，

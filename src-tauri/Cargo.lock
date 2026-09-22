@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "gap-gone"
-version = "0.1.38"
+version = "0.1.41"
 dependencies = [
  "cpal",
  "deep_filter",

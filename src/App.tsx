@@ -190,6 +190,12 @@ function loudnessReport(
 }
 
 /**
+ * 段边界比较容差（秒）。播放位置是按帧更新的近似值，比较时留一点余量，
+ * 避免浮点误差在段尾反复触发同一次跳转。5 ms 的提前量听不出来。
+ */
+const PLAYBACK_EDGE_EPSILON = 0.005;
+
+/**
  * 变速不变调：Chromium/WebKit 认 `preservesPitch`，老 WebKit 只认
  * `webkitPreservesPitch`（标准名出现前的写法），两个都设。
  */
@@ -662,7 +668,9 @@ function App() {
       stopPlayback(false);
       const segments = getKeptRegions(deletedRegions, audioBuffer.duration);
       if (segments.length === 0) {
+        // 领域边界要求：全部时间轴被跳过时必须给出明确结果，不能静默无声
         setPosition(audioBuffer.duration);
+        notify("当前时间轴已全部被切除，没有可播放的内容", "error");
         return;
       }
 
@@ -699,6 +707,11 @@ function App() {
         setPosition(audioBuffer.duration);
       };
 
+      // 当前正在播的保留段索引。切除区间靠"段尾到了就跳到下一段开头"实现，
+      // 索引状态由我们自己持有——不能每帧拿 currentTime 重新推导：规范允许
+      // 脚本运行期间读到滞后的播放位置，那会导致同一次跳转被反复下发，
+      // 媒体元素不停重启 seek，最终卡在段边界上不动。
+      let segmentIndex = index;
       const start = Math.max(playableOffset, segments[index].start);
       // 元数据未就绪时直接赋值会被丢弃，等 loadedmetadata 再定位（正常路径
       // 早就预编码好了，走不到这里）。
@@ -725,16 +738,34 @@ function App() {
       const animate = () => {
         if (playbackTokenRef.current !== token || !mediaRef.current) return;
         const current = mediaRef.current;
-        // 进入切除区间就跳到区间末尾；上一次 seek 还没落地时不重复下发。
-        if (!current.seeking) {
-          const next = nextPlayableTime(
-            current.currentTime,
-            deletedRegions,
-            audioBuffer.duration,
-          );
-          if (next > current.currentTime) current.currentTime = next;
+        let position = current.currentTime;
+        const segment = segments[segmentIndex];
+
+        if (position >= segment.end - PLAYBACK_EDGE_EPSILON) {
+          const nextIndex = segmentIndex + 1;
+          if (nextIndex < segments.length) {
+            // 当前保留段播完：跳到下一段开头。先推进索引再发 seek，
+            // 这样即使 seek 晚一帧才落地，也不会重复下发同一次跳转。
+            segmentIndex = nextIndex;
+            position = segments[nextIndex].start;
+            current.currentTime = position;
+          } else if (segment.end < audioBuffer.duration - PLAYBACK_EDGE_EPSILON) {
+            // 最后一段之后还有被切除的尾巴：到段尾即收尾，不让媒体播过去
+            stopPlayback(false);
+            setPosition(audioBuffer.duration);
+            return;
+          }
+          // 否则：最后一段一直延伸到音频末尾，交给 ended 处理——循环要在这里回环，
+          // 提前 stop 会把回环机会掐掉。
+        } else if (
+          position < segment.start - PLAYBACK_EDGE_EPSILON &&
+          !current.seeking
+        ) {
+          // 上一次 seek 被打断或还没落地：补一次。目标值固定，重复下发是幂等的。
+          position = segment.start;
+          current.currentTime = position;
         }
-        const position = Math.min(audioBuffer.duration, current.currentTime);
+
         setPosition(position);
         setPlaybackLevel(levelFromBuffer(audioBuffer, position));
         animationFrameRef.current = requestAnimationFrame(animate);
@@ -745,6 +776,7 @@ function App() {
       audioBuffer,
       deletedRegions,
       firstKeptStart,
+      notify,
       playbackSpeed,
       setPosition,
       stopPlayback,
@@ -861,9 +893,14 @@ function App() {
       ? nextPlayableTime(time, deletedRegions, audioBuffer.duration)
       : time;
     setPosition(position);
-    // 媒体元素改 currentTime 即可，不必像 AudioBufferSourceNode 那样重开源。
+    if (isPlaying) {
+      // 播放中跳转要重建播放会话：保留段索引必须跟着新位置重算，
+      // 否则段状态机会把播放头拉回它自己认定的当前段。
+      void startPlayback(position);
+      return;
+    }
     const media = mediaRef.current;
-    if (isPlaying && media) media.currentTime = position;
+    if (media) media.currentTime = position;
   };
 
   const updateEditState = (next: EditState) => {
