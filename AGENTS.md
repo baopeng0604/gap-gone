@@ -32,7 +32,7 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 
 * `src/useRecorder.ts` — 录音 Hook。**双路径**：Tauri 桌面走原生命令（`start_recording` 等），浏览器/无命令时降级 Web Media API（getUserMedia + MediaRecorder）。改录音逻辑时两条路径都要考虑。
 
-* `src/App.tsx` — 主界面与状态编排；`src/components/` 波形/时间轴/转录面板组件；`src/utils/` 音频分析（静音检测）、降噪、转录、MP3/WAV 导出、设置持久化（`settings.ts`，localStorage，新增用户设置一律走这里，key 前缀 `gap-gone-`）。
+* `src/App.tsx` — 主界面与状态编排，播放引擎也在这里（见硬约束 10、11）；`src/components/` 波形/时间轴/转录面板组件，其中 `PlaybackSidebar.tsx` 是左侧播放栏（从头播放、循环、变速）；`src/utils/` 音频分析（静音检测）、降噪、转录、MP3/WAV 导出、设置持久化（`settings.ts`，localStorage，新增用户设置一律走这里，key 前缀 `gap-gone-`）。
 
 * `src-tauri/src/lib.rs` — 录音相关原生命令与 cpal 录音流管理（`RecordingManager` 状态机）；`src-tauri/src/transcribe.rs` — SenseVoice 转录（模型下载 + `gap-gone-transcribe` 工作线程）。
 
@@ -51,6 +51,8 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 7. **设备选择用 cpal** **`Device::id()`（平台稳定 ID）**，不要用设备名——两台同名 USB 麦会选错。名称只做显示 label 和兜底匹配。
 8. **大模型不进安装包**。SenseVoice 模型（\~230MB）运行时下载到 `~/models/sense-voice/`（用户主目录，0.1.6 起默认；此前为 `app_data_dir/models/sense-voice/`。HF 主站 + hf-mirror 镜像，`.partial` 过渡文件），支持用户手动放置；`transcribe_model_status` 是唯一就绪判定（`ready` = 转录文件齐全，`punctReady` = 标点文件齐全）。标点恢复模型（CT-Transformer int8，75MB）下载到 `~/models/punctuation-ct-zh-en/`。设置页「下载模型」一次拉齐两者（已存在则跳过）；转录时若仍缺文件也会再下。标点失败自动降级为无标点输出（`TranscriptResult.punctuated` 标记），绝不阻塞转录。
 9. 录音错误通过 Tauri 事件 `recording-error` 上报前端；电平通过 `recording-level` 上报（含 RMS/Peak 与累计 Integrated `lufs`）；降噪进度通过 `denoise-progress` 上报（-1 表示正在加载模型）；转录进度通过 `transcribe-progress` 上报（stage: download/load/transcribe/punctuation）。
+10. **播放走 `<audio>` 媒体元素，不要退回 `AudioBufferSourceNode`**。变速不变调只有媒体元素的 `preservesPitch` 能做（老 WebKit 还要一并设 `webkitPreservesPitch`），`AudioBufferSourceNode.playbackRate` 是磁带式变速，变快必升调。播放源是当前缓冲编码出的 16-bit WAV blob，因此 `audio.currentTime` 本身就是源时间轴位置，变速播放也不用做时间换算。两个易踩点：① 切除区间靠 rAF 检测「进入即 seek 跳过」（约一帧 16 ms 粒度，不再是样本级精准），`seeking` 期间不要重复下发 seek；② 电平表仍从 buffer 抽样（`levelFromBuffer`），**不要**为了取电平把 `MediaElementSource`/`AnalyserNode` 串进音频图——macOS WKWebView 上会吞掉声音。AudioContext 从此只负责解码与离线渲染。
+11. **播放源的编码时机与内存代价**。媒体源只在 `audioBuffer` 身份变化时重编码（打开/录完/降噪/响度归一/撤销），切除区间只改 `deletedRegions`，不触发重编码。`bufferToWav` 是同步的，长录音会占住主线程一会儿，所以要延到下一帧执行，先让「加载完成/处理完成」的画面画出来。内存上 AudioBuffer 与 16-bit WAV 会同时存在；若超长录音撑不住，改用「写临时 WAV + Tauri asset protocol」，改动面只在 `syncMediaSource` 一处。
 
 ## 安全基线
 
@@ -69,6 +71,10 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 * 文档与面向用户的错误消息用中文；代码注释中英混合，技术术语保留英文。
 
 * `denoise` 是派生操作，绝不能覆盖原始录音。
+
+* **播放速度与循环是会话内参数**，不写 localStorage：重启回到 1.0× 且不循环。它们是试听工具而不是文件属性，持久化容易让人误以为音频本身变快了、或者导出会跟着变。
+
+* **改快捷键要同步四处**：`handleKeyDown` 的分支、`isToolbarShortcut` 白名单、按钮的 `aria-keyshortcuts` 与角标、`HelpModal` 的快捷键表。注意 `L` 已归循环播放，响度标准化是 `⇧L`；`[` `]` 调播放速度，别被 range 滑条的焦点守卫挡掉（该守卫已排除 `input[type=range]`）。
 
 * 前端 `dist/`、`node_modules/`、`src-tauri/target/` 均为产物目录，不要手工修改、不要提交构建噪音。
 

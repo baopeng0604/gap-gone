@@ -229,9 +229,140 @@
   border: 1px solid rgba(255, 255, 255, 0.15);
 }
 
+/* 左侧固定栏：播放速度与循环，与右侧电平栏镜像（同样 72px、同样吸顶工具栏之下） */
+.playback-sidebar {
+  position: fixed;
+  top: 6.5rem;
+  left: 1rem;
+  bottom: 1rem;
+  width: 72px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  z-index: 25;
+  pointer-events: none; /* 容器点击穿透，仅控件可点 */
+}
+
+.playback-sidebar > * {
+  pointer-events: auto;
+}
+
+/* 侧栏图标按钮（从头播放、循环）：比普通按钮略大一圈，默认白底黑字 */
+.playback-start,
+.playback-loop {
+  width: 2.25rem;
+  height: 2.25rem;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  line-height: 1;
+  border-radius: 8px;
+  background-color: #f2f2f2;
+  border-color: #ffffff;
+  color: #101510;
+}
+
+.playback-start:hover:not(:disabled),
+.playback-loop:hover:not(:disabled) {
+  background-color: #dcdcdc;
+  border-color: #ffffff;
+}
+
+/* 点亮态沿用工具栏绿色，与速度的冷暖色区分开；hover 也要压住，别被通用按钮样式改灰 */
+.playback-loop.is-on,
+.playback-loop.is-on:hover:not(:disabled) {
+  background-color: #4caf50;
+  border-color: #75d879;
+  color: #101510;
+}
+
+/*
+ * 竖向滑条：WebView2（Chromium 119+）靠 writing-mode + direction 竖排，
+ * WKWebView 仍认老式的 -webkit-appearance: slider-vertical，两套都写。
+ * direction: rtl 让最小值落在底部，符合推子直觉。
+ */
+.playback-speed-wrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  gap: 0.15rem;
+  min-height: 6rem;
+  max-height: 14rem;
+}
+
+.playback-speed {
+  -webkit-appearance: slider-vertical;
+  writing-mode: vertical-lr;
+  direction: rtl;
+  flex: 1;
+  width: 1.5rem;
+  margin: 0;
+}
+
+/*
+ * 档位刻度：0.6 在底、2.0 在顶，逐档一个小横线。
+ * 原生 range 的滑块中心到不了轨道两端，所以上下各内缩一个滑块半径，
+ * 刻度才和滑块实际停留的位置对齐（滑块直径 16px）。
+ */
+.playback-ticks {
+  position: relative;
+  width: 0.5rem;
+  margin: 8px 0;
+}
+
+.playback-tick {
+  position: absolute;
+  right: 0;
+  width: 5px;
+  height: 2px;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.28);
+  transform: translateY(50%);
+}
+
+/* 慢速冷色、快速暖色、1.0 中性灰 */
+.playback-speed.tone-slow {
+  accent-color: #64b5f6;
+}
+
+.playback-speed.tone-normal {
+  accent-color: #9e9e9e;
+}
+
+.playback-speed.tone-fast {
+  accent-color: #ffb74d;
+}
+
+.playback-readout {
+  padding: 0.35rem 0.3rem;
+  font-size: 1rem;
+  font-variant-numeric: tabular-nums;
+  background: none;
+  border-color: transparent;
+}
+
+.playback-readout.tone-slow {
+  color: #64b5f6;
+}
+
+.playback-readout.tone-normal {
+  color: #9e9e9e;
+}
+
+.playback-readout.tone-fast {
+  color: #ffb74d;
+}
+
 /* 视口过窄时隐藏侧栏（窗口 minWidth 1100，正常情况下不会触发） */
 @media (max-width: 1079px) {
-  .wave-sidebar {
+  .wave-sidebar,
+  .playback-sidebar {
     display: none;
   }
 }

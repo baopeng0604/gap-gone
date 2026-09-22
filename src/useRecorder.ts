@@ -49,6 +49,18 @@ function isTauriDesktop() {
   return Boolean((window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
 }
 
+/**
+ * 没有保存偏好（或保存的设备已拔掉）时的默认输入设备。Windows 上取列表
+ * 第二个：内置麦通常排第一，用户想用的外接麦在第二位；其它平台仍取第一个。
+ * 只在没有有效选择时生效，不会覆盖用户显式选过的设备。
+ */
+function defaultDeviceId(inputs: AudioInputDevice[]): string {
+  const isWindows =
+    typeof navigator !== "undefined" && /windows/i.test(navigator.userAgent);
+  const index = isWindows && inputs.length > 1 ? 1 : 0;
+  return inputs[index]?.deviceId ?? "";
+}
+
 export function useRecorder() {
   const [devices, setDevices] = useState<AudioInputDevice[]>([]);
   const [selectedDeviceId, setSelectedDeviceIdRaw] = useState(getDeviceId);
@@ -104,7 +116,7 @@ export function useRecorder() {
           if (current && inputs.some((device) => device.deviceId === current)) {
             return current;
           }
-          return inputs[0]?.deviceId ?? "";
+          return defaultDeviceId(inputs);
         });
         return;
       } catch {
@@ -125,7 +137,7 @@ export function useRecorder() {
         if (current && inputs.some((device) => device.deviceId === current)) {
           return current;
         }
-        return inputs[0]?.deviceId ?? "";
+        return defaultDeviceId(inputs);
       });
     } catch {
       setError("无法读取录音设备列表");

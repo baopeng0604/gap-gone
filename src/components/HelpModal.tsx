@@ -154,7 +154,7 @@ export default function HelpModal({
             <li>
               <span className="help-modal-kbd">响度标准化</span>：按成片 Integrated
               响度一键把整段归一至设置里的目标（默认
-              <span className="help-modal-kbd">-19 LUFS</span>，播客单声道口径），
+              <span className="help-modal-kbd">-23 LUFS</span>，EBU R128 广播口径），
               并用前瞻真峰值限幅把峰值压在 -1 dBTP（导出 MP3 时 -1.5 dBTP）以内。
               只改增益、不改波形，所以不会削波也不会发毛。完成后会报出响度、真峰值
               和限幅衰减量，随时可用
@@ -190,7 +190,7 @@ export default function HelpModal({
             <li>RMS 是平均响度，Peak 是瞬时峰值，单位都是 dBFS。</li>
             <li>
               旁边的 LUFS 是成片 Integrated 响度，达标与否对照设置里的目标
-              （默认 -19）：低于目标 1.5 dB 以上偏弱，高于 1.5 dB 以上偏响。
+              （默认 -23）：低于目标 1.5 dB 以上偏弱，高于 1.5 dB 以上偏响。
               只提示，不拦截。
             </li>
             <li>切除和确认降噪后，LUFS 按即将导出的成片重算，已切除区间不计。</li>
@@ -201,11 +201,38 @@ export default function HelpModal({
             <li>耳机监听默认关闭；开启时请不要使用扬声器，以免产生啸叫。</li>
           </ul>
 
+          <h3>播放速度与循环</h3>
+          <ul>
+            <li>
+              左侧竖条自上而下是从头播放、循环开关、播放速度滑条、
+              当前倍速读数。
+            </li>
+            <li>
+              <span className="help-modal-kbd">⇤</span>：从成片开头开始播放，
+              播放中点击则重新开始（快捷键 P）
+            </li>
+            <li>
+              速度从 0.6 到 2.0 共八档（每档差 0.2，滑条旁有刻度点），
+              变速<strong>不变调</strong>（慢速显示冷色、快速暖色、1.0 为灰色）；
+              拖动即时生效，播放中调也不用暂停。
+            </li>
+            <li>点击倍速读数复位到 1.0×，也可以用 [ / ] 快捷键增减一档。</li>
+            <li>
+              循环开关点亮即从成片开头开始播放，播到成片末尾会自动回到开头
+              （已切除的区间不参与循环）；熄灭则停止播放。快捷键
+              <span className="help-modal-kbd">L</span>
+            </li>
+            <li>速度与循环只在本次会话内有效，且不影响导出的内容。</li>
+          </ul>
+
           <h3>快捷键</h3>
           <ul>
             <li>
               <span className="help-modal-kbd">Space</span>：编辑态播放 / 暂停；
               录音中暂停 / 继续录音
+            </li>
+            <li>
+              <span className="help-modal-kbd">P</span>：从头播放（成片开头）
             </li>
             <li>
               <span className="help-modal-kbd">D</span>：检测静音（只生成候选预览）
@@ -231,8 +258,13 @@ export default function HelpModal({
               <span className="help-modal-kbd">T</span>：转录文字
             </li>
             <li>
-              <span className="help-modal-kbd">L</span>：一键响度标准化，把成片响度
-              归一至设置里的目标 LUFS
+              <span className="help-modal-kbd">L</span>：循环播放开关；
+              <span className="help-modal-kbd">⇧L</span>：一键响度标准化，
+              把成片响度归一至设置里的目标 LUFS
+            </li>
+            <li>
+              <span className="help-modal-kbd">[</span> /
+              <span className="help-modal-kbd">]</span>：播放速度减 / 加一档
             </li>
             <li>
               <span className="help-modal-kbd">⌘/Ctrl+Z</span>：撤销；

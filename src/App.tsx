@@ -2,6 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import WaveformScore from "./components/WaveformScore";
 import HelpModal from "./components/HelpModal";
+import PlaybackSidebar, {
+  SPEED_STEPS,
+} from "./components/PlaybackSidebar";
 import {
   getKeptRegions,
   mergeRegions,
@@ -11,6 +14,7 @@ import {
   type Region,
 } from "./utils/regionUtils";
 import {
+  bufferToWav,
   buildExportBuffer,
   exportAudio,
   saveToDisk,
@@ -185,6 +189,19 @@ function loudnessReport(
   return parts.join(" · ");
 }
 
+/**
+ * 变速不变调：Chromium/WebKit 认 `preservesPitch`，老 WebKit 只认
+ * `webkitPreservesPitch`（标准名出现前的写法），两个都设。
+ */
+function setPitchPreserved(element: HTMLMediaElement, preserved: boolean) {
+  const target = element as HTMLMediaElement & {
+    preservesPitch?: boolean;
+    webkitPreservesPitch?: boolean;
+  };
+  target.preservesPitch = preserved;
+  target.webkitPreservesPitch = preserved;
+}
+
 function meterPosition(db: number) {
   if (!Number.isFinite(db)) return 0;
   return Math.max(0, Math.min(1, (db - METER_MIN_DB) / -METER_MIN_DB));
@@ -283,6 +300,9 @@ function App() {
   const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  // 播放速度与循环是会话内的监听参数，不落盘：重启回到 1.0× 且不循环。
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [looping, setLooping] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [editMode, setEditMode] = useState<EditMode>("seek");
@@ -464,14 +484,18 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const waveformViewRef = useRef<HTMLDivElement>(null);
   const followRowRef = useRef(-1);
-  const playbackRef = useRef<{
-    token: number;
-    segments: Region[];
-    index: number;
-    source: AudioBufferSourceNode | null;
-    sourceStartedAt: number;
-    sourceOffset: number;
-  } | null>(null);
+  /**
+   * 播放用媒体元素。变速不变调只能靠它：AudioBufferSourceNode 的
+   * playbackRate 是磁带式变速（变快必升调），媒体元素的 preservesPitch
+   * 才由浏览器做时间伸缩。
+   */
+  const mediaRef = useRef<HTMLAudioElement | null>(null);
+  /** 媒体源（编码后的 WAV blob URL）与它对应的缓冲；缓冲没变就不重复编码。 */
+  const mediaSourceRef = useRef<{ buffer: AudioBuffer; url: string } | null>(
+    null,
+  );
+  /** 循环开关的实时值：rAF 与 onended 回调里要读最新值，不能捕获旧状态。 */
+  const loopingRef = useRef(false);
   const recorder = useRecorder();
   const recordingMeter = usePeakMeterBallistics(
     recorder.level.peakDb,
@@ -502,6 +526,11 @@ function App() {
       window.AudioContext || (window as typeof window & { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     const context = new AudioContextConstructor();
     audioContextRef.current = context;
+    // 播放走媒体元素，AudioContext 从此只负责解码与离线渲染（降噪）。
+    const media = new Audio();
+    media.preload = "auto";
+    setPitchPreserved(media, true);
+    mediaRef.current = media;
     const preventContextMenu = (event: MouseEvent) => event.preventDefault();
     document.addEventListener("contextmenu", preventContextMenu);
 
@@ -510,10 +539,13 @@ function App() {
       if (animationFrameRef.current !== null) {
         cancelAnimationFrame(animationFrameRef.current);
       }
-      try {
-        playbackRef.current?.source?.stop();
-      } catch {
-        // The source may already be stopped.
+      media.pause();
+      media.removeAttribute("src");
+      mediaRef.current = null;
+      const mediaSource = mediaSourceRef.current;
+      if (mediaSource) {
+        URL.revokeObjectURL(mediaSource.url);
+        mediaSourceRef.current = null;
       }
       if (recordingCountdownRef.current !== null) {
         window.clearInterval(recordingCountdownRef.current);
@@ -561,44 +593,71 @@ function App() {
     setCurrentTime(position);
   }, []);
 
-  const getLivePosition = useCallback(() => {
-    const playback = playbackRef.current;
-    const context = audioContextRef.current;
-    if (!playback || !context || !audioBuffer) return currentTimeRef.current;
-    const segment = playback.segments[playback.index];
-    return Math.min(
-      segment.end,
-      playback.sourceOffset + context.currentTime - playback.sourceStartedAt,
-    );
-  }, [audioBuffer]);
+  /** 当前缓冲对应的媒体源：缓冲没变就复用，变了才重新编码一份 WAV。 */
+  const syncMediaSource = useCallback((buffer: AudioBuffer) => {
+    if (mediaSourceRef.current?.buffer === buffer) return;
+    const url = URL.createObjectURL(bufferToWav(buffer));
+    const previous = mediaSourceRef.current;
+    mediaSourceRef.current = { buffer, url };
+    const media = mediaRef.current;
+    if (media) {
+      media.src = url;
+      media.load();
+    }
+    if (previous) URL.revokeObjectURL(previous.url);
+  }, []);
+
+  /**
+   * 缓冲变化后重建播放源。WAV 编码是同步的，长录音会占住主线程一会儿，
+   * 所以延到下一帧，先让"加载完成/处理完成"的画面画出来。
+   */
+  useEffect(() => {
+    if (!audioBuffer) return;
+    const timer = window.setTimeout(() => syncMediaSource(audioBuffer), 0);
+    return () => window.clearTimeout(timer);
+  }, [audioBuffer, syncMediaSource]);
+
+  /** 变速对媒体元素是即时的，播放中拖动滑条就能听到效果。 */
+  useEffect(() => {
+    const media = mediaRef.current;
+    if (media) media.playbackRate = playbackSpeed;
+  }, [playbackSpeed]);
+
+  /** 成片起点（第一个保留区间的起点）；整段被切除时返回 null。 */
+  const firstKeptStart = useCallback(
+    (buffer: AudioBuffer, regions: Region[]) => {
+      const segments = getKeptRegions(regions, buffer.duration);
+      return segments.length ? segments[0].start : null;
+    },
+    [],
+  );
 
   const stopPlayback = useCallback(
     (updatePosition = true) => {
-      const playback = playbackRef.current;
-      if (updatePosition && playback) setPosition(getLivePosition());
+      const media = mediaRef.current;
+      const wasPlaying = animationFrameRef.current !== null;
       playbackTokenRef.current += 1;
-      playbackRef.current = null;
       if (animationFrameRef.current !== null) {
         cancelAnimationFrame(animationFrameRef.current);
         animationFrameRef.current = null;
       }
-      try {
-        playback?.source?.stop();
-      } catch {
-        // The source may already be stopped.
+      if (media) {
+        // currentTime 是源时间轴上的位置，变速播放时也不用换算。
+        if (updatePosition && wasPlaying) setPosition(media.currentTime);
+        media.onended = null;
+        media.pause();
       }
       setIsPlaying(false);
       setPlaybackLevel(null);
     },
-    [getLivePosition, setPosition],
+    [setPosition],
   );
 
   const startPlayback = useCallback(
     async (offset: number) => {
-      if (!audioBuffer || !audioContextRef.current) return;
-      if (audioContextRef.current.state === "suspended") {
-        await audioContextRef.current.resume();
-      }
+      if (!audioBuffer) return;
+      const media = mediaRef.current;
+      if (!media) return;
 
       stopPlayback(false);
       const segments = getKeptRegions(deletedRegions, audioBuffer.duration);
@@ -612,7 +671,7 @@ function App() {
         deletedRegions,
         audioBuffer.duration,
       );
-      let index = segments.findIndex(
+      const index = segments.findIndex(
         (segment) =>
           playableOffset >= segment.start && playableOffset < segment.end,
       );
@@ -621,51 +680,61 @@ function App() {
         return;
       }
 
+      syncMediaSource(audioBuffer);
+      media.playbackRate = playbackSpeed;
+      setPitchPreserved(media, true);
+
       const token = playbackTokenRef.current + 1;
       playbackTokenRef.current = token;
-
-      const playSegment = (segmentIndex: number, sourceOffset: number) => {
-        if (
-          playbackTokenRef.current !== token ||
-          !audioContextRef.current ||
-          !audioBuffer
-        ) {
+      media.onended = () => {
+        if (playbackTokenRef.current !== token) return;
+        const loopStart = firstKeptStart(audioBuffer, deletedRegions);
+        // 循环回到成片起点，而不是文件 0——文件开头可能已经被切除。
+        if (loopingRef.current && loopStart !== null) {
+          media.currentTime = loopStart;
+          void media.play().catch(() => undefined);
           return;
         }
-        const segment = segments[segmentIndex];
-        const source = audioContextRef.current.createBufferSource();
-        source.buffer = audioBuffer;
-        // 必须直连 destination。macOS WKWebView 上把 AnalyserNode 串在
-        // 输出链里会吞掉声音；倒计时用 HTMLAudio 所以不受影响。
-        source.connect(audioContextRef.current.destination);
-        playbackRef.current = {
-          token,
-          segments,
-          index: segmentIndex,
-          source,
-          sourceStartedAt: audioContextRef.current.currentTime,
-          sourceOffset,
-        };
-        source.onended = () => {
-          if (playbackTokenRef.current !== token) return;
-          const nextIndex = segmentIndex + 1;
-          if (nextIndex < segments.length) {
-            playSegment(nextIndex, segments[nextIndex].start);
-          } else {
-            playbackRef.current = null;
-            setIsPlaying(false);
-            setPlaybackLevel(null);
-            setPosition(audioBuffer.duration);
-          }
-        };
-        source.start(0, sourceOffset, segment.end - sourceOffset);
+        stopPlayback(false);
+        setPosition(audioBuffer.duration);
       };
 
+      const start = Math.max(playableOffset, segments[index].start);
+      // 元数据未就绪时直接赋值会被丢弃，等 loadedmetadata 再定位（正常路径
+      // 早就预编码好了，走不到这里）。
+      if (media.readyState >= 1) {
+        media.currentTime = start;
+      } else {
+        media.addEventListener(
+          "loadedmetadata",
+          () => {
+            media.currentTime = start;
+          },
+          { once: true },
+        );
+      }
+
       setIsPlaying(true);
-      playSegment(index, Math.max(playableOffset, segments[index].start));
+      try {
+        await media.play();
+      } catch {
+        setIsPlaying(false);
+        return;
+      }
+
       const animate = () => {
-        if (playbackTokenRef.current !== token || !playbackRef.current) return;
-        const position = getLivePosition();
+        if (playbackTokenRef.current !== token || !mediaRef.current) return;
+        const current = mediaRef.current;
+        // 进入切除区间就跳到区间末尾；上一次 seek 还没落地时不重复下发。
+        if (!current.seeking) {
+          const next = nextPlayableTime(
+            current.currentTime,
+            deletedRegions,
+            audioBuffer.duration,
+          );
+          if (next > current.currentTime) current.currentTime = next;
+        }
+        const position = Math.min(audioBuffer.duration, current.currentTime);
         setPosition(position);
         setPlaybackLevel(levelFromBuffer(audioBuffer, position));
         animationFrameRef.current = requestAnimationFrame(animate);
@@ -675,9 +744,11 @@ function App() {
     [
       audioBuffer,
       deletedRegions,
-      getLivePosition,
+      firstKeptStart,
+      playbackSpeed,
       setPosition,
       stopPlayback,
+      syncMediaSource,
     ],
   );
 
@@ -692,6 +763,55 @@ function App() {
         : currentTimeRef.current,
     );
   }, [audioBuffer, isPlaying, startPlayback, stopPlayback]);
+
+  /** 循环开关同步到 ref：rAF 与 onended 回调要读实时值。 */
+  useEffect(() => {
+    loopingRef.current = looping;
+  }, [looping]);
+
+  /**
+   * 循环开关兼作播放控制：点亮就从成片开头开始播，熄灭就停止播放。
+   * 起点与回环点都是成片起点（第一个保留区间），反复听开头时行为稳定。
+   */
+  const toggleLoop = useCallback(() => {
+    const next = !looping;
+    setLooping(next);
+    if (!next) {
+      stopPlayback(true);
+      notify("循环播放已关闭");
+      return;
+    }
+    const start = audioBuffer
+      ? firstKeptStart(audioBuffer, deletedRegions)
+      : null;
+    notify("循环播放已开启，从成片开头播放");
+    void startPlayback(start ?? 0);
+  }, [
+    audioBuffer,
+    deletedRegions,
+    firstKeptStart,
+    looping,
+    notify,
+    startPlayback,
+    stopPlayback,
+  ]);
+
+  /** 从头播放：offset 0 会被吸附到成片第一个保留区间的起点。 */
+  const playFromStart = useCallback(() => {
+    void startPlayback(0);
+  }, [startPlayback]);
+
+  const resetSpeed = useCallback(() => setPlaybackSpeed(1), []);
+
+  /** 速度上下移一档，到达端点即停。 */
+  const stepSpeed = useCallback((direction: number) => {
+    setPlaybackSpeed((current) => {
+      const index = SPEED_STEPS.indexOf(current);
+      const base = index < 0 ? SPEED_STEPS.indexOf(1) : index;
+      const next = Math.max(0, Math.min(SPEED_STEPS.length - 1, base + direction));
+      return SPEED_STEPS[next];
+    });
+  }, []);
 
   const resetEditing = () => {
     setPosition(0);
@@ -741,7 +861,9 @@ function App() {
       ? nextPlayableTime(time, deletedRegions, audioBuffer.duration)
       : time;
     setPosition(position);
-    if (isPlaying) void startPlayback(position);
+    // 媒体元素改 currentTime 即可，不必像 AudioBufferSourceNode 那样重开源。
+    const media = mediaRef.current;
+    if (isPlaying && media) media.currentTime = position;
   };
 
   const updateEditState = (next: EditState) => {
@@ -1182,7 +1304,9 @@ function App() {
       const isTextEntryTarget =
         target instanceof HTMLElement &&
         target.closest(
-          "input:not([type='checkbox']):not([type='radio']), textarea, [contenteditable='true']",
+          // range 是播放速度滑条：焦点停在它上面时快捷键仍要生效，
+          // 方向键换档由原生行为处理。
+          "input:not([type='checkbox']):not([type='radio']):not([type='range']), textarea, [contenteditable='true']",
         );
       if (isTextEntryTarget || event.repeat) return;
 
@@ -1222,6 +1346,9 @@ function App() {
         "KeyL",
         "KeyT",
         "KeyB",
+        "KeyP",
+        "BracketLeft",
+        "BracketRight",
         "Space",
       ].includes(event.code);
       if (
@@ -1303,12 +1430,13 @@ function App() {
         void handleNoiseReduction();
       } else if (
         event.code === "KeyL" &&
+        event.shiftKey &&
         !hasPrimaryModifier &&
         audioBuffer &&
         !isProcessing &&
         recorder.status !== "recording"
       ) {
-        // L = 一键响度标准化（统一到设置里的目标 LUFS）
+        // ⇧L = 一键响度标准化（统一到设置里的目标 LUFS）
         event.preventDefault();
         handleLoudnessNormalize();
       } else if (
@@ -1333,6 +1461,37 @@ function App() {
         // B = 恢复原始（撤回已确认的降噪版本）
         event.preventDefault();
         restoreOriginal();
+      } else if (
+        (event.code === "BracketLeft" || event.code === "BracketRight") &&
+        !hasPrimaryModifier &&
+        audioBuffer &&
+        !isProcessing &&
+        recorder.status !== "recording"
+      ) {
+        // [ = 减速一档，] = 加速一档
+        event.preventDefault();
+        stepSpeed(event.code === "BracketRight" ? 1 : -1);
+      } else if (
+        event.code === "KeyP" &&
+        !hasPrimaryModifier &&
+        audioBuffer &&
+        !isProcessing &&
+        recorder.status !== "recording"
+      ) {
+        // P = 从头播放（只从成片开头开始，不改动切除区间）
+        event.preventDefault();
+        playFromStart();
+      } else if (
+        event.code === "KeyL" &&
+        !event.shiftKey &&
+        !hasPrimaryModifier &&
+        audioBuffer &&
+        !isProcessing &&
+        recorder.status !== "recording"
+      ) {
+        // L = 循环播放开关（点亮即从成片开头开始播）
+        event.preventDefault();
+        toggleLoop();
       } else if (
         event.code === "KeyH" ||
         event.key === "?" ||
@@ -1379,9 +1538,12 @@ function App() {
     recorder.stopRecording,
     recorder.status,
     recordingCountdown,
+    playFromStart,
     restoreLastAutoDetection,
     redo,
     startRecordingWithCountdown,
+    stepSpeed,
+    toggleLoop,
     togglePlayback,
     undo,
   ]);
@@ -1586,10 +1748,10 @@ function App() {
           <button
             onClick={handleLoudnessNormalize}
             disabled={!audioBuffer || isProcessing}
-            aria-keyshortcuts="L"
-            title={`快捷键 L：把成片响度归一至 ${lufsTargetDb} LUFS，真峰值限幅防削波`}
+            aria-keyshortcuts="Shift+L"
+            title={`快捷键 ⇧L：把成片响度归一至 ${lufsTargetDb} LUFS，真峰值限幅防削波`}
           >
-            响度标准化 <span className="shortcut-key">L</span>
+            响度标准化 <span className="shortcut-key">⇧L</span>
           </button>
           {hasLoudnessApplied && (
             <button
@@ -2120,6 +2282,18 @@ function App() {
           filePeakDb={filePeakDb}
           lufs={timelineLufs}
           lufsTarget={lufsTargetDb}
+        />
+      )}
+
+      {audioBuffer && (
+        <PlaybackSidebar
+          speed={playbackSpeed}
+          onSpeedChange={setPlaybackSpeed}
+          onSpeedReset={resetSpeed}
+          onPlayFromStart={playFromStart}
+          looping={looping}
+          onToggleLoop={toggleLoop}
+          disabled={isProcessing || recorder.status === "recording"}
         />
       )}
 
