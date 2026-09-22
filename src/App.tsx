@@ -20,13 +20,19 @@ import { extractKeyword } from "./utils/keywordExtract";
 import {
   getExportBitrate,
   getExportFormat,
+  getLufsTarget,
   getNoisePreset,
   getSilencePreset,
+  getSilenceThreshold,
   getTranscriptVisible,
+  LUFS_TARGET_PRESETS,
+  LUFS_TARGET_RANGE,
   setExportBitrate,
   setExportFormat,
+  setLufsTarget as persistLufsTarget,
   setNoisePreset as persistNoisePreset,
   setSilencePreset as persistSilencePreset,
+  setSilenceThreshold as persistSilenceThreshold,
   setTranscriptVisible as persistTranscriptVisible,
   type ExportBitrate,
   type ExportFormat,
@@ -35,6 +41,8 @@ import { formatTimeStandard } from "./utils/timeUtils";
 import {
   detectSilence,
   SILENCE_PRESETS,
+  SILENCE_THRESHOLD_PRESETS,
+  SILENCE_THRESHOLD_RANGE,
   type SilencePreset,
 } from "./utils/audioAnalysis";
 import {
@@ -62,13 +70,12 @@ import {
   type TranscribeProgress,
 } from "./utils/transcribe";
 import {
-  applyLufsGain,
-  compressLoudness,
   formatLufs,
   integratedLufsFromBuffer,
-  limitTruePeak,
   lufsBand,
   lufsBandLabel,
+  normalizeLoudness,
+  type LoudnessNormalizeResult,
 } from "./utils/lufs";
 import TranscriptPanel from "./components/TranscriptPanel";
 import WaveSidebar from "./components/WaveSidebar";
@@ -98,12 +105,12 @@ function formatDb(value: number) {
   return Number.isFinite(value) ? `${value.toFixed(1)} dBFS` : "-∞ dBFS";
 }
 
-function LufsReadout({ lufs }: { lufs: number }) {
-  const band = lufsBand(lufs);
+function LufsReadout({ lufs, target }: { lufs: number; target: number }) {
+  const band = lufsBand(lufs, target);
   return (
     <span
       className={band ? `lufs-readout lufs-${band}` : "lufs-readout"}
-      title="成片 Integrated LUFS，对照短视频常见目标 -14 LUFS"
+      title={`成片 Integrated LUFS，当前目标 ${target} LUFS`}
     >
       {formatLufs(lufs)}
       {band ? ` ${lufsBandLabel(band)}` : ""}
@@ -144,13 +151,39 @@ function createExportFileName(extension: string, keyword: string | null) {
 
 const METER_MIN_DB = -60;
 const METER_MARKS = [-60, -54, -48, -42, -36, -30, -24, -18, -12, -6, 0];
-/** 一键响度标准化的目标 Integrated LUFS（2026-09 定为 -20：在 -16 易过破与 -24 偏保守之间取中）。 */
-const LUFS_TARGET = -20;
-/** 响度标准化：先对 >-6dBFS 大音量段轻度压缩，末端真峰值限制到 -1dBFS。 */
-const LUFS_COMPRESS_THRESHOLD_DB = -6;
-const LUFS_COMPRESS_RATIO = 1.5;
-const LUFS_CEILING_DB = -1;
-const LUFS_CEILING_RATIO = 20;
+/**
+ * 真峰值上限：WAV 按播客规范 -1 dBTP；MP3 有损编码还会额外过冲 0.5 dB 左右，
+ * 所以交付 MP3 时压到 -1.5 dBTP，避免编码完反而越线。
+ */
+const LUFS_CEILING_DB_WAV = -1;
+const LUFS_CEILING_DB_MP3 = -1.5;
+/** 限幅衰减超过这个量，说明素材动态明显偏大，值得提示用户。 */
+const LUFS_HEAVY_LIMIT_DB = 6;
+
+function formatTruePeak(db: number) {
+  return Number.isFinite(db) ? `${db.toFixed(1)} dBTP` : "-∞ dBTP";
+}
+
+/** 标准化结果播报：响度、真峰值、限幅衰减，外加不达标时的原因。 */
+function loudnessReport(
+  result: LoudnessNormalizeResult,
+  targetLufs: number,
+  ceilingDb: number,
+) {
+  const parts = [
+    `响度 ${formatLufs(result.beforeLufs)} → ${formatLufs(result.afterLufs)}（目标 ${targetLufs}）`,
+    `真峰值 ${formatTruePeak(result.truePeakDb)}（上限 ${ceilingDb}）`,
+    `限幅衰减 ${result.gainReductionDb.toFixed(1)} dB`,
+  ];
+  if (result.gainReductionDb > LUFS_HEAVY_LIMIT_DB) {
+    parts.push("素材动态偏大，限幅较深，可考虑先做压缩");
+  }
+  if (!result.converged) {
+    parts.push(`未收敛到目标，已迭代 ${result.passes} 轮`);
+  }
+  parts.push("已保留处理前版本，可用「撤销响度」回退");
+  return parts.join(" · ");
+}
 
 function meterPosition(db: number) {
   if (!Number.isFinite(db)) return 0;
@@ -294,7 +327,20 @@ function App() {
   const [silencePreset, setSilencePreset] = useState<SilencePreset>(
     getSilencePreset() as SilencePreset,
   );
+  const [silenceThresholdDb, setSilenceThresholdDb] = useState(
+    getSilenceThreshold(),
+  );
+  // 输入框用文本态，避免输入「-」这类中间态被数字解析吃掉。
+  const [silenceThresholdInput, setSilenceThresholdInput] = useState(() =>
+    String(getSilenceThreshold()),
+  );
   const [hasEnhancedAudio, setHasEnhancedAudio] = useState(false);
+  const [hasLoudnessApplied, setHasLoudnessApplied] = useState(false);
+  const [lufsTargetDb, setLufsTargetDb] = useState(getLufsTarget());
+  // 输入框用文本态，避免输入「-」这类中间态被数字解析吃掉。
+  const [lufsTargetInput, setLufsTargetInput] = useState(() =>
+    String(getLufsTarget()),
+  );
   const [showRecordingSetup, setShowRecordingSetup] = useState(false);
   const [modelDirInput, setModelDirInput] = useState("");
   const [autoTranscribeEnabled, setAutoTranscribeEnabled] = useState(
@@ -334,6 +380,8 @@ function App() {
   const [modelDownloadError, setModelDownloadError] = useState<string | null>(
     null,
   );
+  /** 转录与标点模型文件齐备：据此禁用「下载模型」，避免无意义的重复下载。 */
+  const modelReady = Boolean(modelStatus?.ready && modelStatus.punctReady);
 
   const refreshTempStorage = useCallback(async () => {
     try {
@@ -403,6 +451,8 @@ function App() {
     peakDb: number;
   } | null>(null);
   const denoiseBaseRef = useRef<AudioBuffer | null>(null);
+  /** 响度标准化前的缓冲快照，供「撤销响度」回退。 */
+  const loudnessBaseRef = useRef<AudioBuffer | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const originalBufferRef = useRef<AudioBuffer | null>(null);
@@ -650,6 +700,8 @@ function App() {
     setSelection(null);
     setDenoisePreview(null);
     denoiseBaseRef.current = null;
+    loudnessBaseRef.current = null;
+    setHasLoudnessApplied(false);
     setHistory([]);
     setFuture([]);
   };
@@ -749,17 +801,17 @@ function App() {
     setIsProcessing(true);
     window.setTimeout(() => {
       try {
-        const candidates = detectSilence(
-          audioBuffer,
-          SILENCE_PRESETS[silencePreset],
-        );
+        const candidates = detectSilence(audioBuffer, {
+          ...SILENCE_PRESETS[silencePreset],
+          thresholdDb: silenceThresholdDb,
+        });
         setDetectedSilenceRegions(candidates);
         if (candidates.length) {
           notify(
-            `使用“${silencePresetLabels[silencePreset]}”预设检测到 ${candidates.length} 个静音候选片段，请检查波形后应用`,
+            `使用“${silencePresetLabels[silencePreset]}”预设（阈值 ${silenceThresholdDb} dBFS）检测到 ${candidates.length} 个静音候选片段，请检查波形后应用`,
           );
         } else {
-          notify("未检测到符合条件的静音片段");
+          notify(`未检测到符合条件的静音片段（当前阈值 ${silenceThresholdDb} dBFS）`);
         }
       } catch {
         notify("静音分析失败", "error");
@@ -767,7 +819,7 @@ function App() {
         setIsProcessing(false);
       }
     }, 0);
-  }, [audioBuffer, silencePreset]);
+  }, [audioBuffer, silencePreset, silenceThresholdDb]);
 
   const applySilenceDetection = () => {
     if (!audioBuffer || !detectedSilenceRegions.length) return;
@@ -947,32 +999,79 @@ function App() {
     await cancelDeepFilterProcessing();
   };
 
-  /** 一键响度标准化：压缩压峰 → 按成片响度归一到 LUFS_TARGET → 末端限幅，避免削波。 */
+  /**
+   * 一键响度标准化：静态增益 + 真峰值限幅，迭代收敛到目标 LUFS。
+   * 处理前留一份快照，「撤销响度」可回退（Ctrl+Z 只管区间编辑，回不到这里）。
+   */
   const handleLoudnessNormalize = useCallback(() => {
     if (!audioBuffer) return;
-    // 1) 先对 >-6dBFS 大音量段轻度压峰，为后续提升留余量。
-    const compressed = compressLoudness(
-      audioBuffer,
-      LUFS_COMPRESS_THRESHOLD_DB,
-      LUFS_COMPRESS_RATIO,
+    const ceilingDb =
+      exportFormat === "mp3" ? LUFS_CEILING_DB_MP3 : LUFS_CEILING_DB_WAV;
+    setIsProcessing(true);
+    // 重算是同步的，先让「处理中」遮罩渲染出去再开算。用 setTimeout 让遮罩先渲染。
+    window.setTimeout(() => {
+      try {
+        const result = normalizeLoudness(audioBuffer, {
+          targetLufs: lufsTargetDb,
+          ceilingDb,
+          deletedRegions,
+        });
+        if (!result) {
+          notify("无法测量当前响度，请先留出可导出的音频内容", "error");
+          return;
+        }
+        stopPlayback(false);
+        loudnessBaseRef.current = audioBuffer;
+        setHasLoudnessApplied(true);
+        setAudioBuffer(result.buffer);
+        notify(loudnessReport(result, lufsTargetDb, ceilingDb), "progress");
+      } catch {
+        notify("响度标准化失败，原始音频未改变", "error");
+      } finally {
+        setIsProcessing(false);
+      }
+    }, 0);
+  }, [
+    audioBuffer,
+    deletedRegions,
+    exportFormat,
+    lufsTargetDb,
+    notify,
+    stopPlayback,
+  ]);
+
+  const revertLoudness = () => {
+    if (!loudnessBaseRef.current) return;
+    stopPlayback(false);
+    setAudioBuffer(loudnessBaseRef.current);
+    loudnessBaseRef.current = null;
+    setHasLoudnessApplied(false);
+    setPosition(0);
+    notify("已回退到响度标准化之前");
+  };
+
+  /** 目标 LUFS 落库：夹到合法区间，同时把输入框文本同步成规范值。 */
+  const commitLufsTarget = useCallback((target: number) => {
+    const clamped = Math.max(
+      LUFS_TARGET_RANGE.min,
+      Math.min(LUFS_TARGET_RANGE.max, Math.round(target * 10) / 10),
     );
-    const current = integratedLufsFromBuffer(compressed, deletedRegions);
-    if (!Number.isFinite(current)) {
-      notify("无法测量当前响度，请先留出可导出的音频内容", "error");
-      return;
-    }
-    // 2) 压缩后重新归一到目标响度。
-    const gained = applyLufsGain(compressed, LUFS_TARGET - current);
-    // 3) 末端真峰值限制到 -1dBFS，作为削波兜底。
-    const result = limitTruePeak(gained, LUFS_CEILING_DB, LUFS_CEILING_RATIO);
-    setAudioBuffer(result);
-    const after = integratedLufsFromBuffer(result, deletedRegions);
-    notify(
-      `响度已标准化：${formatLufs(current)} → ${
-        Number.isFinite(after) ? formatLufs(after) : formatLufs(LUFS_TARGET)
-      }（先压 >-6dBFS 峰，末端限到 -1dBFS）`,
+    setLufsTargetDb(clamped);
+    setLufsTargetInput(String(clamped));
+    persistLufsTarget(clamped);
+  }, []);
+
+  /** 静音阈值落库：夹到合法区间，同时把输入框文本同步成规范值并清掉旧候选。 */
+  const commitSilenceThreshold = useCallback((threshold: number) => {
+    const clamped = Math.max(
+      SILENCE_THRESHOLD_RANGE.min,
+      Math.min(SILENCE_THRESHOLD_RANGE.max, Math.round(threshold * 10) / 10),
     );
-  }, [audioBuffer, deletedRegions, notify]);
+    setSilenceThresholdDb(clamped);
+    setSilenceThresholdInput(String(clamped));
+    persistSilenceThreshold(clamped);
+    setDetectedSilenceRegions([]);
+  }, []);
 
   const handleTranscribe = async (source?: AudioBuffer) => {
     const target = source ?? audioBuffer;
@@ -1029,6 +1128,9 @@ function App() {
     if (!denoisePreview) return;
     setDenoisePreview(null);
     denoiseBaseRef.current = null;
+    // 降噪改写了缓冲，响度快照随之失效，避免回退时把降噪成果一起吞掉。
+    loudnessBaseRef.current = null;
+    setHasLoudnessApplied(false);
     setHasEnhancedAudio(true);
     notify("降噪版本已确认");
   };
@@ -1049,6 +1151,8 @@ function App() {
     stopPlayback(false);
     setAudioBuffer(originalBufferRef.current);
     setHasEnhancedAudio(false);
+    loudnessBaseRef.current = null;
+    setHasLoudnessApplied(false);
     setPosition(0);
   };
 
@@ -1204,7 +1308,7 @@ function App() {
         !isProcessing &&
         recorder.status !== "recording"
       ) {
-        // L = 一键响度标准化（统一到 -20 LUFS）
+        // L = 一键响度标准化（统一到设置里的目标 LUFS）
         event.preventDefault();
         handleLoudnessNormalize();
       } else if (
@@ -1483,10 +1587,18 @@ function App() {
             onClick={handleLoudnessNormalize}
             disabled={!audioBuffer || isProcessing}
             aria-keyshortcuts="L"
-            title="快捷键 L：压缩压峰后把成片响度归一至 -20 LUFS，末端限幅防削波"
+            title={`快捷键 L：把成片响度归一至 ${lufsTargetDb} LUFS，真峰值限幅防削波`}
           >
             响度标准化 <span className="shortcut-key">L</span>
           </button>
+          {hasLoudnessApplied && (
+            <button
+              onClick={revertLoudness}
+              title="回退到响度标准化之前的版本"
+            >
+              撤销响度
+            </button>
+          )}
           <button onClick={restoreOriginal} disabled={!hasEnhancedAudio}>
             恢复原始 <span className="shortcut-key">B</span>
           </button>
@@ -1602,8 +1714,9 @@ function App() {
                       .then(() => refreshModelStatus())
                       .catch(() => notify("模型目录保存失败", "error"));
                   }}
+                  title="把输入框里的路径写入配置并重新检查模型状态"
                 >
-                  保存
+                  应用路径
                 </button>
                 <button
                   onClick={() => void openTranscribeModelDir()}
@@ -1613,8 +1726,16 @@ function App() {
                 </button>
                 <button
                   onClick={() => void handleDownloadModels()}
-                  disabled={modelDownloadPercent !== null || Boolean(transcribeProgress)}
-                  title="下载 SenseVoice 与标点模型；已存在的文件会跳过"
+                  disabled={
+                    modelDownloadPercent !== null ||
+                    Boolean(transcribeProgress) ||
+                    modelReady
+                  }
+                  title={
+                    modelReady
+                      ? "SenseVoice 与标点模型均已就绪，无需重复下载"
+                      : "下载 SenseVoice 与标点模型；已存在的文件会跳过"
+                  }
                 >
                   {modelDownloadPercent !== null
                     ? `下载中 ${Math.round(modelDownloadPercent)}%`
@@ -1626,7 +1747,7 @@ function App() {
                   className={
                     modelDownloadError
                       ? "model-status is-error"
-                      : modelStatus?.ready && modelStatus.punctReady
+                      : modelReady
                         ? "model-status is-ready"
                         : "model-status"
                   }
@@ -1684,6 +1805,70 @@ function App() {
               </div>
             </>
           )}
+          <div className="setup-row">
+            <label className="setup-checkbox">静音阈值</label>
+            {SILENCE_THRESHOLD_PRESETS.map((preset) => (
+              <label className="setup-checkbox" key={preset.label}>
+                <input
+                  type="radio"
+                  name="silence-threshold"
+                  checked={silenceThresholdDb === preset.threshold}
+                  onChange={() => commitSilenceThreshold(preset.threshold)}
+                />
+                {preset.label}
+              </label>
+            ))}
+            <label className="setup-checkbox">
+              <input
+                type="number"
+                step="1"
+                min={SILENCE_THRESHOLD_RANGE.min}
+                max={SILENCE_THRESHOLD_RANGE.max}
+                value={silenceThresholdInput}
+                onChange={(event) =>
+                  setSilenceThresholdInput(event.target.value)
+                }
+                onBlur={() => {
+                  const parsed = Number(silenceThresholdInput);
+                  commitSilenceThreshold(
+                    Number.isFinite(parsed) ? parsed : silenceThresholdDb,
+                  );
+                }}
+              />
+              dBFS
+            </label>
+          </div>
+          <div className="setup-row">
+            <label className="setup-checkbox">响度目标</label>
+            {LUFS_TARGET_PRESETS.map((preset) => (
+              <label className="setup-checkbox" key={preset.label}>
+                <input
+                  type="radio"
+                  name="lufs-target"
+                  checked={lufsTargetDb === preset.target}
+                  onChange={() => commitLufsTarget(preset.target)}
+                />
+                {preset.label}
+              </label>
+            ))}
+            <label className="setup-checkbox">
+              <input
+                type="number"
+                step="0.5"
+                min={LUFS_TARGET_RANGE.min}
+                max={LUFS_TARGET_RANGE.max}
+                value={lufsTargetInput}
+                onChange={(event) => setLufsTargetInput(event.target.value)}
+                onBlur={() => {
+                  const parsed = Number(lufsTargetInput);
+                  commitLufsTarget(
+                    Number.isFinite(parsed) ? parsed : lufsTargetDb,
+                  );
+                }}
+              />
+              LUFS
+            </label>
+          </div>
           <div className="setup-row">
             <label className="setup-checkbox">导出格式</label>
             <label className="setup-checkbox">
@@ -1830,7 +2015,7 @@ function App() {
             <span>RMS {formatDb(recorder.level.rmsDb)}</span>
             <span>Peak {formatDb(recorder.level.peakDb)}</span>
             <span>保持 {formatDb(recorder.peakHoldDb)}</span>
-            <LufsReadout lufs={recorder.level.lufs} />
+            <LufsReadout lufs={recorder.level.lufs} target={lufsTargetDb} />
           </div>
           <label className="monitor-toggle">
             <input
@@ -1934,6 +2119,7 @@ function App() {
           level={playbackLevel}
           filePeakDb={filePeakDb}
           lufs={timelineLufs}
+          lufsTarget={lufsTargetDb}
         />
       )}
 

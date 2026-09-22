@@ -119,6 +119,12 @@ export default function HelpModal({
               静音区间两端保留的声音，默认是自然
             </li>
             <li>
+              <span className="help-modal-kbd">静音阈值</span>：设置里的分贝值，
+              低于它才算安静，默认
+              <span className="help-modal-kbd">-36.5 dBFS</span>。底噪偏高检不出来
+              时往上调（-30 一档更激进），误切气口时往下调
+            </li>
+            <li>
               <span className="help-modal-kbd">恢复本次检测</span>：只移除最近
               应用的自动检测结果，不影响手动切除
             </li>
@@ -146,11 +152,13 @@ export default function HelpModal({
               <span className="help-modal-kbd">恢复原始</span>：撤回已确认的降噪版本
             </li>
             <li>
-              <span className="help-modal-kbd">响度标准化</span>：先对超过 -6 dBFS 的
-              大音量段做轻度压峰，再按成片 Integrated 响度一键把整段归一至
-              <span className="help-modal-kbd">-20 LUFS</span>，末端把真峰值限制到
-              -1 dBFS 兜底、避免削波；仍可用
-              <span className="help-modal-kbd">恢复原始</span>回退
+              <span className="help-modal-kbd">响度标准化</span>：按成片 Integrated
+              响度一键把整段归一至设置里的目标（默认
+              <span className="help-modal-kbd">-19 LUFS</span>，播客单声道口径），
+              并用前瞻真峰值限幅把峰值压在 -1 dBTP（导出 MP3 时 -1.5 dBTP）以内。
+              只改增益、不改波形，所以不会削波也不会发毛。完成后会报出响度、真峰值
+              和限幅衰减量，随时可用
+              <span className="help-modal-kbd">撤销响度</span>回退
             </li>
           </ul>
 
@@ -181,8 +189,9 @@ export default function HelpModal({
             <li>亮条跟随峰值（升起快、落下带惯性），浅色底是 RMS；白针是峰值保持。</li>
             <li>RMS 是平均响度，Peak 是瞬时峰值，单位都是 dBFS。</li>
             <li>
-              旁边的 LUFS 是成片 Integrated 响度（对照短视频常见目标 -14 LUFS）：
-              低于 -20 偏弱，-20～-16 达标，高于 -16 偏响。只提示，不拦截。
+              旁边的 LUFS 是成片 Integrated 响度，达标与否对照设置里的目标
+              （默认 -19）：低于目标 1.5 dB 以上偏弱，高于 1.5 dB 以上偏响。
+              只提示，不拦截。
             </li>
             <li>切除和确认降噪后，LUFS 按即将导出的成片重算，已切除区间不计。</li>
             <li>峰值保持显示录音期间出现过的最高峰值。</li>
@@ -223,7 +232,7 @@ export default function HelpModal({
             </li>
             <li>
               <span className="help-modal-kbd">L</span>：一键响度标准化，把成片响度
-              归一至 -20 LUFS
+              归一至设置里的目标 LUFS
             </li>
             <li>
               <span className="help-modal-kbd">⌘/Ctrl+Z</span>：撤销；

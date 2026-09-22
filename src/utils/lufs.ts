@@ -12,10 +12,14 @@ const LOUDNESS_OFFSET = -0.691;
 
 export type LufsBand = "quiet" | "ok" | "loud";
 
-export function lufsBand(lufs: number): LufsBand | null {
+/** 「达标」容差：与目标响度的偏差在此以内算达标。 */
+export const LUFS_BAND_TOLERANCE_DB = 1.5;
+
+/** 达标判定按用户设定的目标口径走，不再是写死的 -20 ~ -16。 */
+export function lufsBand(lufs: number, targetLufs: number): LufsBand | null {
   if (!Number.isFinite(lufs)) return null;
-  if (lufs < -20) return "quiet";
-  if (lufs > -16) return "loud";
+  if (lufs < targetLufs - LUFS_BAND_TOLERANCE_DB) return "quiet";
+  if (lufs > targetLufs + LUFS_BAND_TOLERANCE_DB) return "loud";
   return "ok";
 }
 
@@ -205,93 +209,287 @@ export function integratedLufsFromBuffer(
   return meter.integrated();
 }
 
-/**
- * 对整段音频应用线性响度增益（dB → linear 缩放各声道采样）。
- * 生成新 AudioBuffer，不修改源 buffer；增益削波时 clamp 到 [-1,1]。
- * 采样率/声道无关，天然兼容任意 buffer。
+function toDb(value: number): number {
+  return value > 0 ? 20 * Math.log10(value) : Number.NEGATIVE_INFINITY;
+}
+
+/*
+ * 真峰值与时间域限幅。
+ *
+ * 旧实现用静态波形整形压峰（逐采样改写波形形状），有两个治不好的毛病：
+ * 一是改波形必然产生谐波，听感发毛；二是过冲一大就压不回 ceiling 以内，
+ * 最后仍靠导出时硬 clamp 兜底 —— 那才是真正削波的来源。
+ *
+ * 这里只改增益、不动波形：4 倍过采样重建真峰值 → 求该点所需衰减 →
+ * 前瞻窗口取最小值（波峰到来之前增益就已经降下去）→ 释放端限速平滑 →
+ * 乘到信号上。因此输出真峰值不会超过 ceiling。
  */
-export function applyLufsGain(
-  buffer: AudioBuffer,
-  gainDb: number,
-): AudioBuffer {
-  const gainLinear = 10 ** (gainDb / 20);
-  const output = new AudioBuffer({
-    length: buffer.length,
-    numberOfChannels: buffer.numberOfChannels,
-    sampleRate: buffer.sampleRate,
-  });
-  for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
-    const input = buffer.getChannelData(channel);
-    const target = output.getChannelData(channel);
-    for (let i = 0; i < input.length; i++) {
-      const sample = input[i] * gainLinear;
-      target[i] = sample > 1 ? 1 : sample < -1 ? -1 : sample;
+
+const OS_PHASES = 4;
+const OS_HALF_TAPS = 4;
+
+/** 每相插值系数：窗函数 sinc，按相归一化到单位增益（p = 0 退化为单位冲击）。 */
+function buildOversampleTaps(): number[][] {
+  const windowHalf = OS_PHASES * (OS_HALF_TAPS + 1) - 1;
+  const taps: number[][] = [];
+  for (let phase = 0; phase < OS_PHASES; phase++) {
+    const row: number[] = [];
+    let sum = 0;
+    for (let d = -OS_HALF_TAPS; d <= OS_HALF_TAPS; d++) {
+      const t = OS_PHASES * d + phase;
+      const ratio = t / windowHalf;
+      const window =
+        0.42 +
+        0.5 * Math.cos(Math.PI * ratio) +
+        0.08 * Math.cos(2 * Math.PI * ratio);
+      const sinc =
+        t === 0
+          ? 1
+          : Math.sin((Math.PI * t) / OS_PHASES) / ((Math.PI * t) / OS_PHASES);
+      const value = (sinc * window) / OS_PHASES;
+      row.push(value);
+      sum += value;
+    }
+    for (let i = 0; i < row.length; i++) row[i] /= sum;
+    taps.push(row);
+  }
+  return taps;
+}
+
+const OS_TAPS = buildOversampleTaps();
+
+/** 三角不等式上界系数：Σ|系数| 的最大值，用来保守跳过不可能逼近 ceiling 的样本。 */
+const OS_L1_BOUND = OS_TAPS.reduce(
+  (worst, row) =>
+    Math.max(worst, row.reduce((sum, value) => sum + Math.abs(value), 0)),
+  0,
+);
+
+const GATE_BLOCK = 64;
+
+/** 分块样本峰值；前后各补一个 0 块，便于直接取邻域上界。 */
+function blockPeaks(channels: Float32Array[]): Float32Array {
+  const length = channels[0]?.length ?? 0;
+  const peaks = new Float32Array(Math.ceil(length / GATE_BLOCK) + 2);
+  for (const data of channels) {
+    for (let i = 0; i < length; i++) {
+      const magnitude = Math.abs(data[i]);
+      const block = ((i / GATE_BLOCK) | 0) + 1;
+      if (magnitude > peaks[block]) peaks[block] = magnitude;
     }
   }
-  return output;
+  return peaks;
 }
 
-/** soft-knee 单采样压缩：|in|>thresh 时超量按 ratio 压缩，阈值处连续，无硬切。 */
-function softKneeSample(
-  sample: number,
-  thresholdLin: number,
-  ratio: number,
-): number {
-  const magnitude = Math.abs(sample);
-  if (magnitude <= thresholdLin) return sample;
-  const sign = sample < 0 ? -1 : 1;
-  const over = magnitude - thresholdLin;
-  return sign * (thresholdLin + over / ratio);
+/** 保守的局部上界：任意样本 ±OS_HALF_TAPS 邻域的最大值都不会超过它。 */
+function localUpperBound(peaks: Float32Array, index: number): number {
+  const block = ((index / GATE_BLOCK) | 0) + 1;
+  return Math.max(peaks[block - 1], peaks[block], peaks[block + 1]);
 }
 
-/**
- * 分声道 dataframe 应用 soft-knee 处理器，返回新 AudioBuffer。
- */
-function processChannels(
-  buffer: AudioBuffer,
-  apply: (sample: number) => number,
-): AudioBuffer {
-  const output = new AudioBuffer({
-    length: buffer.length,
-    numberOfChannels: buffer.numberOfChannels,
-    sampleRate: buffer.sampleRate,
-  });
-  for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
-    const input = buffer.getChannelData(channel);
-    const target = output.getChannelData(channel);
-    for (let i = 0; i < input.length; i++) {
-      target[i] = apply(input[i]);
+/** 4 倍过采样重建的单点真峰值（多声道取最大）。 */
+function truePeakAt(channels: Float32Array[], index: number): number {
+  let peak = 0;
+  for (const data of channels) {
+    for (const taps of OS_TAPS) {
+      let acc = 0;
+      for (let i = 0; i < taps.length; i++) {
+        const at = index + OS_HALF_TAPS - i;
+        if (at >= 0 && at < data.length) acc += data[at] * taps[i];
+      }
+      const magnitude = Math.abs(acc);
+      if (magnitude > peak) peak = magnitude;
     }
   }
-  return output;
+  return peak;
 }
 
 /**
- * 轻度向下压缩：对超过 thresholdDb（如 -6 dBFS）的大音量段，把超出部分按
- * ratio 压缩（soft-knee，阈值处连续），降低波峰、为后续归一留余量。
+ * 整段真峰值（dBTP）。p = 0 相是单位冲击，样本峰值本身就是可达的真峰值下界；
+ * 再按三角不等式上界跳过绝大多数样本，只重建可能更高的点。
  */
-export function compressLoudness(
-  buffer: AudioBuffer,
-  thresholdDb: number,
-  ratio: number,
-): AudioBuffer {
-  const threshold = 10 ** (thresholdDb / 20);
-  return processChannels(buffer, (sample) =>
-    softKneeSample(sample, threshold, ratio),
+export function measureTruePeakDb(buffer: AudioBuffer): number {
+  const channels = Array.from({ length: buffer.numberOfChannels }, (_, index) =>
+    buffer.getChannelData(index),
   );
+  const length = buffer.length;
+  const peaks = blockPeaks(channels);
+  let best = 0;
+  for (const data of channels) {
+    for (let i = 0; i < length; i++) {
+      const magnitude = Math.abs(data[i]);
+      if (magnitude > best) best = magnitude;
+    }
+  }
+  for (let n = 0; n < length; n++) {
+    if (OS_L1_BOUND * localUpperBound(peaks, n) <= best) continue;
+    const exact = truePeakAt(channels, n);
+    if (exact > best) best = exact;
+  }
+  return toDb(best);
 }
 
+const LIMITER_LOOKAHEAD_SEC = 0.005;
+/** 增益释放速度 dB/s；只影响听感，不影响 ceiling 保证。 */
+const LIMITER_RELEASE_DB_PER_SEC = 80;
+const LIMITER_CHUNK_SAMPLES = 1 << 16;
+
 /**
- * 末端真峰值限制：把超过 ceilingDb（如 -1 dBFS）的部分按大 ratio 软收敛到
- * ceiling 附近，作为削波的最终保险。soft-knee 连续，不产生硬削波方波。
+ * 静态增益 + 前瞻真峰值限幅：out[n] = in[n] · gainLinear · s[n]，
+ * 且 s[n] 不超过前瞻窗口内各点所需的衰减，因此输出真峰值恒不超过 ceiling。
  */
-export function limitTruePeak(
+function renderLimited(
   buffer: AudioBuffer,
-  ceilingDb: number,
-  ratio: number,
-): AudioBuffer {
-  const ceiling = 10 ** (ceilingDb / 20);
-  return processChannels(buffer, (sample) =>
-    softKneeSample(sample, ceiling, ratio),
+  gainLinear: number,
+  ceilingLinear: number,
+): { buffer: AudioBuffer; gainReductionDb: number } {
+  const length = buffer.length;
+  const channelCount = buffer.numberOfChannels;
+  const channels = Array.from({ length: channelCount }, (_, index) =>
+    buffer.getChannelData(index),
   );
+  const output = new AudioBuffer({
+    length,
+    numberOfChannels: channelCount,
+    sampleRate: buffer.sampleRate,
+  });
+  const targets = Array.from({ length: channelCount }, (_, index) =>
+    output.getChannelData(index),
+  );
+  const peaks = blockPeaks(channels);
+
+  const lookahead = Math.max(
+    1,
+    Math.round(buffer.sampleRate * LIMITER_LOOKAHEAD_SEC),
+  );
+  const windowLength = lookahead + 1;
+  const releaseStep =
+    10 ** (LIMITER_RELEASE_DB_PER_SEC / (20 * buffer.sampleRate));
+  const chunk = Math.min(LIMITER_CHUNK_SAMPLES, length);
+  const size = chunk + windowLength;
+  const required = new Float32Array(size);
+  const prefixMin = new Float32Array(size);
+  const suffixMin = new Float32Array(size);
+  let released = 1;
+  let gainReduction = 1;
+
+  for (let start = 0; start < length; start += chunk) {
+    const count = Math.min(chunk, length - start);
+    // 1) 每点所需增益（1 = 不衰减）；局部上界够不到的样本跳过真峰值重建。
+    for (let i = 0; i < size; i++) {
+      const n = start + i;
+      if (n >= length) {
+        required[i] = 1;
+        continue;
+      }
+      if (OS_L1_BOUND * gainLinear * localUpperBound(peaks, n) <= ceilingLinear) {
+        required[i] = 1;
+        continue;
+      }
+      const peak = truePeakAt(channels, n) * gainLinear;
+      required[i] = peak > ceilingLinear ? ceilingLinear / peak : 1;
+    }
+    // 2) 前瞻窗口最小值：按窗口长度分块做前后缀最小值，O(n) 且无队列开销。
+    for (let block = 0; block < size; block += windowLength) {
+      const end = Math.min(size, block + windowLength);
+      let running = Number.POSITIVE_INFINITY;
+      for (let i = block; i < end; i++) {
+        running = Math.min(running, required[i]);
+        prefixMin[i] = running;
+      }
+      running = Number.POSITIVE_INFINITY;
+      for (let i = end - 1; i >= block; i--) {
+        running = Math.min(running, required[i]);
+        suffixMin[i] = running;
+      }
+    }
+    // 3) 释放端限速平滑，再乘回信号。
+    for (let i = 0; i < count; i++) {
+      const windowed = Math.min(suffixMin[i], prefixMin[i + windowLength - 1]);
+      released = Math.min(windowed, Math.min(1, released * releaseStep));
+      if (released < gainReduction) gainReduction = released;
+      for (let c = 0; c < channelCount; c++) {
+        targets[c][start + i] = channels[c][start + i] * gainLinear * released;
+      }
+    }
+  }
+  return { buffer: output, gainReductionDb: toDb(gainReduction) };
+}
+
+export interface LoudnessNormalizeOptions {
+  /** 目标 Integrated LUFS。 */
+  targetLufs: number;
+  /** 真峰值上限（dBTP）。 */
+  ceilingDb: number;
+  /** 成片口径：切除区间不计入响度测量。 */
+  deletedRegions?: Region[];
+  toleranceDb?: number;
+  maxPasses?: number;
+}
+
+export interface LoudnessNormalizeResult {
+  buffer: AudioBuffer;
+  beforeLufs: number;
+  afterLufs: number;
+  truePeakDb: number;
+  /** 本次限幅的最大衰减量（dB，0 表示完全没压）。 */
+  gainReductionDb: number;
+  /** 本次施加的静态增益（dB）。 */
+  gainDb: number;
+  passes: number;
+  converged: boolean;
+}
+
+const NORMALIZE_TOLERANCE_DB = 0.3;
+const NORMALIZE_MAX_PASSES = 4;
+
+/**
+ * 一键响度标准化：静态增益 + 真峰值限幅，迭代收敛。
+ * 限幅会拉低响度、ceiling 又要按实测真峰值收紧，两者互相影响，所以跑
+ * 「渲染 → 重测 → 修正」最多 maxPasses 轮，直到响度进容差且真峰值不过线。
+ */
+export function normalizeLoudness(
+  buffer: AudioBuffer,
+  options: LoudnessNormalizeOptions,
+): LoudnessNormalizeResult | null {
+  const { targetLufs, ceilingDb, deletedRegions = [] } = options;
+  const toleranceDb = options.toleranceDb ?? NORMALIZE_TOLERANCE_DB;
+  const maxPasses = options.maxPasses ?? NORMALIZE_MAX_PASSES;
+  const beforeLufs = integratedLufsFromBuffer(buffer, deletedRegions);
+  if (!Number.isFinite(beforeLufs)) return null;
+
+  let gainDb = targetLufs - beforeLufs;
+  let ceiling = ceilingDb;
+  let result: LoudnessNormalizeResult | null = null;
+
+  for (let pass = 1; pass <= maxPasses; pass++) {
+    const rendered = renderLimited(
+      buffer,
+      10 ** (gainDb / 20),
+      10 ** (ceiling / 20),
+    );
+    const afterLufs = integratedLufsFromBuffer(rendered.buffer, deletedRegions);
+    const truePeakDb = measureTruePeakDb(rendered.buffer);
+    result = {
+      buffer: rendered.buffer,
+      beforeLufs,
+      afterLufs,
+      truePeakDb,
+      gainReductionDb: rendered.gainReductionDb,
+      gainDb,
+      passes: pass,
+      converged: false,
+    };
+    const loudnessDelta = targetLufs - afterLufs;
+    if (!Number.isFinite(loudnessDelta)) break;
+    const loudnessOk = Math.abs(loudnessDelta) <= toleranceDb;
+    const peakOver = truePeakDb - ceiling;
+    if (loudnessOk && peakOver <= 0.05) {
+      result.converged = true;
+      break;
+    }
+    if (!loudnessOk) gainDb += loudnessDelta;
+    if (peakOver > 0.05) ceiling -= peakOver;
+  }
+  return result;
 }

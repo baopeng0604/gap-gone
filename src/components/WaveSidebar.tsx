@@ -11,6 +11,8 @@ interface WaveSidebarProps {
   filePeakDb: number | null;
   /** 成片 Integrated LUFS（切除不计）。 */
   lufs: number;
+  /** 达标判定的目标 LUFS（用户可在设置里改）。 */
+  lufsTarget: number;
 }
 
 const MIN_DB = -60;
@@ -30,13 +32,14 @@ export default function WaveSidebar({
   level,
   filePeakDb,
   lufs,
+  lufsTarget,
 }: WaveSidebarProps) {
   const live = Boolean(level);
   const rmsDb = level?.rmsDb ?? Number.NEGATIVE_INFINITY;
   const peakDb = live
     ? (level?.peakDb ?? Number.NEGATIVE_INFINITY)
     : (filePeakDb ?? Number.NEGATIVE_INFINITY);
-  const band = lufsBand(lufs);
+  const band = lufsBand(lufs, lufsTarget);
 
   return (
     <aside className="wave-sidebar" aria-label="播放音量与波形导航">
@@ -55,7 +58,7 @@ export default function WaveSidebar({
               ? `sidebar-meter-readout sidebar-lufs lufs-${band}`
               : "sidebar-meter-readout sidebar-lufs"
           }
-          title="成片 Integrated LUFS，对照短视频常见目标 -14 LUFS"
+          title={`成片 Integrated LUFS，当前目标 ${lufsTarget} LUFS`}
         >
           {formatLufs(lufs)}
         </span>
