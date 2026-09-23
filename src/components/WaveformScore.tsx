@@ -17,6 +17,9 @@ interface WaveformScoreProps {
   words?: TranscriptWord[] | null;
 }
 
+/** 每行波形的像素宽度，与 WaveformRow 的默认宽度保持一致。 */
+const ROW_WIDTH = 1000;
+
 const WaveformScore = ({
   buffer,
   currentTime,
@@ -41,6 +44,11 @@ const WaveformScore = ({
     const rowWords = words
       ? words.filter((word) => word.start < endTime && word.end > startTime)
       : null;
+    // 末行不足一整行时按实际秒数收窄，不拉满整行：拉满等于把这行的横轴
+    // 从 secondsPerRow 秒摊到整行宽度，波形被横向拉伸，比例和其它行对不上。
+    const rowWidth = Math.round(
+      (ROW_WIDTH * (endTime - startTime)) / secondsPerRow,
+    );
 
     rows.push(
       <WaveformRow
@@ -48,6 +56,7 @@ const WaveformScore = ({
         buffer={buffer}
         startTime={startTime}
         endTime={endTime}
+        width={rowWidth}
         currentTime={currentTime}
         onSeek={onSeek}
         regions={regions}

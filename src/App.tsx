@@ -99,6 +99,19 @@ const emptyEditState: EditState = {
   autoRegions: [],
 };
 
+/** 设置面板打开时的快照，「取消」据此把本次改动回退。 */
+interface SetupSnapshot {
+  deviceId: string;
+  /** 后端当前生效的模型目录；异步取，未取到时保持 undefined（不回退该项）。 */
+  modelDir?: string | null;
+  autoTranscribe: boolean;
+  transcriptVisible: boolean;
+  silenceThreshold: number;
+  lufsTarget: number;
+  exportFormat: ExportFormat;
+  exportBitrate: ExportBitrate;
+}
+
 const silencePresetLabels: Record<SilencePreset, string> = {
   compact: "紧凑",
   natural: "自然",
@@ -321,6 +334,8 @@ function App() {
   const [future, setFuture] = useState<EditState[]>([]);
   const [noiseNotice, setNoiseNotice] = useState<string | null>(null);
   const noticeTimerRef = useRef<number>(0);
+  /** 设置面板打开时的快照，供「取消」回退；面板关闭时清空。 */
+  const setupSnapshotRef = useRef<SetupSnapshot | null>(null);
 
   /**
    * 展示提示：info（成功/结果通知）3 秒后自动消失；
@@ -572,8 +587,31 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!showRecordingSetup || !isTauriDesktop()) return;
-    void getTranscribeModelDir().then(setModelDirInput).catch(() => undefined);
+    if (!showRecordingSetup) {
+      setupSnapshotRef.current = null;
+      return;
+    }
+    // 打开面板即记录快照，「取消」按它回退本次改动：设置是即时生效的，
+    // 没有快照就无"取消"可言。故意只跟开关——面板打开期间的值变动不能覆盖快照。
+    setupSnapshotRef.current = {
+      deviceId: recorder.selectedDeviceId,
+      autoTranscribe: autoTranscribeEnabled,
+      transcriptVisible,
+      silenceThreshold: silenceThresholdDb,
+      lufsTarget: lufsTargetDb,
+      exportFormat,
+      exportBitrate,
+    };
+    if (isTauriDesktop()) {
+      // 当前生效的模型目录存在后端，异步取回来补齐快照（没取到就别回退它）
+      void getTranscribeModelDir()
+        .then((dir) => {
+          if (setupSnapshotRef.current) setupSnapshotRef.current.modelDir = dir;
+          setModelDirInput(dir);
+        })
+        .catch(() => undefined);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showRecordingSetup]);
 
   // 换音频后重置跟随行，保证新文件从第 0 行也能触发滚动。
@@ -1585,6 +1623,36 @@ function App() {
     undo,
   ]);
 
+  /**
+   * 「取消」：把面板打开期间改动过的设置全部回退到打开时的快照。
+   * 需要单独列的只有面板里那几项即时生效的设置；工具栏上的静音预设、
+   * 降噪预设不在面板内，不参与回退。
+   */
+  const cancelSetup = () => {
+    const snapshot = setupSnapshotRef.current;
+    setShowRecordingSetup(false);
+    if (!snapshot) return;
+    recorder.setSelectedDeviceId(snapshot.deviceId);
+    setAutoTranscribeEnabled(snapshot.autoTranscribe);
+    setAutoTranscribe(snapshot.autoTranscribe);
+    setTranscriptVisible(snapshot.transcriptVisible);
+    commitSilenceThreshold(snapshot.silenceThreshold);
+    commitLufsTarget(snapshot.lufsTarget);
+    setExportFormatState(snapshot.exportFormat);
+    setExportFormat(snapshot.exportFormat);
+    setExportBitrateState(snapshot.exportBitrate);
+    setExportBitrate(snapshot.exportBitrate);
+    // 模型目录从后端读，快照可能还没补上：没取到就别回退，免得把自定义目录冲成默认
+    if (isTauriDesktop() && snapshot.modelDir !== undefined) {
+      setModelDirInput(snapshot.modelDir ?? "");
+      setCustomModelDir(snapshot.modelDir);
+      void setTranscribeModelDir(snapshot.modelDir)
+        .then(() => refreshModelStatus())
+        .catch(() => notify("模型目录恢复失败", "error"));
+    }
+    notify("已撤回本次设置改动");
+  };
+
   return (
     <main className="container">
       <div className="controls">
@@ -1892,6 +1960,12 @@ function App() {
             </label>
             <button onClick={() => void recorder.refreshDevices()}>刷新</button>
             <button onClick={() => setShowRecordingSetup(false)}>确定</button>
+            <button
+              onClick={cancelSetup}
+              title="撤回本次打开设置后改动的项目，恢复成打开前的值"
+            >
+              取消
+            </button>
           </div>
           {isTauriDesktop() && (
             <>

@@ -214,19 +214,26 @@
   white-space: nowrap;
 }
 
+/* 白底黑字，与左侧播放栏的按钮同一套样式：右侧栏其它元素都是暗色，
+   这个按钮要更跳一点才容易被看到。 */
 .sidebar-top-btn {
   pointer-events: auto;
   margin-top: auto;
   padding: 0.4rem 0.25rem;
   font-size: 0.7rem;
   line-height: 1.3;
-  color: #fff;
+  color: #101510;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 2px;
-  background: rgba(30, 30, 30, 0.96);
-  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: #f2f2f2;
+  border: 1px solid #ffffff;
+}
+
+.sidebar-top-btn:hover:not(:disabled) {
+  background-color: #dcdcdc;
+  border-color: #ffffff;
 }
 
 /* 左侧固定栏：播放速度与循环，与右侧电平栏镜像（同样 72px、同样吸顶工具栏之下） */
