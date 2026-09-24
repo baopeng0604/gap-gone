@@ -7,7 +7,10 @@ import {
 interface WaveSidebarProps {
   /** 播放中的实时电平；未播放时为 null，刻度回落到底。 */
   level: { rmsDb: number; peakDb: number } | null;
-  /** 整段音频真实峰值，用来对照波形是否顶满（近 0 dBFS 才会削波）。 */
+  /**
+   * 整段音频真实峰值（dBFS）。它不随播放位置变化，所以既用来对照波形是否顶满
+   * （近 0 dBFS 才会削波），也是播放侧的稳定读数 —— 与录音侧「保持」同量纲。
+   */
   filePeakDb: number | null;
   /** 成片 Integrated LUFS（切除不计）。 */
   lufs: number;
@@ -36,6 +39,8 @@ export default function WaveSidebar({
 }: WaveSidebarProps) {
   const live = Boolean(level);
   const rmsDb = level?.rmsDb ?? Number.NEGATIVE_INFINITY;
+  // 条子与峰值针由瞬时值驱动（播放中才动）；数字读数固定用整段峰值，不随
+  // 播放位置跳动 —— 否则同一个「Peak」两边读数差出语音的波峰因数，根本没法判断。
   const peakDb = live
     ? (level?.peakDb ?? Number.NEGATIVE_INFINITY)
     : (filePeakDb ?? Number.NEGATIVE_INFINITY);
@@ -45,9 +50,7 @@ export default function WaveSidebar({
     <aside className="wave-sidebar" aria-label="播放音量与波形导航">
       <div className="sidebar-meter" aria-label="实时播放电平">
         <span className="sidebar-meter-readout">
-          {level
-            ? `Pk ${formatDb(peakDb)}`
-            : `文件 ${formatDb(filePeakDb ?? Number.NEGATIVE_INFINITY)}`}
+          {`整段 ${formatDb(filePeakDb ?? Number.NEGATIVE_INFINITY)}`}
         </span>
         <span className="sidebar-meter-readout sidebar-meter-readout-secondary">
           {level ? `RMS ${formatDb(rmsDb)}` : "dBFS"}

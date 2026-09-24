@@ -916,6 +916,18 @@ button:disabled {
   pointer-events: none;
 }
 
+/* 目标带（-12 ~ -6 dBFS）：压在电平条之上，落进带里就是期望电平。 */
+.meter-target-band {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 1;
+  background: rgba(255, 255, 255, 0.16);
+  border-left: 1px dotted rgba(255, 255, 255, 0.55);
+  border-right: 1px dotted rgba(255, 255, 255, 0.55);
+  pointer-events: none;
+}
+
 .meter-scale {
   position: relative;
   height: 18px;

@@ -14,6 +14,7 @@ export const SETTINGS_KEYS = {
   silencePreset: "gap-gone-silence-preset",
   silenceThreshold: "gap-gone-silence-threshold",
   noisePreset: "gap-gone-noise-preset",
+  compressionPreset: "gap-gone-compression-preset",
   transcriptVisible: "gap-gone-transcript-visible",
   exportFormat: "gap-gone-export-format",
   exportBitrate: "gap-gone-export-bitrate",
@@ -98,6 +99,16 @@ export function getNoisePreset(): string {
 
 export function setNoisePreset(preset: string) {
   writeString(SETTINGS_KEYS.noisePreset, preset);
+}
+
+/** 压缩预设（light / medium / strong，默认 medium）。 */
+export function getCompressionPreset(): string {
+  const value = readString(SETTINGS_KEYS.compressionPreset);
+  return value === "light" || value === "strong" ? value : "medium";
+}
+
+export function setCompressionPreset(preset: string) {
+  writeString(SETTINGS_KEYS.compressionPreset, preset);
 }
 
 /** 转录面板显隐（默认显示）。 */

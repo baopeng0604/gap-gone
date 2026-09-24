@@ -22,6 +22,7 @@ import {
 import { encodeMp3 } from "./utils/mp3Export";
 import { extractKeyword } from "./utils/keywordExtract";
 import {
+  getCompressionPreset,
   getExportBitrate,
   getExportFormat,
   getLufsTarget,
@@ -31,6 +32,7 @@ import {
   getTranscriptVisible,
   LUFS_TARGET_PRESETS,
   LUFS_TARGET_RANGE,
+  setCompressionPreset as persistCompressionPreset,
   setExportBitrate,
   setExportFormat,
   setLufsTarget as persistLufsTarget,
@@ -54,6 +56,13 @@ import {
   cancelDeepFilterProcessing,
   type NoisePreset,
 } from "./utils/noiseReduction";
+import {
+  COMPRESSION_PRESETS,
+  COMPRESSION_PRESET_LIST,
+  compressAudio,
+  type CompressionPreset,
+  type CompressionResult,
+} from "./utils/compression";
 import {
   cancelTranscribe,
   checkTranscribeModel,
@@ -169,6 +178,16 @@ function createExportFileName(extension: string, keyword: string | null) {
 const METER_MIN_DB = -60;
 const METER_MARKS = [-60, -54, -48, -42, -36, -30, -24, -18, -12, -6, 0];
 /**
+ * 录音目标区间 -12 ~ -6 dBFS。太低信噪比不够，太高留不出余量；
+ * 表上画一条半透明目标带，让「有没有落进去」一眼可见。
+ */
+const METER_TARGET_RANGE = { min: -12, max: -6 };
+/**
+ * 播放电平的采样窗口（秒）。与 Rust 端录音上报的聚合窗口同值，
+ * 两侧读数才是同一把尺子。
+ */
+const PLAYBACK_METER_WINDOW_SEC = 0.1;
+/**
  * 真峰值上限：WAV 按播客规范 -1 dBTP；MP3 有损编码还会额外过冲 0.5 dB 左右，
  * 所以交付 MP3 时压到 -1.5 dBTP，避免编码完反而越线。
  */
@@ -199,6 +218,21 @@ function loudnessReport(
     parts.push(`未收敛到目标，已迭代 ${result.passes} 轮`);
   }
   parts.push("已保留处理前版本，可用「撤销响度」回退");
+  return parts.join(" · ");
+}
+
+/** 压缩结果播报：平均压缩量、自动补偿、限幅衰减与真峰值。 */
+function compressionReport(result: CompressionResult, ceilingDb: number) {
+  const parts = [
+    `已按「${COMPRESSION_PRESETS[result.preset].label}」档压缩`,
+    `平均压缩 ${result.averageReductionDb.toFixed(1)} dB`,
+    `自动补偿 +${result.makeupDb.toFixed(1)} dB`,
+    `真峰值 ${formatTruePeak(result.truePeakDb)}（上限 ${ceilingDb}）`,
+  ];
+  if (result.limiterGainReductionDb < -LUFS_HEAVY_LIMIT_DB) {
+    parts.push("限幅较深，可换更轻的档位");
+  }
+  parts.push("已保留处理前版本，可用「撤销压缩」回退");
   return parts.join(" · ");
 }
 
@@ -279,8 +313,11 @@ function toDb(value: number) {
   return value > 0 ? 20 * Math.log10(value) : Number.NEGATIVE_INFINITY;
 }
 
-/** 从当前播放位置取一小窗采样算 RMS/Peak，不依赖 AnalyserNode 过音频图。 */
-function levelFromBuffer(buffer: AudioBuffer, time: number, windowSize = 2048) {
+/**
+ * 从当前播放位置取一个窗口的采样算 RMS/Peak，不依赖 AnalyserNode 过音频图。
+ * 窗口长度由调用方按秒数换算（见 PLAYBACK_METER_WINDOW_SEC），不再写死。
+ */
+function levelFromBuffer(buffer: AudioBuffer, time: number, windowSize: number) {
   const channel = buffer.getChannelData(0);
   const start = Math.max(
     0,
@@ -365,6 +402,9 @@ function App() {
   const [noisePreset, setNoisePreset] = useState<NoisePreset>(
     getNoisePreset() as NoisePreset,
   );
+  const [compressionPreset, setCompressionPreset] = useState<CompressionPreset>(
+    getCompressionPreset() as CompressionPreset,
+  );
   const [silencePreset, setSilencePreset] = useState<SilencePreset>(
     getSilencePreset() as SilencePreset,
   );
@@ -377,6 +417,7 @@ function App() {
   );
   const [hasEnhancedAudio, setHasEnhancedAudio] = useState(false);
   const [hasLoudnessApplied, setHasLoudnessApplied] = useState(false);
+  const [hasCompressionApplied, setHasCompressionApplied] = useState(false);
   const [lufsTargetDb, setLufsTargetDb] = useState(getLufsTarget());
   // 输入框用文本态，避免输入「-」这类中间态被数字解析吃掉。
   const [lufsTargetInput, setLufsTargetInput] = useState(() =>
@@ -494,6 +535,11 @@ function App() {
   const denoiseBaseRef = useRef<AudioBuffer | null>(null);
   /** 响度标准化前的缓冲快照，供「撤销响度」回退。 */
   const loudnessBaseRef = useRef<AudioBuffer | null>(null);
+  /**
+   * 最近一次压缩的输入快照。压缩永远从这份基准重算（替换而非叠加），
+   * 所以重复点「压缩」只是换档位，不会一层层压下去。
+   */
+  const compressBaseRef = useRef<AudioBuffer | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const originalBufferRef = useRef<AudioBuffer | null>(null);
@@ -805,7 +851,13 @@ function App() {
         }
 
         setPosition(position);
-        setPlaybackLevel(levelFromBuffer(audioBuffer, position));
+        setPlaybackLevel(
+          levelFromBuffer(
+            audioBuffer,
+            position,
+            Math.round(audioBuffer.sampleRate * PLAYBACK_METER_WINDOW_SEC),
+          ),
+        );
         animationFrameRef.current = requestAnimationFrame(animate);
       };
       animationFrameRef.current = requestAnimationFrame(animate);
@@ -891,7 +943,9 @@ function App() {
     setDenoisePreview(null);
     denoiseBaseRef.current = null;
     loudnessBaseRef.current = null;
+    compressBaseRef.current = null;
     setHasLoudnessApplied(false);
+    setHasCompressionApplied(false);
     setHistory([]);
     setFuture([]);
   };
@@ -1247,6 +1301,73 @@ function App() {
     notify("已回退到响度标准化之前");
   };
 
+  /**
+   * 压缩：软拐点压缩 → 自动补偿 → 真峰值限幅。全段处理，不支持选区。
+   *
+   * 基准语义（防止叠压、防止归一失效）：
+   * - 已做过响度归一：必须先作废归一。归一是按旧动态算出的静态增益，压缩改了
+   *   动态它就不再成立，所以按 loudnessBaseRef 回退后再算，并提示重新点一次。
+   * - 之前压缩过：从 compressBaseRef 重算 —— 重复点是「换档位」而不是「压第二遍」。
+   */
+  const handleCompression = useCallback(() => {
+    if (!audioBuffer) return;
+    const ceilingDb =
+      exportFormat === "mp3" ? LUFS_CEILING_DB_MP3 : LUFS_CEILING_DB_WAV;
+    let revertedLoudness = false;
+    let source = audioBuffer;
+    if (hasLoudnessApplied) {
+      if (loudnessBaseRef.current) source = loudnessBaseRef.current;
+      loudnessBaseRef.current = null;
+      setHasLoudnessApplied(false);
+      revertedLoudness = true;
+    }
+    const base = compressBaseRef.current ?? source;
+    setIsProcessing(true);
+    // 全段重算是同步的，先让「处理中」遮罩画出来再开算。
+    window.setTimeout(() => {
+      try {
+        const result = compressAudio(base, compressionPreset, ceilingDb);
+        if (!result) {
+          notify("当前音频没有可处理的内容", "error");
+          return;
+        }
+        stopPlayback(false);
+        compressBaseRef.current = base;
+        setHasCompressionApplied(true);
+        setAudioBuffer(result.buffer);
+        notify(
+          compressionReport(result, ceilingDb) +
+            (revertedLoudness ? " · 响度归一已失效，请重新点一次" : ""),
+          "progress",
+        );
+      } catch {
+        notify("压缩失败，原始音频未改变", "error");
+      } finally {
+        setIsProcessing(false);
+      }
+    }, 0);
+  }, [
+    audioBuffer,
+    compressionPreset,
+    exportFormat,
+    hasLoudnessApplied,
+    notify,
+    stopPlayback,
+  ]);
+
+  const revertCompression = () => {
+    if (!compressBaseRef.current) return;
+    stopPlayback(false);
+    setAudioBuffer(compressBaseRef.current);
+    compressBaseRef.current = null;
+    setHasCompressionApplied(false);
+    // 压在压缩版本之上的响度归一一起回退，快照随之作废。
+    loudnessBaseRef.current = null;
+    setHasLoudnessApplied(false);
+    setPosition(0);
+    notify("已回退到压缩之前的版本");
+  };
+
   /** 目标 LUFS 落库：夹到合法区间，同时把输入框文本同步成规范值。 */
   const commitLufsTarget = useCallback((target: number) => {
     const clamped = Math.max(
@@ -1325,9 +1446,11 @@ function App() {
     if (!denoisePreview) return;
     setDenoisePreview(null);
     denoiseBaseRef.current = null;
-    // 降噪改写了缓冲，响度快照随之失效，避免回退时把降噪成果一起吞掉。
+    // 降噪改写了缓冲，响度快照与压缩基准随之失效，避免回退时把降噪成果一起吞掉。
     loudnessBaseRef.current = null;
+    compressBaseRef.current = null;
     setHasLoudnessApplied(false);
+    setHasCompressionApplied(false);
     setHasEnhancedAudio(true);
     notify("降噪版本已确认");
   };
@@ -1349,7 +1472,9 @@ function App() {
     setAudioBuffer(originalBufferRef.current);
     setHasEnhancedAudio(false);
     loudnessBaseRef.current = null;
+    compressBaseRef.current = null;
     setHasLoudnessApplied(false);
+    setHasCompressionApplied(false);
     setPosition(0);
   };
 
@@ -1758,6 +1883,36 @@ function App() {
             恢复检测 <span className="shortcut-key">Shift+R</span>
           </button>
         </div>
+        {isTauriDesktop() && (
+          <>
+            <span className="toolbar-divider" aria-hidden="true" />
+            <div className="toolbar-group" aria-label="转录">
+              <button
+                onClick={() => void handleTranscribe()}
+                disabled={!audioBuffer || isProcessing || modelDownloadPercent !== null}
+              >
+                转录文字 <span className="shortcut-key">T</span>
+              </button>
+              {transcribeProgress && (
+                <>
+                  <span className="denoise-progress">
+                    {transcribeProgress.stage === "download" &&
+                      `下载模型 ${Math.round(transcribeProgress.percent)}%`}
+                    {transcribeProgress.stage === "transcribe" &&
+                      `转录 ${Math.round(transcribeProgress.percent)}%`}
+                    {transcribeProgress.stage === "punctuation" &&
+                      (transcribeProgress.percent < 0
+                        ? "正在准备标点模型…"
+                        : `下载标点模型 ${Math.round(transcribeProgress.percent)}%`)}
+                  </span>
+                  <button onClick={() => void cancelTranscribe()}>
+                    取消转录
+                  </button>
+                </>
+              )}
+            </div>
+          </>
+        )}
         </div>
         <div className="controls-row controls-row-secondary">
         <div className="toolbar-group" aria-label="文件和录音">
@@ -1850,6 +2005,38 @@ function App() {
               <button onClick={cancelNoiseReduction}>取消试听</button>
             </>
           )}
+          <select
+            className="noise-preset"
+            value={compressionPreset}
+            onChange={(event) => {
+              const preset = event.target.value as CompressionPreset;
+              setCompressionPreset(preset);
+              persistCompressionPreset(preset);
+            }}
+            disabled={!audioBuffer || isProcessing}
+            aria-label="压缩档位"
+          >
+            {COMPRESSION_PRESET_LIST.map((preset) => (
+              <option key={preset} value={preset}>
+                压缩：{COMPRESSION_PRESETS[preset].label}
+              </option>
+            ))}
+          </select>
+          <button
+            onClick={handleCompression}
+            disabled={!audioBuffer || isProcessing}
+            title={`软拐点压缩 → 自动补偿 → 真峰值限幅；把大的压小、小的相对提上来（上限 ${exportFormat === "mp3" ? LUFS_CEILING_DB_MP3 : LUFS_CEILING_DB_WAV} dBTP）`}
+          >
+            压缩
+          </button>
+          {hasCompressionApplied && (
+            <button
+              onClick={revertCompression}
+              title="回退到压缩之前的版本（重复点「压缩」是换档位，不会叠压）"
+            >
+              撤销压缩
+            </button>
+          )}
           <button
             onClick={handleLoudnessNormalize}
             disabled={!audioBuffer || isProcessing}
@@ -1880,36 +2067,6 @@ function App() {
             帮助 <span className="shortcut-key">H</span>
           </button>
         </div>
-        {isTauriDesktop() && (
-          <>
-            <span className="toolbar-divider" aria-hidden="true" />
-            <div className="toolbar-group" aria-label="转录">
-              <button
-                onClick={() => void handleTranscribe()}
-                disabled={!audioBuffer || isProcessing || modelDownloadPercent !== null}
-              >
-                转录文字 <span className="shortcut-key">T</span>
-              </button>
-              {transcribeProgress && (
-                <>
-                  <span className="denoise-progress">
-                    {transcribeProgress.stage === "download" &&
-                      `下载模型 ${Math.round(transcribeProgress.percent)}%`}
-                    {transcribeProgress.stage === "transcribe" &&
-                      `转录 ${Math.round(transcribeProgress.percent)}%`}
-                    {transcribeProgress.stage === "punctuation" &&
-                      (transcribeProgress.percent < 0
-                        ? "正在准备标点模型…"
-                        : `下载标点模型 ${Math.round(transcribeProgress.percent)}%`)}
-                  </span>
-                  <button onClick={() => void cancelTranscribe()}>
-                    取消转录
-                  </button>
-                </>
-              )}
-            </div>
-          </>
-        )}
         </div>
       </div>
 
@@ -2236,6 +2393,19 @@ function App() {
                   style={{
                     transform: `scaleX(${meterPosition(recorder.level.rmsDb)})`,
                   }}
+                />
+                {/* 目标带画在电平条之上，落进带里就是期望电平 */}
+                <span
+                  className="meter-target-band"
+                  style={{
+                    left: `${meterPosition(METER_TARGET_RANGE.min) * 100}%`,
+                    width: `${
+                      (meterPosition(METER_TARGET_RANGE.max) -
+                        meterPosition(METER_TARGET_RANGE.min)) *
+                      100
+                    }%`,
+                  }}
+                  title={`${METER_TARGET_RANGE.min} ~ ${METER_TARGET_RANGE.max} dBFS：期望的录音峰值区间`}
                 />
                 <div
                   className="meter-bar"

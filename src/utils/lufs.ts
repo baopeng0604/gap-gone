@@ -337,8 +337,9 @@ const LIMITER_CHUNK_SAMPLES = 1 << 16;
 /**
  * 静态增益 + 前瞻真峰值限幅：out[n] = in[n] · gainLinear · s[n]，
  * 且 s[n] 不超过前瞻窗口内各点所需的衰减，因此输出真峰值恒不超过 ceiling。
+ * 压缩（compression.ts）也复用它收尾，保证两条处理链的封顶口径一致。
  */
-function renderLimited(
+export function renderLimited(
   buffer: AudioBuffer,
   gainLinear: number,
   ceilingLinear: number,

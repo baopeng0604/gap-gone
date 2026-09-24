@@ -53,6 +53,8 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 9. 录音错误通过 Tauri 事件 `recording-error` 上报前端；电平通过 `recording-level` 上报（含 RMS/Peak 与累计 Integrated `lufs`）；降噪进度通过 `denoise-progress` 上报（-1 表示正在加载模型）；转录进度通过 `transcribe-progress` 上报（stage: download/load/transcribe/punctuation）。
 10. **播放走 `<audio>` 媒体元素，不要退回 `AudioBufferSourceNode`**。变速不变调只有媒体元素的 `preservesPitch` 能做（老 WebKit 还要一并设 `webkitPreservesPitch`），`AudioBufferSourceNode.playbackRate` 是磁带式变速，变快必升调。播放源是当前缓冲编码出的 16-bit WAV blob，因此 `audio.currentTime` 本身就是源时间轴位置，变速播放也不用做时间换算。两个易踩点：① 切除区间靠**保留段索引**跳过——rAF 里只把当前位置与「当前保留段」的端点比，越过段尾才跳到下一段开头并推进索引；**不要**每帧拿 `currentTime` 去 `nextPlayableTime` 重新推导该不该 seek：规范允许脚本运行期间读到滞后的播放位置（MDN: the reported playback position must remain stable while scripts are running），那会让同一次跳转被反复下发、媒体元素不停重启 seek，最后卡在段边界不出声（0.1.38 的真实 bug）。播放中用户跳转必须重建会话（走 `startPlayback`），否则段索引与新位置不一致。② 电平表仍从 buffer 抽样（`levelFromBuffer`），**不要**为了取电平把 `MediaElementSource`/`AnalyserNode` 串进音频图——macOS WKWebView 上会吞掉声音。AudioContext 从此只负责解码与离线渲染。
 11. **播放源的编码时机与内存代价**。媒体源只在 `audioBuffer` 身份变化时重编码（打开/录完/降噪/响度归一/撤销），切除区间只改 `deletedRegions`，不触发重编码。`bufferToWav` 是同步的，长录音会占住主线程一会儿，所以要延到下一帧执行，先让「加载完成/处理完成」的画面画出来。内存上 AudioBuffer 与 16-bit WAV 会同时存在；若超长录音撑不住，改用「写临时 WAV + Tauri asset protocol」，改动面只在 `syncMediaSource` 一处。
+12. **两侧电平表必须同口径**。录音侧由 Rust 每 100 ms（`sample_rate/10`）聚合上报 `recording-level`；播放侧 `levelFromBuffer` 也必须取 100 ms 窗口（`PLAYBACK_METER_WINDOW_SEC`），**不要**退回写死的 2048 采样——窗口不同，再叠加「录音侧有保持、播放侧没有」，同一段语音的 Peak 读数能差十几 dB（用户最常见的困惑，0.1.43 修）。稳定读数只用整段样本峰值：录音侧「保持」（`peakHoldDb`）与播放侧 `filePeakDb`（`bufferTruePeakDb`）同量纲、不随播放位置变，瞬时值只驱动条子与峰值针。录音表 -12 ~ -6 dBFS 画目标带（`METER_TARGET_RANGE`），落在带内即期望电平。
+13. **压缩是替换式派生操作，基准决定语义**。`compressBaseRef` 存「最近一次压缩的输入」，重复压缩永远从它重算——所以换档位再点是替换，绝不会一层层压下去；**不要**改成从 `audioBuffer` 重算，否则用户连点两次就会叠压两层。基准在新录音/导入/恢复原始/确认降噪时清空（降噪与响度快照同理），响度归一**不**清空压缩基准。反向依赖必须处理：压缩改了动态，之前做的响度归一（按旧动态算出的静态增益）要自动作废、按 `loudnessBaseRef` 回退后重算，并提示用户重新点一次。处理链固定「软拐点压缩 → 自动补偿 → 真峰值限幅」，限幅复用 `lufs.ts` 的 `renderLimited`，两条链的 ceiling 口径（WAV -1 / MP3 -1.5 dBTP）必须一致。
 
 ## 安全基线
 
@@ -67,6 +69,8 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 ## 约定
 
 * **版本号递增**：每次修改代码/配置完成后，把版本号 patch 位加 1（如 0.1.0 → 0.1.1），三处必须同步：`package.json`、`src-tauri/tauri.conf.json`（应用与安装包版本，运行时可见）、`src-tauri/Cargo.toml`（`Cargo.lock` 会在 cargo 构建时自动跟进）。纯文档微调（AGENTS.md/README/docs）可不递增。
+
+* **功能改动要留档**：领域词汇与语义边界写进 `CONTEXT.md`，面向开发者/代理的踩坑与约束写进本文件（AGENTS.md），面向用户的能力与操作写进 `README.md`。新增功能或改语义时三份一起看，别只改代码。
 
 * 文档与面向用户的错误消息用中文；代码注释中英混合，技术术语保留英文。
 
