@@ -171,7 +171,7 @@
   bottom: 0;
   z-index: 0;
   background: rgba(125, 235, 133, 0.85);
-  transition: height 60ms linear;
+  /* 不做 CSS 过渡：rAF 本身已是逐帧刷新，再叠 60 ms 只会拖尾显得迟缓（0.1.45 修） */
 }
 
 .sidebar-meter-warning .sidebar-meter-fill {
@@ -185,7 +185,6 @@
   z-index: 2;
   height: 2px;
   background: #fff;
-  transition: bottom 60ms linear;
 }
 
 .sidebar-meter-tick {
@@ -409,6 +408,15 @@
   color: #e6b84e;
   font-weight: normal;
   margin-left: 0.5rem;
+}
+
+/* 语音优化链的前置提示：只提示、不拦截 */
+.chain-hint {
+  font-size: 0.75rem;
+  color: #8a8a8a;
+  font-weight: normal;
+  margin-left: 0.4rem;
+  white-space: nowrap;
 }
 
 /* 设置面板行布局 */
@@ -879,15 +887,8 @@ button:disabled {
   min-width: 0;
 }
 
+/* 底柱 = RMS（说话的平均水平），是主视觉；峰值改成独立白针，两条不再互相遮盖。 */
 .meter-rms {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  transform-origin: left center;
-  background: rgba(125, 235, 133, 0.28);
-}
-
-.meter-bar {
   position: absolute;
   inset: 0;
   z-index: 0;
@@ -895,15 +896,26 @@ button:disabled {
   background: rgba(125, 235, 133, 0.9);
 }
 
-.meter-peak {
+/* 瞬时峰值针：与播放侧竖条的白针一致。 */
+.meter-bar {
   position: absolute;
   top: 0;
   bottom: 0;
   z-index: 2;
-  width: 3px;
+  width: 2px;
   margin-left: -1px;
   background: #fff;
-  box-shadow: 0 0 4px rgba(255, 255, 255, 0.8);
+}
+
+/* 峰值保持针：更细一档，与瞬时针区分开。 */
+.meter-peak {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 3;
+  width: 1px;
+  margin-left: -0.5px;
+  background: rgba(255, 255, 255, 0.75);
 }
 
 .meter-tick {
@@ -942,12 +954,9 @@ button:disabled {
   transform: translateX(-50%);
 }
 
-.meter-warning .meter-bar {
-  background: #e6b84e;
-}
-
+/* 超过 -6 dBFS 预警时染黄的是 RMS 底柱，两根白针保持白色。 */
 .meter-warning .meter-rms {
-  background: rgba(230, 184, 78, 0.3);
+  background: #e6b84e;
 }
 
 .meter-readouts {

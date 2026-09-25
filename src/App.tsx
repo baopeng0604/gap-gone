@@ -59,9 +59,9 @@ import {
 import {
   COMPRESSION_PRESETS,
   COMPRESSION_PRESET_LIST,
-  compressAudio,
+  runVoiceChain,
+  type ChainResult,
   type CompressionPreset,
-  type CompressionResult,
 } from "./utils/compression";
 import {
   cancelTranscribe,
@@ -196,6 +196,16 @@ const LUFS_CEILING_DB_MP3 = -1.5;
 /** 限幅衰减超过这个量，说明素材动态明显偏大，值得提示用户。 */
 const LUFS_HEAVY_LIMIT_DB = 6;
 
+/**
+ * 设置页「转录模型目录」的占位提示。Windows 上默认目录在仓库内（与 Rust 侧
+ * `WINDOWS_MODELS_ROOT` 对应，见 `src-tauri/src/transcribe.rs`），其余平台是用户主目录。
+ * 输入框真正显示的目录由后端 `get_transcribe_model_dir` 给，这里只是输入框为空时的提示。
+ */
+const DEFAULT_MODEL_DIR_HINT =
+  typeof navigator !== "undefined" && /windows/i.test(navigator.userAgent)
+    ? "默认：D:\\Code\\Github\\gap-gone\\models\\sense-voice"
+    : "默认：~/models/sense-voice";
+
 function formatTruePeak(db: number) {
   return Number.isFinite(db) ? `${db.toFixed(1)} dBTP` : "-∞ dBTP";
 }
@@ -221,18 +231,81 @@ function loudnessReport(
   return parts.join(" · ");
 }
 
-/** 压缩结果播报：平均压缩量、自动补偿、限幅衰减与真峰值。 */
-function compressionReport(result: CompressionResult, ceilingDb: number) {
-  const parts = [
-    `已按「${COMPRESSION_PRESETS[result.preset].label}」档压缩`,
-    `平均压缩 ${result.averageReductionDb.toFixed(1)} dB`,
-    `自动补偿 +${result.makeupDb.toFixed(1)} dB`,
-    `真峰值 ${formatTruePeak(result.truePeakDb)}（上限 ${ceilingDb}）`,
-  ];
-  if (result.limiterGainReductionDb < -LUFS_HEAVY_LIMIT_DB) {
-    parts.push("限幅较深，可换更轻的档位");
+/**
+ * 语音优化链播报：链路各步与响度标准化结果一次说完。
+ *
+ * 为什么合并播报：这是一条流水线（高通 → 扩展 → 压缩 → 归一），用户点一次就该看到
+ * 最终结果；分两段播报会有两条「已保留处理前版本」的收尾句，啰嗦且互相打架。
+ *
+ * 不再播报「自动补偿」：0.1.49 起压缩不做补偿，峰值改由「目标 LUFS + 限幅上限」共同
+ * 保证，所以最终真峰值与限幅衰减这两个数就是用户该信的那两个。
+ */
+function compressionReport(
+  result: ChainResult,
+  normalized: LoudnessNormalizeResult | null,
+  targetLufs: number,
+  ceilingDb: number,
+) {
+  const { compression, expander } = result;
+  const label = COMPRESSION_PRESETS[compression.preset].label;
+  const steps = [`高通 ${result.highPassHz} Hz`];
+  if (expander.applied && expander.thresholdDb !== null) {
+    steps.push(
+      `扩展底噪（阈值 ${expander.thresholdDb.toFixed(0)} dBFS、最多 ${expander.rangeDb} dB）`,
+    );
+  } else if (expander.skipReason === "clean") {
+    steps.push(`底噪已够干净（${formatDb(expander.noiseFloorDb)}），未做扩展`);
+  } else {
+    steps.push("底噪与语音挨得太近，未做扩展");
   }
-  parts.push("已保留处理前版本，可用「撤销压缩」回退");
+  const parts: string[] = [`已做语音优化：${steps.join(" · ")}`];
+  if (compression.skipped) {
+    parts.push(
+      compression.sourceSpanDb === null
+        ? "这段本来就很稳，无需压缩"
+        : `这段本来就很稳（跨度 ${compression.sourceSpanDb.toFixed(1)} dB 已接近目标 ${compression.targetSpanDb} dB），无需压缩`,
+    );
+  } else {
+    const { thresholdDb, ratio } = compression.params;
+    const generated = `阈值 ${thresholdDb.toFixed(0)} dBFS、压缩比 ${ratio.toFixed(1)}:1`;
+    if (compression.sourceSpanDb === null) {
+      parts.push(`已按「${label}」档压缩（素材太短，用保守参数：${generated}）`);
+    } else {
+      const span =
+        compression.outputSpanDb === null
+          ? `跨度 ${compression.sourceSpanDb.toFixed(1)} dB`
+          : `跨度 ${compression.sourceSpanDb.toFixed(1)} dB → ${compression.outputSpanDb.toFixed(1)} dB`;
+      parts.push(
+        `已按「${label}」档压缩（${span}，目标 ${compression.targetSpanDb} dB，${generated}）`,
+      );
+    }
+    parts.push(
+      `成片有效电平 ${formatDb(compression.sourceRmsDb)}`,
+      `平均压掉 ${compression.averageReductionDb.toFixed(1)} dB`,
+    );
+    if (compression.capped) {
+      parts.push("已达压缩比上限 4:1，再往上压会听出抽气");
+    }
+    if (compression.averageReductionDb < 1) {
+      parts.push("几乎没压到：输入电平太低，先调高麦克风增益");
+    }
+  }
+  if (normalized) {
+    parts.push(
+      `响度 ${formatLufs(normalized.beforeLufs)} → ${formatLufs(normalized.afterLufs)}（目标 ${targetLufs}）`,
+      `最终真峰值 ${formatTruePeak(normalized.truePeakDb)}（上限 ${ceilingDb}）`,
+      `限幅衰减 ${normalized.gainReductionDb.toFixed(1)} dB`,
+    );
+    if (normalized.gainReductionDb > LUFS_HEAVY_LIMIT_DB) {
+      parts.push("限幅较深，可换更轻的档位或调低响度目标");
+    }
+    if (!normalized.converged) {
+      parts.push(`未收敛到目标，已迭代 ${normalized.passes} 轮`);
+    }
+  } else {
+    parts.push("响度标准化失败，已保留优化结果，可单独点「响度标准化」重试");
+  }
+  parts.push("已保留处理前版本，可用「撤销压缩」整体回退");
   return parts.join(" · ");
 }
 
@@ -1166,7 +1239,7 @@ function App() {
     if (!audioBuffer) return;
     setIsProcessing(true);
     try {
-      // MP3 为默认格式（纯 JS 编码，分块让出主线程）；WAV 走同步 PCM 编码
+      // WAV 为默认格式（同步 PCM 编码）；MP3 走纯 JS 编码，分块让出主线程
       const blob =
         exportFormat === "mp3"
           ? await encodeMp3(
@@ -1302,42 +1375,59 @@ function App() {
   };
 
   /**
-   * 压缩：软拐点压缩 → 自动补偿 → 真峰值限幅。全段处理，不支持选区。
+   * 一键语音优化：高通 80 Hz → 向下扩展 → 软拐点压缩 → 响度标准化。
+   *
+   * 为什么把归一并进来：链路只把动态压平、把音色修顺，不负责把整体响度拉到目标，
+   * 分两步点容易漏，所以点一次做到位。「响度标准化」按钮保持单纯归一、行为不变。
+   *
+   * 为什么压缩段不补偿、也不限幅：补偿是静态抬全段，抬完由限幅器收拾，波形必然变平顶；
+   * 而归一随后会按实测 LUFS 重算增益，把这份补偿在数学上抵消掉 —— 收益归零，限幅留下的
+   * 增益包络却不可逆。峰值改由「目标 LUFS + 限幅上限」共同保证（0.1.49）。
    *
    * 基准语义（防止叠压、防止归一失效）：
-   * - 已做过响度归一：必须先作废归一。归一是按旧动态算出的静态增益，压缩改了
-   *   动态它就不再成立，所以按 loudnessBaseRef 回退后再算，并提示重新点一次。
+   * - 已单独做过响度归一：必须先作废归一。归一是按旧动态算出的静态增益，压缩改了
+   *   动态它就不再成立，所以按 loudnessBaseRef 回退后再算（流水线末尾会重新归一）。
    * - 之前压缩过：从 compressBaseRef 重算 —— 重复点是「换档位」而不是「压第二遍」。
+   * - 撤销粒度：「撤销压缩」整体回退到压缩前（含流水线里那次归一）；「撤销响度」只退
+   *   归一那一步、保留压缩结果 —— 两个按钮一起亮时先撤响度再撤压缩，顺序自然。
    */
   const handleCompression = useCallback(() => {
     if (!audioBuffer) return;
     const ceilingDb =
       exportFormat === "mp3" ? LUFS_CEILING_DB_MP3 : LUFS_CEILING_DB_WAV;
-    let revertedLoudness = false;
-    let source = audioBuffer;
-    if (hasLoudnessApplied) {
-      if (loudnessBaseRef.current) source = loudnessBaseRef.current;
-      loudnessBaseRef.current = null;
-      setHasLoudnessApplied(false);
-      revertedLoudness = true;
-    }
-    const base = compressBaseRef.current ?? source;
+    const base =
+      compressBaseRef.current ??
+      (hasLoudnessApplied ? loudnessBaseRef.current ?? audioBuffer : audioBuffer);
     setIsProcessing(true);
     // 全段重算是同步的，先让「处理中」遮罩画出来再开算。
     window.setTimeout(() => {
       try {
-        const result = compressAudio(base, compressionPreset, ceilingDb);
-        if (!result) {
+        // 素材本来就稳、或没有可测内容时，runVoiceChain 照常返回（压缩那步会跳过）。
+        const chained = runVoiceChain(base, compressionPreset, deletedRegions);
+        if (!chained) {
           notify("当前音频没有可处理的内容", "error");
           return;
         }
+        // 第二步：响度标准化。动态与音色交给链路，响度与真峰值上限由这一步定。
+        const normalized = normalizeLoudness(chained.buffer, {
+          targetLufs: lufsTargetDb,
+          ceilingDb,
+          deletedRegions,
+        });
         stopPlayback(false);
         compressBaseRef.current = base;
         setHasCompressionApplied(true);
-        setAudioBuffer(result.buffer);
+        if (normalized) {
+          loudnessBaseRef.current = chained.buffer;
+          setHasLoudnessApplied(true);
+          setAudioBuffer(normalized.buffer);
+        } else {
+          loudnessBaseRef.current = null;
+          setHasLoudnessApplied(false);
+          setAudioBuffer(chained.buffer);
+        }
         notify(
-          compressionReport(result, ceilingDb) +
-            (revertedLoudness ? " · 响度归一已失效，请重新点一次" : ""),
+          compressionReport(chained, normalized, lufsTargetDb, ceilingDb),
           "progress",
         );
       } catch {
@@ -1349,8 +1439,10 @@ function App() {
   }, [
     audioBuffer,
     compressionPreset,
+    deletedRegions,
     exportFormat,
     hasLoudnessApplied,
+    lufsTargetDb,
     notify,
     stopPlayback,
   ]);
@@ -2015,6 +2107,7 @@ function App() {
             }}
             disabled={!audioBuffer || isProcessing}
             aria-label="压缩档位"
+            title={`压缩档位＝目标跨度：自动量出这段录音自身的起伏跨度（只算保留区间），再把它压到「轻 8 / 中 5 / 强 3」dB，与麦克风增益大小无关`}
           >
             {COMPRESSION_PRESET_LIST.map((preset) => (
               <option key={preset} value={preset}>
@@ -2025,14 +2118,22 @@ function App() {
           <button
             onClick={handleCompression}
             disabled={!audioBuffer || isProcessing}
-            title={`软拐点压缩 → 自动补偿 → 真峰值限幅；把大的压小、小的相对提上来（上限 ${exportFormat === "mp3" ? LUFS_CEILING_DB_MP3 : LUFS_CEILING_DB_WAV} dBTP）`}
+            title={`一键语音优化：高通 80 Hz → 向下扩展（底噪够干净时自动跳过）→ 软拐点压缩 → 响度标准化（全链唯一一次真峰值限幅）。自动量出这段录音的起伏跨度（只算保留区间），按档位压到 ${COMPRESSION_PRESETS[compressionPreset].targetSpanDb} dB（与麦克风增益大小无关），压完直接归一到 ${lufsTargetDb} LUFS（上限 ${exportFormat === "mp3" ? LUFS_CEILING_DB_MP3 : LUFS_CEILING_DB_WAV} dBTP）`}
           >
             压缩
           </button>
+          {audioBuffer && !hasEnhancedAudio && (
+            <span
+              className="chain-hint"
+              title="扩展器只兜得住残余底噪：先「一键降噪」再优化，成品更干净"
+            >
+              建议先降噪
+            </span>
+          )}
           {hasCompressionApplied && (
             <button
               onClick={revertCompression}
-              title="回退到压缩之前的版本（重复点「压缩」是换档位，不会叠压）"
+              title="回退到压缩之前的版本（含流水线里那次响度标准化；重复点「压缩」是换档位，不会叠压）"
             >
               撤销压缩
             </button>
@@ -2132,7 +2233,7 @@ function App() {
                   <input
                     type="text"
                     value={modelDirInput}
-                    placeholder="默认：~/models/sense-voice"
+                    placeholder={DEFAULT_MODEL_DIR_HINT}
                     onChange={(event) => setModelDirInput(event.target.value)}
                   />
                 </label>
@@ -2311,7 +2412,7 @@ function App() {
                   setExportFormat("mp3");
                 }}
               />
-              MP3（默认）
+              MP3
             </label>
             <label className="setup-checkbox">
               <input
@@ -2323,7 +2424,7 @@ function App() {
                   setExportFormat("wav");
                 }}
               />
-              WAV
+              WAV（默认）
             </label>
           </div>
           {exportFormat === "mp3" && (
@@ -2388,13 +2489,14 @@ function App() {
                 className={`meter${recordingMeter.barDb >= -6 ? " meter-warning" : ""}`}
                 aria-label="实时输入峰值电平"
               >
+                {/* 底柱 = RMS（说话的平均水平），下面两根白针分别是瞬时峰值与保持 */}
                 <div
                   className="meter-rms"
                   style={{
                     transform: `scaleX(${meterPosition(recorder.level.rmsDb)})`,
                   }}
                 />
-                {/* 目标带画在电平条之上，落进带里就是期望电平 */}
+                {/* 目标带只管峰值：看白针落点，底柱（RMS）本来就低于它 */}
                 <span
                   className="meter-target-band"
                   style={{
@@ -2405,12 +2507,13 @@ function App() {
                       100
                     }%`,
                   }}
-                  title={`${METER_TARGET_RANGE.min} ~ ${METER_TARGET_RANGE.max} dBFS：期望的录音峰值区间`}
+                  title={`${METER_TARGET_RANGE.min} ~ ${METER_TARGET_RANGE.max} dBFS：期望的录音峰值区间（看白针，不看底柱）`}
                 />
                 <div
                   className="meter-bar"
                   style={{
-                    transform: `scaleX(${meterPosition(recordingMeter.barDb)})`,
+                    left: `${meterPosition(recordingMeter.barDb) * 100}%`,
+                    opacity: Number.isFinite(recordingMeter.barDb) ? 1 : 0,
                   }}
                 />
                 <div

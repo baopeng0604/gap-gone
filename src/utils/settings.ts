@@ -120,10 +120,10 @@ export function setTranscriptVisible(visible: boolean) {
   writeString(SETTINGS_KEYS.transcriptVisible, visible ? "1" : "0");
 }
 
-/** 导出格式（默认 MP3）。 */
+/** 导出格式（默认 WAV：无损母版，不再压一次有损编码；要小体积时在设置里切 MP3）。 */
 export function getExportFormat(): ExportFormat {
   const value = readString(SETTINGS_KEYS.exportFormat);
-  return value === "wav" ? "wav" : "mp3";
+  return value === "mp3" ? "mp3" : "wav";
 }
 
 export function setExportFormat(format: ExportFormat) {
@@ -143,11 +143,11 @@ export function setExportBitrate(bitrate: ExportBitrate) {
 }
 
 /**
- * 响度标准化目标（Integrated LUFS）。默认 -23：EBU R128 广播标准
- * （美国 ATSC A/85 为 -24 LKFS）。注意口径：-23 按立体声口径测得，单声道
- * 节目想严格对齐广播口径应取 -26。-19 是 Apple Podcasts 对单声道节目的
- * 规范值（立体声 -16，差 3 dB 只是 BS.1770 单双声道口径不同），-14 对齐
- * 短视频平台。
+ * 响度标准化目标（Integrated LUFS）。默认 -19：Apple Podcasts 对单声道节目的规范值，
+ * 也是本应用口播录音的常规交付口径。注意单双声道口径：BS.1770 对单声道按单通道权重
+ * 量测，所以同一个单声道文件在立体声系统回放会比读数响 3 dB —— 这就是「单声道 -19 /
+ * 立体声 -16」那 3 dB 的来源。-23 是 EBU R128 广播标准（美国 ATSC A/85 为 -24 LKFS），
+ * -14 对齐短视频平台。
  */
 export const LUFS_TARGET_PRESETS = [
   { label: "广播 -23", target: -23 },
@@ -155,7 +155,7 @@ export const LUFS_TARGET_PRESETS = [
   { label: "短视频 -14", target: -14 },
 ] as const;
 
-const LUFS_TARGET_DEFAULT = -23;
+const LUFS_TARGET_DEFAULT = -19;
 /** 允许的目标区间：高于 -6 LUFS 已经没有动态可言，低于 -30 基本没有意义。 */
 export const LUFS_TARGET_RANGE = { min: -30, max: -6 };
 

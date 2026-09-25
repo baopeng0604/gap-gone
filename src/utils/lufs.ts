@@ -33,7 +33,8 @@ export function formatLufs(lufs: number): string {
   return Number.isFinite(lufs) ? `${lufs.toFixed(1)} LUFS` : "— LUFS";
 }
 
-class Biquad {
+/** 直二型双二阶滤波器。K 计权用它，压缩链的高通也复用它（都是线性滤波）。 */
+export class Biquad {
   z1 = 0;
   z2 = 0;
   constructor(

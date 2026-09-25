@@ -157,7 +157,8 @@ export default function HelpModal({
             <li>
               <span className="help-modal-kbd">响度标准化</span>：按成片 Integrated
               响度一键把整段归一至设置里的目标（默认
-              <span className="help-modal-kbd">-23 LUFS</span>，EBU R128 广播口径），
+              <span className="help-modal-kbd">-19 LUFS</span>，Apple Podcasts
+              单声道口径；另有广播 -23、短视频 -14），
               并用前瞻真峰值限幅把峰值压在 -1 dBTP（导出 MP3 时 -1.5 dBTP）以内。
               只改增益、不改波形，所以不会削波也不会发毛。完成后会报出响度、真峰值
               和限幅衰减量，随时可用
@@ -193,7 +194,7 @@ export default function HelpModal({
             <li>RMS 是平均响度，Peak 是瞬时峰值，单位都是 dBFS。</li>
             <li>
               旁边的 LUFS 是成片 Integrated 响度，达标与否对照设置里的目标
-              （默认 -23）：低于目标 1.5 dB 以上偏弱，高于 1.5 dB 以上偏响。
+              （默认 -19）：低于目标 1.5 dB 以上偏弱，高于 1.5 dB 以上偏响。
               只提示，不拦截。
             </li>
             <li>切除和确认降噪后，LUFS 按即将导出的成片重算，已切除区间不计。</li>

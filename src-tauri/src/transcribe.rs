@@ -1,7 +1,7 @@
 //! SenseVoice 语音转录：模型下载 + 离线识别。
 //!
 //! 架构与降噪一致：识别器（含大模型）常驻 gap-gone-transcribe 工作线程，
-//! 命令只投递任务；模型文件按需下载到应用数据目录，支持用户手动放置。
+//! 命令只投递任务；模型文件按需下载到默认模型目录，支持用户手动放置。
 //! 大文件走「临时 WAV + 路径传参」，见 AGENTS.md 硬约束。
 
 use std::{
@@ -39,7 +39,15 @@ const TOKENS_TXT: &str = "tokens.txt";
 /// 发布包的单文件镜像，避免 Rust 侧解压 tar.bz2。
 const PUNCT_REPO: &str =
     "ranger810/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8";
+/// 转录模型目录名与标点模型目录名（都挂在默认模型根目录下）。
+const MODEL_DIR_NAME: &str = "sense-voice";
 const PUNCT_DIR_NAME: &str = "punctuation-ct-zh-en";
+
+/// Windows 上默认模型根目录：仓库内的 `models/`（本机自用，模型已手动放好，
+/// 不再往用户主目录重复下载一份）。只在它的**上层目录**存在时才采用 —— 换一台
+/// 机器装同一个构建时会自然回落到 ~/models，不会指到一个不存在的盘。
+#[cfg(windows)]
+const WINDOWS_MODELS_ROOT: &str = r"D:\Code\Github\gap-gone\models";
 const PUNCT_ONNX: &str = "model.int8.onnx";
 
 /// 分块目标时长（秒）。整段一次性 decode 无法给进度也无法取消，
@@ -97,16 +105,33 @@ pub struct TranscribeJob {
     pub respond: mpsc::Sender<Result<TranscriptResult, String>>,
 }
 
-/// 标点模型目录：~/models/punctuation-ct-zh-en（与自定义转录目录独立）。
-fn punct_dir(app: &AppHandle) -> Result<PathBuf, String> {
+/// 默认模型根目录。Windows 优先用仓库内的 `models/`（见 WINDOWS_MODELS_ROOT），
+/// 其余情况一律是用户主目录下的 `models/`。
+fn default_models_root(app: &AppHandle) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    if let Some(root) = windows_models_root() {
+        return Ok(root);
+    }
     app.path()
         .home_dir()
-        .map(|dir| dir.join("models").join(PUNCT_DIR_NAME))
+        .map(|dir| dir.join("models"))
         .map_err(|error| format!("无法定位用户主目录: {error}"))
 }
 
+#[cfg(windows)]
+fn windows_models_root() -> Option<PathBuf> {
+    let root = PathBuf::from(WINDOWS_MODELS_ROOT);
+    let parent_exists = root.parent().is_some_and(|parent| parent.is_dir());
+    parent_exists.then_some(root)
+}
+
+/// 标点模型目录：默认模型根目录下的 punctuation-ct-zh-en（与自定义转录目录独立）。
+fn punct_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    default_models_root(app).map(|root| root.join(PUNCT_DIR_NAME))
+}
+
 /// 模型目录：用户自定义优先（RecordingManager.transcribe_model_dir），
-/// 默认用户主目录 ~/models/sense-voice。
+/// 默认模型根目录下的 sense-voice。
 fn model_dir(app: &AppHandle, state: &State<'_, RecordingManager>) -> Result<PathBuf, String> {
     if let Some(custom) = state
         .transcribe_model_dir
@@ -116,10 +141,7 @@ fn model_dir(app: &AppHandle, state: &State<'_, RecordingManager>) -> Result<Pat
     {
         return Ok(custom);
     }
-    app.path()
-        .home_dir()
-        .map(|dir| dir.join("models").join("sense-voice"))
-        .map_err(|error| format!("无法定位用户主目录: {error}"))
+    default_models_root(app).map(|root| root.join(MODEL_DIR_NAME))
 }
 
 /// 当前生效的模型目录（自定义或默认）。
