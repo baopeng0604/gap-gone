@@ -166,3 +166,55 @@ export function bufferToWav(abuffer: AudioBuffer): Blob {
     pos += 4;
   }
 }
+
+/**
+ * 32-bit float WAV 编码（WAVE_FORMAT_IEEE_FLOAT）。
+ *
+ * 只给降噪中间文件用，**不要拿它做交付导出**：素材电平偏低时（口播常见），16-bit 会把
+ * 底噪那一段量化掉，而 DeepFilterNet 的抑制决策正依赖对底噪的准确估计；float 写盘时
+ * 也不需要削顶。交付导出仍走 16-bit 的 `bufferToWav`。
+ */
+export function bufferToFloatWav(abuffer: AudioBuffer): Blob {
+  const numOfChan = abuffer.numberOfChannels;
+  const length = abuffer.length * numOfChan * 4 + 44;
+  const buffer = new ArrayBuffer(length);
+  const view = new DataView(buffer);
+  let pos = 0;
+  const setUint16 = (data: number) => {
+    view.setUint16(pos, data, true);
+    pos += 2;
+  };
+  const setUint32 = (data: number) => {
+    view.setUint32(pos, data, true);
+    pos += 4;
+  };
+
+  setUint32(0x46464952); // "RIFF"
+  setUint32(length - 8); // file length - 8
+  setUint32(0x45564157); // "WAVE"
+
+  setUint32(0x20746d66); // "fmt "
+  setUint32(16); // length = 16（PCMWAVEFORMAT，hound 读得进 IEEE float）
+  setUint16(3); // IEEE float
+  setUint16(numOfChan);
+  setUint32(abuffer.sampleRate);
+  setUint32(abuffer.sampleRate * 4 * numOfChan); // avg. bytes/sec
+  setUint16(numOfChan * 4); // block-align
+  setUint16(32);
+
+  setUint32(0x61746164); // "data"
+  setUint32(length - pos - 4); // chunk length
+
+  const channels: Float32Array[] = [];
+  for (let i = 0; i < numOfChan; i++) channels.push(abuffer.getChannelData(i));
+
+  let offset = pos; // 头部写完正好是 44
+  for (let frame = 0; frame < abuffer.length; frame++) {
+    for (let i = 0; i < numOfChan; i++) {
+      view.setFloat32(offset, channels[i][frame], true);
+      offset += 4;
+    }
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}

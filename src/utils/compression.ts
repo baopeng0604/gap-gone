@@ -6,10 +6,12 @@
  * 就在末尾的响度标准化里（lufs.ts renderLimited），压缩段不再自己限幅。
  *
  * 六点口径：
- * 1. **参数自适应，不预设阈值**。先量素材自身的动态跨度（P90 − P10，剔除气口），
- *    再由档位「目标跨度」反推阈值与压缩比。跨度是相对量：麦克风增益整体平移时
- *    P10 / P90 同步平移、差值不变，所以增益拧大拧小都不影响判定 —— 固定阈值做不到
- *    这一点（0.1.45 及以前：增益一漂，要么压空、要么压不动）。换麦克风同理。
+ * 1. **参数自适应，不预设阈值**。先量素材自身的动态跨度（P90 − P10），再由档位「目标跨度」
+ *    反推阈值与压缩比。剔除气口的门限锚在**噪声底**上（`噪声底 + 14 dB`），不锚在中位数上 ——
+ *    中位数会随压缩移动（见 analyseSource 的注释），锚在它上面会让跨度前后不可比。
+ *    跨度本身是相对量：麦克风增益整体平移时 P10 / P90 同步平移、差值不变，所以增益拧大拧小
+ *    都不影响判定 —— 固定阈值做不到这一点（0.1.45 及以前：增益一漂，要么压空、要么压不动）。
+ *    换麦克风同理。
  * 2. **检测器用真 RMS 做一阶指数平滑**，不是峰值包络。语音的峰值比有效值高 8 ~ 12 dB，
  *    按峰值判触发会让阈值照着尖峰设，结果只有偶发尖峰被压、整段起伏纹丝不动
  *    （0.1.43 的三档 -14 / -18 / -22 就是这个病）。
@@ -65,8 +67,12 @@ export const COMPRESSION_PRESET_LIST: CompressionPreset[] = [
 /** 高通截止频率（Hz）：口播人声有效下限在 80 Hz 以上，再往下只有隆隆声与近讲堆积。 */
 export const HIGH_PASS_HZ = 80;
 
-/** 剔除气口用的相对门限（dB）：低于「本段块电平中位数 − 该值」的块算气口。 */
-const BREATH_CULL_DB = 20;
+/**
+ * 语音门限相对**噪声底**的余量（dB）：低于「噪声底 + 该值」的块算气口，不参与跨度统计。
+ * 取 14 是给扩展器留余量 —— 扩展器阈值最多只敢抬到「噪声底 + 6 dB / 语音 P10 − 3 dB」，
+ * 门限显著高于它，气口才不会又被算回语音侧。
+ */
+const SPEECH_GATE_MARGIN_DB = 14;
 /** 软拐点宽度（dB），阈值上下各占一半。 */
 const KNEE_DB = 6;
 /** 压缩比上限：再往上压会明显听出抽气，宁可压不够也要如实播报。 */
@@ -104,8 +110,8 @@ const EXPANDER_RANGE_DB = 12;
 const EXPANDER_KNEE_DB = 6;
 /** 阈值相对语音 P10 的下移量（dB）：至少低这么多，保证扩展器不啃到语音。 */
 const EXPANDER_SPEECH_MARGIN_DB = 3;
-/** 底噪比语音有效电平低这么多（dB）就算够干净，直接跳过扩展（信噪比已经够好）。 */
-const EXPANDER_CLEAN_MARGIN_DB = 30;
+/** 底噪比语音有效电平低这么多（dB）就算够干净：扩展器据此自动跳过。 */
+const CLEAN_SNR_MARGIN_DB = 30;
 
 function toDb(value: number) {
   return value > 0 ? 20 * Math.log10(value) : Number.NEGATIVE_INFINITY;
@@ -206,29 +212,46 @@ function collectBlockLevels(
 }
 
 /**
- * 量素材的电平分布。剔除气口用的是**相对门限**（本段块电平中位数 − 20 dB）而不是
- * 绝对 dB：绝对门限会跟着增益漂，增益拧小 10 dB 时原本有效的块会集体掉进门限以下
- * 被误剔，跨度就量歪了。
+ * 量素材的电平分布。剔除气口的门限**锚在噪声底上，不锚在中位数上**。
+ *
+ * 为什么不能锚中位数（0.1.60 修）：中位数会随压缩移动，而压缩正是本函数的调用方之一。
+ * 用它当基准会让「压缩前」与「压缩后」测的不是同一批块 —— 压缩把语音压低十几 dB → 中位数
+ * 下降 → 门限跟着下降 → 原本被剔掉的气口重新进入统计 → 实测跨度反而变大，播报里于是出现
+ * 「跨度 19.2 dB → 24.5 dB」这种荒谬读数。噪声底是气口的电平，压缩在气口处的增益≈0，
+ * 它不随压缩移动，拿它当基准前后才可比。
+ *
+ * 也没有写死绝对 dB：噪声底本身就是绝对量，麦克风增益整体平移时它同步平移、门限跟着平移，
+ * 判定不变。
+ *
+ * 门限另外夹在「中位数」以下：素材里根本没有气口时（全程连续说话），块电平的 P10 不是噪声底
+ * 而是最轻的语音，此时门限若高过中位数就会把一半动态当成噪声切掉。
  *
  * 没有任何有效块（整段都在绝对静音门限以下）时返回 null，调用方据此放弃处理。
  */
 export function analyseSource(
   buffer: AudioBuffer,
   regions: Region[],
+  anchorNoiseFloorDb?: number,
 ): SourceLevels | null {
   if (buffer.length === 0 || regions.length === 0) return null;
   const { allDb, audibleDb } = collectBlockLevels(buffer, regions);
   if (audibleDb.length === 0) return null;
   const rmsDb = percentile(audibleDb, 0.5);
-  const activeDb = audibleDb.filter((level) => level >= rmsDb - BREATH_CULL_DB);
+  const noiseFloorDb = Math.max(
+    percentile(allDb, NOISE_FLOOR_PERCENTILE),
+    NOISE_FLOOR_CLAMP_DB,
+  );
+  // 量压缩输出时传入**输入**的噪声底：同一条门限，前后才是同一批块。
+  const gateDb = Math.min(
+    (anchorNoiseFloorDb ?? noiseFloorDb) + SPEECH_GATE_MARGIN_DB,
+    rmsDb,
+  );
+  const activeDb = audibleDb.filter((level) => level >= gateDb);
   const p10Db = percentile(activeDb, 0.1);
   const p90Db = percentile(activeDb, 0.9);
   return {
     rmsDb,
-    noiseFloorDb: Math.max(
-      percentile(allDb, NOISE_FLOOR_PERCENTILE),
-      NOISE_FLOOR_CLAMP_DB,
-    ),
+    noiseFloorDb,
     p10Db,
     p90Db,
     spanDb: p90Db - p10Db,
@@ -240,8 +263,9 @@ export function analyseSource(
 export function measureSpanDb(
   buffer: AudioBuffer,
   regions: Region[],
+  anchorNoiseFloorDb?: number,
 ): number | null {
-  const levels = analyseSource(buffer, regions);
+  const levels = analyseSource(buffer, regions, anchorNoiseFloorDb);
   if (!levels || levels.blockCount < MIN_ACTIVE_BLOCKS) return null;
   return levels.spanDb;
 }
@@ -276,7 +300,7 @@ export function planExpander(levels: SourceLevels): ExpanderPlan {
     thresholdDb: null,
     rangeDb: 0,
   } as const;
-  if (levels.rmsDb - levels.noiseFloorDb >= EXPANDER_CLEAN_MARGIN_DB) {
+  if (levels.rmsDb - levels.noiseFloorDb >= CLEAN_SNR_MARGIN_DB) {
     return { ...base, applied: false, skipReason: "clean" };
   }
   if (levels.p10Db - levels.noiseFloorDb <= EXPANDER_KNEE_DB + EXPANDER_SPEECH_MARGIN_DB) {
@@ -511,7 +535,8 @@ function applyCompression(
     preset,
     averageReductionDb:
       reductionCount > 0 ? -reductionSum / reductionCount : 0,
-    outputSpanDb: measureSpanDb(compressed, regions),
+    // 用**输入**的噪声底当锚：输出自身的噪声底会被扩展器改掉，拿它当锚又会前后不可比。
+    outputSpanDb: measureSpanDb(compressed, regions, levels.noiseFloorDb),
   };
 }
 

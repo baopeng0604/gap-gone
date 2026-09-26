@@ -1308,9 +1308,17 @@ function App() {
       denoiseBaseRef.current = audioBuffer;
       setDenoisePreview(result.buffer);
       setAudioBuffer(result.buffer);
-      notify(
-        `${result.engine} 已生成${noisePreset === "light" ? "轻度" : noisePreset === "strong" ? "强度" : "中度"}降噪试听，请播放确认`,
-      );
+      const degree =
+        noisePreset === "light" ? "轻度" : noisePreset === "strong" ? "强度" : "中度";
+      if (result.fallbackReason) {
+        // 兜底算法和 DeepFilterNet 差一个量级，必须让用户看到，不能悄悄降级
+        notify(
+          `已生成${degree}降噪试听，但 DeepFilterNet 未生效（${result.fallbackReason}），已改用基础降噪、效果会明显更差`,
+          "error",
+        );
+      } else {
+        notify(`${result.engine} 已生成${degree}降噪试听，请播放确认`);
+      }
     } catch {
       notify("降噪已取消或失败，原始音频未改变", "error");
     } finally {

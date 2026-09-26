@@ -1,6 +1,6 @@
 [package]
 name = "gap-gone"
-version = "0.1.51"
+version = "0.1.60"
 description = "Gap Gone - 录音与音频编辑桌面应用"
 authors = ["you"]
 edition = "2021"
@@ -32,7 +32,22 @@ ndarray = "0.15"
 sherpa-onnx = "1.13"
 # 模型文件下载（ModelScope/HuggingFace 单文件直下）。
 ureq = "2"
-df = { package = "deep_filter", git = "https://github.com/Rikorose/DeepFilterNet", rev = "d375b2d8309e0935d165700c91da9de862a99c31", features = ["tract", "default-model"] }
+# DeepFilterNet3 **低延迟变体**（`default-model-ll`）。
+#
+# 为什么不用标准变体（`default-model`）：标准版的图在 tract 0.21.4 上过不了 codegen 之后的
+# 图压缩，报 `duplicate name /convt3/Conv.bias` —— 模型加载直接失败，而失败会被前端兜底
+# 接住，于是整条降噪悄悄退化成兜底算法（0.1.57 定位，代价是四轮调参全部无效）。
+#
+# 为什么不升 tract 换回标准版（0.1.58 实测）：`df` 主分支的 HEAD 就是下面这个 rev（上游自
+# 那以后没动过），它的代码只和 tract 0.21.4 的 API 对得上 —— 升到 0.21.18（df 的 `^0.21.4`
+# 本来允许）会因 `symbol_table` → `symbols` 等改动报 17 个编译错误。**换标准版必须 fork df
+# 或 tract 的源码，不是改配置能做到的。** 低延迟变体同架构（48 kHz / hop 480 / fft 960 /
+# nb_df 96），只是 lookahead 从 2 帧降到 0，恰好绕开那个算子；代价是体积 7.6 MB → 34.7 MB，
+# 而且它是为零延迟实时场景训练的，离线处理时模型自身的痕迹更重。
+# 动完**必须**跑 `cargo test --lib deepfilternet_engine_works`：它会直接告诉你引擎还能不能加载。
+df = { package = "deep_filter", git = "https://github.com/Rikorose/DeepFilterNet", rev = "d375b2d8309e0935d165700c91da9de862a99c31", default-features = false, features = ["tract", "default-model-ll"] }
+# 这 9 个版本必须整体锁死在 =0.21.4：df 的代码只对这个版本的 API。升上去 df 编译不过，
+# 而沿着 `^0.21.4` 漂到 0.21.18 就是上面说的那条死路。要动就 df 的 rev 和这 9 行一起动。
 tract-core = "=0.21.4"
 tract-data = "=0.21.4"
 tract-hir = "=0.21.4"
