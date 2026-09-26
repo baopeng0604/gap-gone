@@ -961,6 +961,25 @@ fn push_aac_bitrate(args: &mut Vec<String>, kbps: u32) {
     args.push(format!("{kbps}k"));
 }
 
+/// 转场类型白名单。**绝不把前端传来的字符串直接拼进 filter**：那是滤镜图，
+/// 拼错的轻则导不出、重则能塞进任意滤镜参数（例如 `,drawtext=...`）。
+/// 认不出的值一律退回默认的 `smoothleft` 并打日志。
+fn sanitize_transition_type(requested: Option<&str>) -> &'static str {
+    match requested {
+        Some("smoothleft") | None => "smoothleft",
+        Some("wipeleft") => "wipeleft",
+        Some("dissolve") => "dissolve",
+        Some("fadewhite") => "fadewhite",
+        Some(other) => {
+            log_error(
+                "视频导出",
+                &format!("未知的转场类型 {other}，回退 smoothleft"),
+            );
+            "smoothleft"
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_video_export(
     app: &AppHandle,
@@ -970,6 +989,7 @@ fn run_video_export(
     regions: &[(f64, f64)],
     transitions: &[f64],
     fps: &str,
+    transition_type: &str,
     output: &Path,
     fastcopy: bool,
     total_duration: f64,
@@ -1240,19 +1260,22 @@ fn run_video_export(
             // 位置写法（`settb=AVTB`、`setpts=PTS-STARTPTS`）只有 ffmpeg 7.0+ 认，
             // 实测 6.1.1 直接报 `No option name near 'AVTB'`。
             //
-            // 转场类型用 `smoothleft`（平滑滑移），**不是 `dissolve`**（0.1.72 换）：
-            // 交叉溶解会把两帧不同姿态的画面叠在一起 —— 边缘成双影、细纹理互相交织，
-            // 用户看到的就是「像锐化过度 + 密密麻麻的点」。实测同一个接缝上，混合帧的
-            // `edgedetect` 平均亮度是普通帧的 1.66 倍、码率是 5 倍（25.2 vs 5.2 Mbps）；
-            // 换成滑移后两幅画面是**平移推入**，不叠影、不互相污染。交叉溶解适合表达
-            // 「时间流逝」，而这里的用途是**掩盖跳切**，滑移/推入才是业内常规做法。
+            // 转场类型由用户选（设置页下拉），默认 `smoothleft`（平滑滑移）。
+            // **默认不是 `dissolve`**（0.1.72 换）：交叉溶解把两帧不同姿态的画面叠在一起 ——
+            // 边缘成双影、细纹理互相交织，用户看到的「像锐化过度 + 密密麻麻的点」就是它。
+            // 实测同一个接缝上，溶解的混合帧 `edgedetect` 平均亮度是普通帧的 1.66 倍、
+            // 码率 5 倍（25.2 vs 5.2 Mbps）；换滑移后回到普通帧水平。
+            // 交叉溶解适合表达「时间流逝」，而这里的用途是**掩盖跳切**，滑移/划像才是常规做法。
+            // 顺带记下其它选项的量级（逐帧画面变动量，普通素材基准 2.18）：划像 2.41、
+            // 溶解 2.83、闪白 32.55（0.1 秒时 98.6）—— 闪白是「请观众注意」的语言，别设成默认。
             let filter = format!(
                 "[0:v]settb=tb=AVTB,setpts=expr=PTS-STARTPTS,fps=fps={fps}[v0];\
                  [1:v]settb=tb=AVTB,setpts=expr=PTS-STARTPTS,fps=fps={fps}[v1];\
-                 [v0][v1]xfade=transition=smoothleft:duration={duration:.3}:offset=0,format=yuv420p[v];\
+                 [v0][v1]xfade=transition={transition}:duration={duration:.3}:offset=0,format=yuv420p[v];\
                  [2:a][3:a]concat=n=2:v=0:a=1,afade=t=in:st=0:d={fade:.3},\
                  afade=t=out:st={fade_out:.3}:d={fade:.3}[a]",
                 fps = fps,
+                transition = transition_type,
                 duration = tail_trim,
                 fade = micro_fade,
                 fade_out = (tail_trim - micro_fade).max(0.0),
@@ -1367,7 +1390,8 @@ fn run_video_export(
 /// audio_path 提供（应用过降噪/压缩/响度归一化）时替换原音轨为前端渲染的处理后音轨；
 /// 否则 -c:a copy 保留原音轨特征。variant: "fastcopy"（默认，不重编码）/ "reencode"（帧精确）。
 /// transitions_json 是**逐接缝的过渡时长**（秒，长度 = 区间数 − 1，0 = 硬切），只在
-/// reencode 档生效；fps 是源视频帧率的原始分数串（如 "30/1"），xfade 要求显式帧率。
+/// reencode 档生效；transition_type 是转场类型（白名单见 sanitize_transition_type）；
+/// fps 是源视频帧率的原始分数串（如 "30/1"），xfade 要求显式帧率。
 /// subtitles_path 提供时，导出成功后把该临时字幕文件复制到成片旁边（同名 .srt）。
 #[tauri::command]
 pub(crate) async fn export_video(
@@ -1379,6 +1403,7 @@ pub(crate) async fn export_video(
     subtitles_path: Option<String>,
     regions_json: String,
     transitions_json: Option<String>,
+    transition_type: Option<String>,
     fps: Option<String>,
     output_path: String,
     variant: String,
@@ -1416,13 +1441,14 @@ pub(crate) async fn export_video(
         .and_then(|json| serde_json::from_str::<Vec<f64>>(json).ok())
         .unwrap_or_default();
     let fps = fps.unwrap_or_else(|| "30/1".to_string());
+    let transition_type = sanitize_transition_type(transition_type.as_deref());
 
     // 导出计划先落一行到终端：出问题时第一件事就是对照它看「按哪个档位、切了哪几段」，
     // 而这些参数来自前端，光看界面复现不出来。
     log_info(
         "视频导出",
         &format!(
-            "开始：{}｜保留 {} 段 {:?}｜过渡 {:?}｜fps {fps}｜{}｜输出 {output_path}",
+            "开始：{}｜保留 {} 段 {:?}｜过渡 {transition_type} {:?}｜fps {fps}｜{}｜输出 {output_path}",
             if fastcopy { "无损快速" } else { "精确重编码" },
             regions.len(),
             regions,
@@ -1452,6 +1478,7 @@ pub(crate) async fn export_video(
             &regions,
             &transitions,
             &fps,
+            transition_type,
             &export_output,
             fastcopy,
             total_duration,

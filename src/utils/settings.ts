@@ -28,6 +28,8 @@ export const SETTINGS_KEYS = {
   videoVariant: "gap-gone-video-variant",
   // 视频切片过渡时长（秒，0 = 硬切；只在「精确编码」档生效）
   videoTransition: "gap-gone-video-transition",
+  // 视频切片过渡的转场类型（smoothleft / wipeleft / dissolve / fadewhite）
+  videoTransitionType: "gap-gone-video-transition-type",
 } as const;
 
 export type ExportFormat = "mp3" | "wav";
@@ -226,14 +228,66 @@ export function setVideoVariant(variant: VideoExportVariant) {
 }
 
 /**
- * 视频切片过渡时长（秒）。**0 = 硬切**，默认 0.3。
+ * 视频切片过渡的转场类型。**时长 = 0 时一律硬切，与此项无关。**
  *
- * 0.3 秒是"消隐跳切"的常用值：剪辑软件的转场默认时长普遍是 1 秒（Premiere 的 30 帧、
- * DaVinci 与 Final Cut 的 Standard Duration），短视频工具的转场默认 0.5 秒，但那些是给
- * 镜头切换用的；隐藏跳切要短得多（业内实操多在 0.1~0.3 秒），再长就不像在藏剪辑点、
- * 而像刻意加了个转场，且音频是同步交叉淡化，越长越多字会被叠在一起。
+ * 默认 `smoothleft`（平滑滑移）。为什么默认不是交叉溶解：溶解把两帧不同姿态的画面叠在
+ * 一起，边缘成双影、细纹理互相交织，肉眼就是「锐化过度 + 密密麻麻的点」（实测混合帧的
+ * 高频能量是普通帧的 1.66 倍、码率 5 倍）。
+ *
+ * 四个选项都留着，是因为「哪种最不显眼」得在用户自己的素材上看 —— 逐帧画面变动量实测
+ * （普通素材基准 2.18）：平滑滑移 0.3 秒 2.32、划像 0.3 秒 2.41、交叉溶解 0.3 秒 2.83、
+ * 闪白 0.3 秒 **32.55**（0.1 秒时 98.6，是基准的 45 倍）。闪白/闪黑是「请观众注意这里」
+ * 的语言（转场、回忆、分屏），与「藏跳切」的目标相反，放在这里只为让用户自己排除它。
  */
-export const VIDEO_TRANSITION_DEFAULT = 0.3;
+export const VIDEO_TRANSITION_TYPES = [
+  {
+    value: "smoothleft",
+    label: "平滑滑移",
+    hint: "画面横向推入，两幅画面平移衔接",
+  },
+  {
+    value: "wipeleft",
+    label: "划像",
+    hint: "一条边界扫过，画面本身不平移",
+  },
+  {
+    value: "dissolve",
+    label: "交叉溶解",
+    hint: "两幅画面叠在一起淡化（会留双影、细纹交织）",
+  },
+  {
+    value: "fadewhite",
+    label: "闪白",
+    hint: "画面先冲到纯白再回来 —— 最抢眼",
+  },
+] as const;
+
+export type VideoTransitionType =
+  (typeof VIDEO_TRANSITION_TYPES)[number]["value"];
+
+const VIDEO_TRANSITION_TYPE_DEFAULT: VideoTransitionType = "smoothleft";
+
+export function getVideoTransitionType(): VideoTransitionType {
+  const raw = readString(SETTINGS_KEYS.videoTransitionType);
+  return VIDEO_TRANSITION_TYPES.some((item) => item.value === raw)
+    ? (raw as VideoTransitionType)
+    : VIDEO_TRANSITION_TYPE_DEFAULT;
+}
+
+export function setVideoTransitionType(type: VideoTransitionType) {
+  writeString(SETTINGS_KEYS.videoTransitionType, type);
+}
+
+/**
+ * 视频切片过渡时长（秒）。**0 = 硬切**，默认 0.1。
+ *
+ * 默认取 0.1 秒（@30fps = 3 帧）而不是剪辑软件的常规转场时长：那些默认值（Premiere 30 帧、
+ * DaVinci / Final Cut 1 秒、短视频工具 0.5 秒）是给**镜头之间**的转场用的；掩盖跳切相反，
+ * 越短越不像「加了转场」—— 0.1 秒只够读成「甩了一下」，0.5 秒则是一整段持续平移，反而显眼。
+ * 实测逐帧画面变动量：0.5 秒 1.84（比普通素材还平）、0.3 秒 2.32、0.2 秒 3.00、0.1 秒 5.21
+ * —— 时长把同样的内容变化摊得越开，单帧越平，但「画面在平移」这件事持续得越久。
+ */
+export const VIDEO_TRANSITION_DEFAULT = 0.1;
 /** 可调区间（秒）与步进。0 表示硬切。 */
 export const VIDEO_TRANSITION_RANGE = { min: 0, max: 1, step: 0.1 } as const;
 

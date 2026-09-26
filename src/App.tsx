@@ -37,6 +37,7 @@ import {
   getSilenceThreshold,
   getTranscriptVisible,
   getVideoTransition,
+  getVideoTransitionType,
   getVideoVariant,
   LUFS_TARGET_PRESETS,
   LUFS_TARGET_RANGE,
@@ -50,11 +51,14 @@ import {
   setSilenceThreshold as persistSilenceThreshold,
   setTranscriptVisible as persistTranscriptVisible,
   setVideoTransition as persistVideoTransition,
+  setVideoTransitionType as persistVideoTransitionType,
   setVideoVariant as persistVideoVariant,
   VIDEO_TRANSITION_RANGE,
+  VIDEO_TRANSITION_TYPES,
   type ExportBitrate,
   type ExportFormat,
   type VideoExportVariant,
+  type VideoTransitionType,
 } from "./utils/settings";
 import { formatTimeStandard } from "./utils/timeUtils";
 import {
@@ -136,6 +140,7 @@ interface SetupSnapshot {
   exportBitrate: ExportBitrate;
   videoVariant: VideoExportVariant;
   videoTransition: number;
+  videoTransitionType: VideoTransitionType;
   /** 设置页「ffmpeg 路径」输入框当时的值（含 Windows 默认值）。 */
   ffmpegPath: string;
 }
@@ -596,6 +601,8 @@ function App() {
   const [videoTransition, setVideoTransitionState] = useState<number>(() =>
     getVideoTransition(),
   );
+  const [videoTransitionType, setVideoTransitionTypeState] =
+    useState<VideoTransitionType>(() => getVideoTransitionType());
   const [videoExportProgress, setVideoExportProgress] = useState<number | null>(
     null,
   );
@@ -878,6 +885,7 @@ function App() {
       exportBitrate,
       videoVariant: videoExportVariant,
       videoTransition,
+      videoTransitionType,
       ffmpegPath: getFfmpegPath(),
     };
     if (isTauriDesktop()) {
@@ -1833,6 +1841,7 @@ function App() {
         subtitlesPath: subtitlePath,
         regionsJson,
         transitionsJson: JSON.stringify(transitionPlan),
+        transitionType: videoTransitionType,
         fps: videoAsset.fps,
         outputPath,
         variant: effectiveVariant,
@@ -1842,7 +1851,10 @@ function App() {
       });
       const appliedTransitions = transitionPlan.filter((value) => value > 0);
       const transitionNote = appliedTransitions.length
-        ? `（精确编码：${appliedTransitions.length} 处滑移过渡，成片比硬切短 ${appliedTransitions.reduce((sum, value) => sum + value, 0).toFixed(1)} 秒）`
+        ? `（精确编码：${appliedTransitions.length} 处${
+            VIDEO_TRANSITION_TYPES.find((item) => item.value === videoTransitionType)
+              ?.label ?? "过渡"
+          }，成片比硬切短 ${appliedTransitions.reduce((sum, value) => sum + value, 0).toFixed(1)} 秒）`
         : "";
       // 无损快切档的代价也要如实说：切点吸附到关键帧等于少删了一小截静音
       const snapNote =
@@ -2543,6 +2555,8 @@ function App() {
     persistVideoVariant(snapshot.videoVariant);
     setVideoTransitionState(snapshot.videoTransition);
     persistVideoTransition(snapshot.videoTransition);
+    setVideoTransitionTypeState(snapshot.videoTransitionType);
+    persistVideoTransitionType(snapshot.videoTransitionType);
     // ffmpeg 路径也回退并静默重探一次（不弹引导框、不发提示，本函数末尾统一提示）
     if (isTauriDesktop() && snapshot.ffmpegPath !== getFfmpegPath()) {
       persistFfmpegPath(snapshot.ffmpegPath);
@@ -3259,6 +3273,26 @@ function App() {
                 </label>
               </div>
               <div className="setup-row">
+                <label className="setup-checkbox">转场类型</label>
+                {VIDEO_TRANSITION_TYPES.map((item) => (
+                  <label className="setup-checkbox" key={item.value} title={item.hint}>
+                    <input
+                      type="radio"
+                      name="video-transition-type"
+                      checked={videoTransitionType === item.value}
+                      disabled={
+                        videoExportVariant !== "reencode" || !ffmpegInfo?.hasXfade
+                      }
+                      onChange={() => {
+                        setVideoTransitionTypeState(item.value);
+                        persistVideoTransitionType(item.value);
+                      }}
+                    />
+                    {item.label}
+                  </label>
+                ))}
+              </div>
+              <div className="setup-row">
                 <label className="setup-checkbox">切片过渡</label>
                 <input
                   type="range"
@@ -3284,10 +3318,18 @@ function App() {
               <div className="setup-row">
                 <small>
                   {videoExportVariant !== "reencode"
-                    ? "「无损快切」不重编码画面，做不了过渡 —— 切到「精确编码」后上面这项才生效。"
+                    ? "「无损快切」不重编码画面，做不了过渡 —— 切到「精确编码」后上面这两项才生效。"
                     : videoTransition === 0
-                      ? "接缝处硬切（当前设置）。"
-                      : `接缝处做 ${videoTransition.toFixed(1)} 秒平滑滑移过渡（画面横向推入；声音不跟着滑，在接缝处硬拼接、两端各加 5 毫秒微淡），成片会比硬切短 ${videoTransition.toFixed(1)} 秒 × 接缝数。0.1~0.3 秒用于隐藏跳切，再长会像刻意的镜头转场。`}
+                      ? "接缝处硬切（当前设置）。现代口播里跳切本身也很常见，不必非要加过渡。"
+                      : `接缝处做 ${videoTransition.toFixed(1)} 秒${
+                          VIDEO_TRANSITION_TYPES.find(
+                            (item) => item.value === videoTransitionType,
+                          )?.label ?? "过渡"
+                        }（${
+                          VIDEO_TRANSITION_TYPES.find(
+                            (item) => item.value === videoTransitionType,
+                          )?.hint ?? ""
+                        }；声音不跟着变，在接缝处硬拼接、两端各加 5 毫秒微淡），成片会比硬切短 ${videoTransition.toFixed(1)} 秒 × 接缝数。越短越不像加了转场 —— 0.1 秒只够读成「甩了一下」，拉到 0 就是硬切。`}
                   {" 过渡只在导出时应用，预览仍是硬切。"}
                 </small>
               </div>
