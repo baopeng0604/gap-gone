@@ -123,7 +123,7 @@ export function nextPlayableTime(
  * 删除」多留一小截），成片时间轴必须以吸附后的区间为基准，否则字幕会随每个吸附点累积错位。
  *
  * `transitions` 用于**精确编码档的切片过渡**：每个接缝 t 秒是从相邻两段的边界各取 t
- * 混合而成（重叠式交叉溶解），所以每段在成片里只剩「主体」、且成片整体比硬切短 Σt。
+ * 混合而成（重叠式过渡），所以每段在成片里只剩「主体」、且成片整体比硬切短 Σt。
  * 不传（或传全 0）时行为与硬切完全一致。
  */
 export function mapRangeToKept(
@@ -147,7 +147,7 @@ export function mapRangeToKept(
     const end = Math.min(bodyEnd, range.end);
     if (end > start) {
       // 字幕伸进被裁掉的那两截时，映射结果也要跟着扩到过渡段上：那部分内容是在
-      // 过渡里播出去的（混合画面），字幕盖住它才不会在溶解时闪一下。
+      // 过渡里播出去的，字幕盖住它才不会在过渡时闪一下。
       const extendedStart = range.start < bodyStart ? start - headTrim : start;
       const extendedEnd = range.end > bodyEnd ? end + tailTrim : end;
       const piece = {
@@ -155,7 +155,7 @@ export function mapRangeToKept(
         end: offset + (extendedEnd - bodyStart),
       };
       // 横跨接缝的字幕会被切成两段，中间隔着 t 秒的过渡段 —— 那是同一句话，
-      // 合并起来让它盖住过渡，而不是在溶解时闪一下。
+      // 合并起来让它盖住过渡，而不是在过渡时闪一下。
       const previous = result[result.length - 1];
       if (previous && piece.start - previous.end <= tailTrim + 0.001) {
         previous.end = piece.end;

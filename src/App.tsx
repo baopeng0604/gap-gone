@@ -1491,7 +1491,7 @@ function App() {
   /**
    * 逐接缝的过渡时长（秒，长度 = 保留区间数 − 1；0 = 硬切）。这是导出与字幕换算的
    * **唯一来源**，Rust 侧只做兜底钳制、不再自己推导。三条规则：
-   * - **只在「精确编码」档生效**：无损快切是 `-c:v copy`，画面根本没解码，做不了溶解；
+   * - **只在「精确编码」档生效**：无损快切是 `-c:v copy`，画面根本没解码，做不了过渡；
    * - **按帧取整**（0.3 秒 @30fps = 9 帧）：xfade 与 concat 都按帧走，不取整会攒出
    *   ±1 帧 × 接缝数的偏差，把字幕推歪；
    * - **短段保护**：每处接缝最多取相邻两段各一半，否则会把短的那段吃光。
@@ -1502,7 +1502,7 @@ function App() {
       effectiveVariant !== "reencode" ||
       videoTransition <= 0 ||
       kept.length < 2 ||
-      // 没有 xfade 就做不了溶解（精简构建可能缺失），这里直接退成硬切，
+      // 没有 xfade 就做不了过渡（精简构建可能缺失），这里直接退成硬切，
       // 导出前的提示会把原因说明白，而不是让导出跑到一半报 Filter not found。
       !ffmpegInfo?.hasXfade
     ) {
@@ -1736,7 +1736,7 @@ function App() {
           : `本次改用「精确重编码」：${fastcopyFallbackReason}`,
       );
     } else if (effectiveVariant === "reencode" && transitionPlan.some((value) => value > 0)) {
-      notify("本次用「精确重编码」，接缝会做交叉溶解");
+      notify("本次用「精确重编码」，接缝会做平滑滑移过渡");
     }
     // 短段保护生效时如实说一声：这类接缝的过渡比设置值短（或直接退回硬切）
     const shortenedJoins = transitionPlan.filter(
@@ -1745,7 +1745,7 @@ function App() {
     if (shortenedJoins > 0) {
       notify(`有 ${shortenedJoins} 处接缝因相邻片段过短，过渡时长已自动缩短`);
     }
-    // 设了过渡时长但这份 ffmpeg 做不了溶解：明确说明本次按硬切走，别让人以为已经生效
+    // 设了过渡时长但这份 ffmpeg 做不了过渡：明确说明本次按硬切走，别让人以为已经生效
     if (
       videoTransition > 0 &&
       effectiveVariant === "reencode" &&
@@ -1782,7 +1782,7 @@ function App() {
       if (exportSubtitles && transcript) {
         // 转录时间码在源时间轴上，成片已跳过切除区间，必须重映射到成片时间轴。
         // - 无损快切档的成片时间轴以「吸附后的保留区间」为准（每段多留一小截）；
-        // - 精确编码档若有过渡，每个接缝还会让成片短 t 秒（重叠式交叉溶解）。
+        // - 精确编码档若有过渡，每个接缝还会让成片短 t 秒（重叠式过渡）。
         // 不按实际成片时间轴换算的话，字幕会随吸附点/过渡点累积错位。
         const keptForSubtitles =
           effectiveVariant === "fastcopy" ? fastcopyPlan?.snapped : undefined;
@@ -1842,7 +1842,7 @@ function App() {
       });
       const appliedTransitions = transitionPlan.filter((value) => value > 0);
       const transitionNote = appliedTransitions.length
-        ? `（精确编码：${appliedTransitions.length} 处交叉溶解，成片比硬切短 ${appliedTransitions.reduce((sum, value) => sum + value, 0).toFixed(1)} 秒）`
+        ? `（精确编码：${appliedTransitions.length} 处滑移过渡，成片比硬切短 ${appliedTransitions.reduce((sum, value) => sum + value, 0).toFixed(1)} 秒）`
         : "";
       // 无损快切档的代价也要如实说：切点吸附到关键帧等于少删了一小截静音
       const snapNote =
@@ -3284,10 +3284,10 @@ function App() {
               <div className="setup-row">
                 <small>
                   {videoExportVariant !== "reencode"
-                    ? "「无损快切」不重编码画面，做不了交叉溶解 —— 切到「精确编码」后上面这项才生效。"
+                    ? "「无损快切」不重编码画面，做不了过渡 —— 切到「精确编码」后上面这项才生效。"
                     : videoTransition === 0
                       ? "接缝处硬切（当前设置）。"
-                      : `接缝处做 ${videoTransition.toFixed(1)} 秒交叉溶解（画面与声音一起淡化），成片会比硬切短 ${videoTransition.toFixed(1)} 秒 × 接缝数。0.1~0.3 秒用于隐藏跳切，再长会像刻意的镜头转场。`}
+                      : `接缝处做 ${videoTransition.toFixed(1)} 秒平滑滑移过渡（画面横向推入；声音不跟着滑，在接缝处硬拼接、两端各加 5 毫秒微淡），成片会比硬切短 ${videoTransition.toFixed(1)} 秒 × 接缝数。0.1~0.3 秒用于隐藏跳切，再长会像刻意的镜头转场。`}
                   {" 过渡只在导出时应用，预览仍是硬切。"}
                 </small>
               </div>

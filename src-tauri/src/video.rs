@@ -1205,8 +1205,12 @@ fn run_video_export(
             // 过渡段的两个视频窗口 = 两侧**被裁掉的那两截**，正好接在主体之外，
             // 所以既不会有内容重复也不会丢内容：
             //   本段尾巴 [body_end, body_end + t] 与 下一段头部 [start_{i+1}, start_{i+1} + t]
-            // 注意起点不要写成 body_end - t / start_{i+1} + t —— 那会把过渡窗口挪进主体里，
-            // 结果是 A 的最后一截永远不出现、B 的开头被播两遍。
+            // 注意起点不要写成 `body_end - t` / `start_{i+1} + t` —— 那会把过渡窗口挪进主体里，
+            // 结果是 A 的最后一截永远不出现、B 的开头被播两遍。**这两个错法都实际发生过**：
+            // `start + t` 在 0.1.67 修掉，`body_end - t` 在 0.1.71 修掉（注释写对了、代码写错了，
+            // 而验证只看帧数与时长，两个错法的帧数完全一样，所以一直没暴露）。
+            // 判据必须是**内容**：过渡段第 0 帧应与源上 `body_end` 那一帧几乎一致
+            // （PSNR ≈ 43 dB），与 `body_end - t` 那一帧则应明显不像（≈ 19 dB）。
             let next_region_start = regions[index + 1].0;
             let audio_after = audio_offset + full_duration;
             let half = tail_trim / 2.0;
@@ -1214,7 +1218,7 @@ fn run_video_export(
             let micro_fade = (tail_trim / 10.0).min(0.005).max(0.001);
             let mut args: Vec<String> = vec!["-y".into(), "-hide_banner".into()];
             // 输入 0/1：视频窗口各**正好** d 秒（xfade 的 offset=0 要求输入 1 时长恰为 d）
-            push_window_input(&mut args, input, body_end - tail_trim, tail_trim);
+            push_window_input(&mut args, input, body_end, tail_trim);
             push_window_input(&mut args, input, next_region_start, tail_trim);
             // 输入 2/3：音频窗口各 d/2 秒，取「两侧**被裁掉那一截的前半**」——
             // 与视频窗口（两侧被裁掉那一整截）端点对齐，所以过渡段起点的音频正好接在
@@ -1235,10 +1239,17 @@ fn run_video_export(
             // 滤镜参数一律用**具名**写法（`settb=tb=` / `setpts=expr=` / `fps=fps=`）：
             // 位置写法（`settb=AVTB`、`setpts=PTS-STARTPTS`）只有 ffmpeg 7.0+ 认，
             // 实测 6.1.1 直接报 `No option name near 'AVTB'`。
+            //
+            // 转场类型用 `smoothleft`（平滑滑移），**不是 `dissolve`**（0.1.72 换）：
+            // 交叉溶解会把两帧不同姿态的画面叠在一起 —— 边缘成双影、细纹理互相交织，
+            // 用户看到的就是「像锐化过度 + 密密麻麻的点」。实测同一个接缝上，混合帧的
+            // `edgedetect` 平均亮度是普通帧的 1.66 倍、码率是 5 倍（25.2 vs 5.2 Mbps）；
+            // 换成滑移后两幅画面是**平移推入**，不叠影、不互相污染。交叉溶解适合表达
+            // 「时间流逝」，而这里的用途是**掩盖跳切**，滑移/推入才是业内常规做法。
             let filter = format!(
                 "[0:v]settb=tb=AVTB,setpts=expr=PTS-STARTPTS,fps=fps={fps}[v0];\
                  [1:v]settb=tb=AVTB,setpts=expr=PTS-STARTPTS,fps=fps={fps}[v1];\
-                 [v0][v1]xfade=transition=dissolve:duration={duration:.3}:offset=0,format=yuv420p[v];\
+                 [v0][v1]xfade=transition=smoothleft:duration={duration:.3}:offset=0,format=yuv420p[v];\
                  [2:a][3:a]concat=n=2:v=0:a=1,afade=t=in:st=0:d={fade:.3},\
                  afade=t=out:st={fade_out:.3}:d={fade:.3}[a]",
                 fps = fps,
