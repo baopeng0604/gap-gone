@@ -738,17 +738,17 @@ fn enhance_samples(
     // enhance_wav 的 --compensate-delay 就是丢掉这一段。不补的话整段会晚几十毫秒
     // （与视频/字幕对不齐），选区降噪更是直接错位。做法：输入尾部补 delay 个零，
     // 输出整体前移 delay，长度仍与输入一致。
-    // 注意 `df_order` 这一项：crate 的 process 把输出取自滚动缓冲里**最旧**的那一帧，
-    // 而缓冲长度是 (df_order + conv_lookahead) 帧，所以真实延迟要算上 df_order 帧 ——
-    // 官方 enhance_wav 的 `fft_size − hop_size + lookahead × hop_size` **漏了这一项**，
-    // 照抄会让整段输出晚 5 个 hop（实测 2400 采样 = 50 ms，`--compensate-delay` 同样漏）。
-    // 本模型：960 − 480 + 5 × 480 = 2880。
-    let delay = model.fft_size.saturating_sub(hop_size).saturating_add(
-        model
-            .df_order
-            .saturating_add(model.lookahead)
-            .saturating_mul(hop_size),
-    );
+    // **公式保持与官方一致，不要往里加 `df_order`**（0.1.61 实测改正）：真实算法延迟
+    // 就是 `fft_size − hop_size + lookahead × hop_size`（本模型 = 960 − 480 + 0 = 480）。
+    // 这里曾经写成 `+ (df_order + lookahead) × hop_size` = 2880，理由是「process 的输出取自
+    // 滚动缓冲里最旧的一帧、缓冲长度是 (df_order + conv_lookahead) 帧」—— 那个理由是**错的**：
+    // 多出来的 5 帧（2400 采样）并不来自模型的固有延迟，而是来自每任务多调的那套
+    // `init()` + `DFState::reset()` + `init_norm_states()`（见 run_denoise_job 的注释）。
+    // 当时两个错误正好抵消（多造 2400、多补 2400），自检一直报「滞后 0 采样」而看不出问题。
+    let delay = model
+        .fft_size
+        .saturating_sub(hop_size)
+        .saturating_add(model.lookahead.saturating_mul(hop_size));
     let total = samples.len() + delay;
     let total_chunks = total.div_ceil(hop_size).max(1);
     let mut enhanced: Vec<f32> = Vec::with_capacity(samples.len());
@@ -836,14 +836,13 @@ fn run_denoise_job(job: &DenoiseJob) -> Result<(), String> {
     // 消掉、人声先毛了。0.1.54 开过 0.02，用户实测「强档人声破音」，故回退（0.1.55）。
     // 注意链上顺序：PF 在「掺回原始噪声」之前跑，所以它本来也压不掉 atten_lim 掺回的那部分。
     model.set_pf_beta(0.0);
-    model
-        .init()
-        .map_err(|error| format!("无法重置降噪模型状态: {error}"))?;
-    let nb_df = model.nb_df;
-    for df_state in &mut model.df_states {
-        df_state.reset();
-        df_state.init_norm_states(nb_df);
-    }
+    // **不要调 `init()` / `DFState::reset()` / `init_norm_states()`**（0.1.61 实测改正）。
+    // `DfTract::new` 已经把内部状态准备好了；再「重置」一次会**清掉滚动缓冲与归一化状态**，
+    // 模型要再过 `df_order` 帧（5 帧 = 2400 采样 = 50 ms）才把它们填回来。实测代价有两条：
+    // ① 真实算法延迟从 480 变成 2880（当时在 `enhance_samples` 里多补的 2400 恰好把它抵消，
+    //    所以自检一直报「滞后 0 采样」）；② 输出在 5–16 kHz 上凭空多出最多 **+24 dB** 的改动
+    //    （230 个块里 63 个高频上升），听感就是「人声发毛、明显异常」—— 而同一条素材、同一档位
+    //    下，官方 `enhance_wav`（从不调用这三行）逐块高频改动最大值只有 −0.1 dB。
     let enhanced = enhance_samples(&mut model, &samples, |done, total| {
         let _ = job
             .app
@@ -965,13 +964,9 @@ mod tests {
 
         // 加载成功还不够：真跑几个 hop，确认推理出得来、且输出全是有限值。
         // NaN 会毁掉整段声音却不会报错，所以这一步必须断言。
-        let nb_df = model.nb_df;
         let hop_size = model.hop_size;
-        model.init().expect("无法重置模型状态");
-        for state in &mut model.df_states {
-            state.reset();
-            state.init_norm_states(nb_df);
-        }
+        // 这里也**不要**调 init()/reset()/init_norm_states()，理由见 run_denoise_job 的注释：
+        // 那套「重置」会清掉滚动缓冲，是 0.1.61 定位到的降噪异常根因。
         for amplitude in [0.0f32, 0.1, -0.1] {
             let chunk = Array2::from_shape_vec((1, hop_size), vec![amplitude; hop_size])
                 .expect("构造输入失败");
@@ -1135,12 +1130,9 @@ mod tests {
                 .expect("模型加载失败");
             model.set_atten_lim(attenuation);
             model.set_pf_beta(0.0);
-            model.init().expect("重置失败");
-            let nb_df = model.nb_df;
-            for state in &mut model.df_states {
-                state.reset();
-                state.init_norm_states(nb_df);
-            }
+            // TEMP-DIAG：临时去掉 init()/reset()/init_norm_states() 这一套「重置」，
+            // 用于验证「高频爆点是否由这套重置引入」——官方 enhance_wav 从不调用它们。
+            // 验证完必须还原。
             let out = enhance_samples(&mut model, &input, |_, _| true).expect("推理失败");
             let envelope_in = envelope(&input, SR);
             let envelope_out = envelope(&out, SR);
