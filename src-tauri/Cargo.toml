@@ -57,3 +57,12 @@ tract-onnx = "=0.21.4"
 tract-onnx-opl = "=0.21.4"
 tract-pulse = "=0.21.4"
 tract-pulse-opl = "=0.21.4"
+
+# dev 构建默认带**完整**调试信息（debug = 2），而本项目的依赖里有 sherpa-onnx / onnxruntime /
+# tract 这些大块头，debug 产物里的 .lib / .pdb 动辄上 GB —— 实测 target/debug 曾涨到 66 GB
+# （其中 deps 36 GB、incremental 20 GB）。降到行号级（debug = 1）能明显压小体积，且**不牺牲
+# 编译速度与增量编译**；代价是调试时看不到局部变量值，需要完整符号就临时改回 2（注意：改这一项
+# 会让所有依赖产物的 hash 失效、触发一次全量重编，所以要么别频繁动，要么配合 cargo clean 一起做）。
+# 只影响 dev 构建，release（pnpm tauri build）与安装包不受影响。
+[profile.dev]
+debug = 1
