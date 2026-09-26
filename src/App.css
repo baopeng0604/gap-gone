@@ -443,6 +443,17 @@
   gap: 0.5rem;
 }
 
+/* 设置页里的滑条（切片过渡时长）：占满剩余宽度，跟着面板的强调色 */
+.setup-range {
+  flex: 1;
+  max-width: 16rem;
+  accent-color: #64b5f6;
+}
+
+.setup-range:disabled {
+  opacity: 0.45;
+}
+
 .setup-grow input[type="text"] {
   flex: 1;
   min-width: 0;
@@ -1268,16 +1279,6 @@ button:disabled {
   object-fit: contain;
 }
 
-.video-variant {
-  min-height: 28px;
-  padding: 0.2rem 0.45rem;
-  border: 1px solid #444;
-  border-radius: 6px;
-  background: #2a2a2a;
-  color: #e0e0e0;
-  font-size: 0.8rem;
-}
-
 .video-subtitle-toggle {
   display: inline-flex;
   align-items: center;
@@ -1289,14 +1290,6 @@ button:disabled {
 
 .video-subtitle-toggle input {
   accent-color: #4caf50;
-}
-
-/* 档位旁的口径提示（缺 libx264 / 切点不在关键帧上 / 关键帧间隔过大） */
-.video-export-hint {
-  max-width: 22rem;
-  font-size: 0.75rem;
-  line-height: 1.25;
-  color: #d8b26a;
 }
 
 .ffmpeg-guide {

@@ -24,6 +24,10 @@ export const SETTINGS_KEYS = {
   modelDir: "gap-gone-model-dir",
   // 用户手动指定的 ffmpeg 路径（视频导入/导出依赖系统 ffmpeg）
   ffmpegPath: "gap-gone-ffmpeg-path",
+  // 视频导出档位（长期偏好；实际导出时素材不满足条件会自动降级并在导出前提示）
+  videoVariant: "gap-gone-video-variant",
+  // 视频切片过渡时长（秒，0 = 硬切；只在「精确编码」档生效）
+  videoTransition: "gap-gone-video-transition",
 } as const;
 
 export type ExportFormat = "mp3" | "wav";
@@ -180,11 +184,77 @@ export function setLufsTarget(target: number) {
   writeString(SETTINGS_KEYS.lufsTarget, String(Math.round(clamped * 10) / 10));
 }
 
-/** 用户手动指定的 ffmpeg 路径（空串 = 未指定，走自动探测）。 */
+/**
+ * ffmpeg 可执行文件在 Windows 上的默认路径。
+ *
+ * 为什么给一个具体路径当默认值：系统 PATH 里排在前面的常是某个应用自带的精简构建
+ * （实测 Krita 那份既没有 libx264 也没有 xfade），自动探测挑中它之后，「精确编码」
+ * 与「切片过渡」会莫名不可用，用户按提示重装 ffmpeg 也查不出原因。这里默认指向一份
+ * 完整构建（LosslessCut 自带，实测含 libx264 + xfade）。**该文件不存在时
+ * detect_ffmpeg 会回落到自动探测**（见 App.tsx 的 resolveFfmpeg），换台机器不会卡住。
+ */
+export const DEFAULT_FFMPEG_PATH =
+  "D:\\ProgramData\\LosslessCut-win-x64\\resources\\ffmpeg.exe";
+
+/** 用户指定的 ffmpeg 路径；未指定时 Windows 返回默认值，其他平台返回空串（走自动探测）。 */
 export function getFfmpegPath(): string {
-  return readString(SETTINGS_KEYS.ffmpegPath) ?? "";
+  const stored = readString(SETTINGS_KEYS.ffmpegPath);
+  if (stored) return stored;
+  return navigator.userAgent.includes("Windows") ? DEFAULT_FFMPEG_PATH : "";
 }
 
 export function setFfmpegPath(path: string) {
   writeString(SETTINGS_KEYS.ffmpegPath, path || null);
+}
+
+/** 视频导出档位：fastcopy（无损快切，不重编码）/ reencode（精确编码，逐帧切）。 */
+export type VideoExportVariant = "fastcopy" | "reencode";
+
+/**
+ * 视频导出档位（默认 fastcopy）。**它只是长期偏好**：素材不满足快速档条件时
+ * （HEVC / 含 B 帧 / 带旋转 / 已处理过音频 / 切点无法安全吸附），导出会自动降级为
+ * reencode 并在导出前说明原因 —— 所以不要在设置页里把它当成"本次一定这么走"。
+ */
+export function getVideoVariant(): VideoExportVariant {
+  return readString(SETTINGS_KEYS.videoVariant) === "reencode"
+    ? "reencode"
+    : "fastcopy";
+}
+
+export function setVideoVariant(variant: VideoExportVariant) {
+  writeString(SETTINGS_KEYS.videoVariant, variant);
+}
+
+/**
+ * 视频切片过渡时长（秒）。**0 = 硬切**，默认 0.3。
+ *
+ * 0.3 秒是"消隐跳切"的常用值：剪辑软件的转场默认时长普遍是 1 秒（Premiere 的 30 帧、
+ * DaVinci 与 Final Cut 的 Standard Duration），短视频工具的转场默认 0.5 秒，但那些是给
+ * 镜头切换用的；隐藏跳切要短得多（业内实操多在 0.1~0.3 秒），再长就不像在藏剪辑点、
+ * 而像刻意加了个转场，且音频是同步交叉淡化，越长越多字会被叠在一起。
+ */
+export const VIDEO_TRANSITION_DEFAULT = 0.3;
+/** 可调区间（秒）与步进。0 表示硬切。 */
+export const VIDEO_TRANSITION_RANGE = { min: 0, max: 1, step: 0.1 } as const;
+
+export function getVideoTransition(): number {
+  const raw = readString(SETTINGS_KEYS.videoTransition);
+  if (raw === null) return VIDEO_TRANSITION_DEFAULT;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return VIDEO_TRANSITION_DEFAULT;
+  if (
+    value < VIDEO_TRANSITION_RANGE.min ||
+    value > VIDEO_TRANSITION_RANGE.max
+  ) {
+    return VIDEO_TRANSITION_DEFAULT;
+  }
+  return Math.round(value * 10) / 10;
+}
+
+export function setVideoTransition(seconds: number) {
+  const clamped = Math.max(
+    VIDEO_TRANSITION_RANGE.min,
+    Math.min(VIDEO_TRANSITION_RANGE.max, seconds),
+  );
+  writeString(SETTINGS_KEYS.videoTransition, String(Math.round(clamped * 10) / 10));
 }

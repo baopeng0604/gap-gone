@@ -36,6 +36,8 @@ import {
   getSilencePreset,
   getSilenceThreshold,
   getTranscriptVisible,
+  getVideoTransition,
+  getVideoVariant,
   LUFS_TARGET_PRESETS,
   LUFS_TARGET_RANGE,
   setCompressionPreset as persistCompressionPreset,
@@ -47,8 +49,12 @@ import {
   setSilencePreset as persistSilencePreset,
   setSilenceThreshold as persistSilenceThreshold,
   setTranscriptVisible as persistTranscriptVisible,
+  setVideoTransition as persistVideoTransition,
+  setVideoVariant as persistVideoVariant,
+  VIDEO_TRANSITION_RANGE,
   type ExportBitrate,
   type ExportFormat,
+  type VideoExportVariant,
 } from "./utils/settings";
 import { formatTimeStandard } from "./utils/timeUtils";
 import {
@@ -128,6 +134,10 @@ interface SetupSnapshot {
   lufsTarget: number;
   exportFormat: ExportFormat;
   exportBitrate: ExportBitrate;
+  videoVariant: VideoExportVariant;
+  videoTransition: number;
+  /** 设置页「ffmpeg 路径」输入框当时的值（含 Windows 默认值）。 */
+  ffmpegPath: string;
 }
 
 const silencePresetLabels: Record<SilencePreset, string> = {
@@ -143,6 +153,8 @@ interface FfmpegInfo {
   version: string | null;
   /** 该构建是否带 libx264：决定「精确重编码」档能不能用。 */
   hasLibx264: boolean;
+  /** 该构建是否带 xfade 滤镜：决定「切片过渡」能不能用（精简构建可能没有）。 */
+  hasXfade: boolean;
 }
 
 /** probe_video 的返回（ffprobe JSON 提炼）。 */
@@ -159,6 +171,8 @@ interface VideoProbe {
   rotated: boolean;
   /** 画面是否含 B 帧：含则禁用「无损快速」（输出侧 seek 会整段丢掉第一个 GOP）。 */
   hasBFrames: boolean;
+  /** 源视频帧率的分数串（ffprobe r_frame_rate，如 "30/1"）：过渡按帧取整要用。 */
+  fps: string;
   /** 关键帧时间戳（秒，升序，ffprobe 原始精度）。无损快速档只能从关键帧起切。 */
   keyframes: number[];
 }
@@ -179,18 +193,35 @@ interface VideoAsset {
   rotated: boolean;
   /** 是否含 B 帧，含则只能走精确重编码（原因见 VideoProbe.hasBFrames）。 */
   hasBFrames: boolean;
+  /** 源视频帧率的分数串（ffprobe r_frame_rate），切片过渡按帧取整与 xfade 都要用。 */
+  fps: string;
   /** 关键帧时间戳（秒，升序），无损快速档的吸附基准。 */
   keyframes: number[];
 }
 
-/** 视频导出编码档位：fastcopy（默认，不重编码，快）/ reencode（帧精确，慢）。 */
-type VideoExportVariant = "fastcopy" | "reencode";
+/**
+ * 无损快速档的切点吸附：往 1 ms 的让位等细节见 fastcopyPlan；
+ * 档位类型 VideoExportVariant 来自 settings.ts（它是持久化的用户偏好）。
+ */
 
 /**
  * 吸附后的起点再往回让 1 ms。关键帧时间戳是 6 位小数（如 16.666667，真值 16.6666666…），
  * 直接拿它当 `-ss`，一旦被四舍五入抬高就会越过关键帧 —— 输出侧 seek 会因此丢掉整段画面。
  */
 const FASTCOPY_SEEK_EPSILON = 0.001;
+/**
+ * 短于一帧的过渡没有意义（30 fps 下 0.034 秒 ≈ 1 帧），按硬切处理。
+ * 与 Rust 的 `MIN_FRAME_SECONDS` 同一个值，改一处要改两处。
+ */
+const MIN_TRANSITION_SECONDS = 0.034;
+
+/** ffprobe 的 r_frame_rate 是分数串（"30/1"、"30000/1001"），换算成每秒帧数。 */
+function parseFrameRate(rate: string): number {
+  const [numerator, denominator] = rate.split("/").map(Number);
+  if (!Number.isFinite(numerator)) return 0;
+  if (!Number.isFinite(denominator) || denominator <= 0) return numerator || 0;
+  return numerator / denominator;
+}
 
 function lastKeyframeAtOrBefore(keyframes: number[], time: number): number {
   let result = 0;
@@ -546,6 +577,10 @@ function App() {
   const [videoAsset, setVideoAsset] = useState<VideoAsset | null>(null);
   const [ffmpegInfo, setFfmpegInfo] = useState<FfmpegInfo | null>(null);
   const [ffmpegGuideOpen, setFfmpegGuideOpen] = useState(false);
+  /** 设置页「ffmpeg 路径」输入框（即时生效：失焦/回车/选文件后立刻重探）。 */
+  const [ffmpegPathInput, setFfmpegPathInput] = useState<string>(() =>
+    getFfmpegPath(),
+  );
   /** 导入阶段：extract = ffmpeg 抽音轨（有百分比），decode = 前端解析进缓冲。 */
   const [videoImportStage, setVideoImportStage] = useState<
     "extract" | "decode" | null
@@ -553,9 +588,14 @@ function App() {
   const [videoImportProgress, setVideoImportProgress] = useState<number | null>(
     null,
   );
-  // 导出档位与「是否顺带写一份字幕」是会话内选择，不落盘（和播放速度同一类参数）。
-  const [videoExportVariant, setVideoExportVariant] =
-    useState<VideoExportVariant>("fastcopy");
+  // 视频导出档位与切片过渡时长是**持久化偏好**（在设置页里改，跨启动保留），
+  // 「是否顺带写一份字幕」仍是会话内选择。
+  const [videoExportVariant, setVideoVariantState] = useState<VideoExportVariant>(
+    () => getVideoVariant(),
+  );
+  const [videoTransition, setVideoTransitionState] = useState<number>(() =>
+    getVideoTransition(),
+  );
   const [videoExportProgress, setVideoExportProgress] = useState<number | null>(
     null,
   );
@@ -836,6 +876,9 @@ function App() {
       lufsTarget: lufsTargetDb,
       exportFormat,
       exportBitrate,
+      videoVariant: videoExportVariant,
+      videoTransition,
+      ffmpegPath: getFfmpegPath(),
     };
     if (isTauriDesktop()) {
       // 当前生效的模型目录存在后端，异步取回来补齐快照（没取到就别回退它）
@@ -1404,7 +1447,6 @@ function App() {
     };
   }, [videoAsset, audioBuffer, deletedRegions]);
 
-  const ffmpegHasLibx264 = ffmpegInfo?.hasLibx264 ?? false;
   /**
    * 无损快速档的适用条件：
    * - 整段保留（没有剪切）→ 只是重新封装，任何编码都安全；
@@ -1446,6 +1488,41 @@ function App() {
     return null;
   }, [videoExportVariant, fastcopyAvailable, audioProcessed, fastcopyPlan, videoAsset]);
 
+  /**
+   * 逐接缝的过渡时长（秒，长度 = 保留区间数 − 1；0 = 硬切）。这是导出与字幕换算的
+   * **唯一来源**，Rust 侧只做兜底钳制、不再自己推导。三条规则：
+   * - **只在「精确编码」档生效**：无损快切是 `-c:v copy`，画面根本没解码，做不了溶解；
+   * - **按帧取整**（0.3 秒 @30fps = 9 帧）：xfade 与 concat 都按帧走，不取整会攒出
+   *   ±1 帧 × 接缝数的偏差，把字幕推歪；
+   * - **短段保护**：每处接缝最多取相邻两段各一半，否则会把短的那段吃光。
+   */
+  const transitionPlan = useMemo(() => {
+    const kept = fastcopyPlan?.kept ?? [];
+    if (
+      effectiveVariant !== "reencode" ||
+      videoTransition <= 0 ||
+      kept.length < 2 ||
+      // 没有 xfade 就做不了溶解（精简构建可能缺失），这里直接退成硬切，
+      // 导出前的提示会把原因说明白，而不是让导出跑到一半报 Filter not found。
+      !ffmpegInfo?.hasXfade
+    ) {
+      return [] as number[];
+    }
+    const fps = videoAsset ? parseFrameRate(videoAsset.fps) : 0;
+    return kept.slice(0, -1).map((region, index) => {
+      const next = kept[index + 1];
+      const limit = Math.min(
+        (region.end - region.start) / 2,
+        (next.end - next.start) / 2,
+      );
+      const seconds = Math.min(videoTransition, limit);
+      if (seconds < MIN_TRANSITION_SECONDS) return 0;
+      return fps > 0
+        ? Math.round(seconds * fps) / fps
+        : Math.round(seconds * 1000) / 1000;
+    });
+  }, [effectiveVariant, videoTransition, fastcopyPlan, videoAsset, ffmpegInfo]);
+
   /** 收回 asset 协议的单个文件放行。 */
   const releaseVideoAsset = useCallback((path: string | null) => {
     if (!path) return;
@@ -1459,24 +1536,35 @@ function App() {
     setVideoAsset(null);
   }, [releaseVideoAsset]);
 
-  /** 解析可用的 ffmpeg 路径；未安装时打开引导弹框并返回 null。 */
-  const resolveFfmpeg = useCallback(async (): Promise<string | null> => {
-    if (!isTauriDesktop()) return null;
-    const custom = getFfmpegPath();
-    let info = await invoke<FfmpegInfo>("detect_ffmpeg", {
-      customPath: custom || null,
-    });
-    if (!info.found && custom) {
-      // 手动指定的路径失效（升级 / 移动后），回退自动探测
-      info = await invoke<FfmpegInfo>("detect_ffmpeg", { customPath: null });
-    }
-    setFfmpegInfo(info);
-    if (!info.found || !info.path) {
-      setFfmpegGuideOpen(true);
-      return null;
-    }
-    return info.path;
-  }, []);
+  /**
+   * 解析可用的 ffmpeg 路径。showGuide 为 true 时（用户主动打开视频）未找到就弹出
+   * 引导弹框；启动时的那次静默探测传 false，只把结果填进设置页的状态行。
+   */
+  const resolveFfmpeg = useCallback(
+    async (showGuide = true): Promise<string | null> => {
+      if (!isTauriDesktop()) return null;
+      const custom = getFfmpegPath();
+      let info = await invoke<FfmpegInfo>("detect_ffmpeg", {
+        customPath: custom || null,
+      });
+      if (!info.found && custom) {
+        // 指定路径失效（换机器 / 升级后移动），回退自动探测，别卡住视频功能
+        info = await invoke<FfmpegInfo>("detect_ffmpeg", { customPath: null });
+      }
+      setFfmpegInfo(info);
+      if (!info.found || !info.path) {
+        if (showGuide) setFfmpegGuideOpen(true);
+        return null;
+      }
+      return info.path;
+    },
+    [],
+  );
+
+  // 启动时静默探一次：设置页的「ffmpeg 路径」行不必等用户打开视频才有状态。
+  useEffect(() => {
+    void resolveFfmpeg(false);
+  }, [resolveFfmpeg]);
 
   const recheckFfmpeg = useCallback(async () => {
     const ffmpeg = await resolveFfmpeg();
@@ -1485,6 +1573,26 @@ function App() {
       notify("ffmpeg 已就绪，可以打开视频了");
     }
   }, [resolveFfmpeg, notify]);
+
+  /**
+   * 应用设置页里填的 ffmpeg 路径：写盘 + 重新探测一次并回报结果。
+   * 传空串 = 清空输入（Windows 回落到默认值，其他平台回到自动探测）；
+   * 走 resolveFfmpeg 是为了复用「指定路径失效则回退自动探测」这条逻辑。
+   */
+  const applyFfmpegPath = useCallback(
+    async (path: string) => {
+      persistFfmpegPath(path);
+      setFfmpegPathInput(path || getFfmpegPath());
+      const resolved = await resolveFfmpeg(false);
+      if (resolved) {
+        setFfmpegGuideOpen(false);
+        notify(`ffmpeg 已就绪：${resolved}`);
+      } else {
+        notify("该路径无法运行 ffmpeg，请确认选的是 ffmpeg 可执行文件", "error");
+      }
+    },
+    [notify, resolveFfmpeg],
+  );
 
   const pickFfmpegPath = useCallback(async () => {
     const picked = await openDialog({
@@ -1496,16 +1604,8 @@ function App() {
     });
     const path = typeof picked === "string" ? picked : null;
     if (!path) return;
-    const info = await invoke<FfmpegInfo>("detect_ffmpeg", { customPath: path });
-    if (info.found) {
-      persistFfmpegPath(path);
-      setFfmpegInfo(info);
-      setFfmpegGuideOpen(false);
-      notify("ffmpeg 已就绪，可以打开视频了");
-    } else {
-      notify("该路径无法运行 ffmpeg，请确认选择的是 ffmpeg 可执行文件", "error");
-    }
-  }, [notify]);
+    await applyFfmpegPath(path);
+  }, [applyFfmpegPath]);
 
   /**
    * 打开视频：dialog 拿路径（不走 <input type=file>，大文件不进内存）→
@@ -1581,6 +1681,7 @@ function App() {
         channels: probe.channels,
         rotated: probe.rotated ?? false,
         hasBFrames: probe.hasBFrames ?? false,
+        fps: probe.fps ?? "30/1",
         keyframes: probe.keyframes ?? [0],
       });
       notify(
@@ -1629,7 +1730,30 @@ function App() {
       return;
     }
     if (fastcopyFallbackReason) {
-      notify(`本次改用「精确重编码」：${fastcopyFallbackReason}`);
+      notify(
+        transitionPlan.some((value) => value > 0)
+          ? `本次改用「精确重编码」：${fastcopyFallbackReason}（接缝会做过渡）`
+          : `本次改用「精确重编码」：${fastcopyFallbackReason}`,
+      );
+    } else if (effectiveVariant === "reencode" && transitionPlan.some((value) => value > 0)) {
+      notify("本次用「精确重编码」，接缝会做交叉溶解");
+    }
+    // 短段保护生效时如实说一声：这类接缝的过渡比设置值短（或直接退回硬切）
+    const shortenedJoins = transitionPlan.filter(
+      (value) => value > 0 && value < videoTransition - 0.001,
+    ).length;
+    if (shortenedJoins > 0) {
+      notify(`有 ${shortenedJoins} 处接缝因相邻片段过短，过渡时长已自动缩短`);
+    }
+    // 设了过渡时长但这份 ffmpeg 做不了溶解：明确说明本次按硬切走，别让人以为已经生效
+    if (
+      videoTransition > 0 &&
+      effectiveVariant === "reencode" &&
+      ffmpegInfo &&
+      !ffmpegInfo.hasXfade &&
+      deletedRegions.length > 0
+    ) {
+      notify("当前 ffmpeg 不带 xfade 滤镜，本次按硬切导出（可在设置里指定另一份 ffmpeg）");
     }
     const outputPath = await saveDialog({
       defaultPath: createExportFileName(
@@ -1657,16 +1781,22 @@ function App() {
       }
       if (exportSubtitles && transcript) {
         // 转录时间码在源时间轴上，成片已跳过切除区间，必须重映射到成片时间轴。
-        // 无损快速档的成片时间轴以「吸附后的保留区间」为准（每段多留一小截），
-        // 不按它换算的话字幕会随每个吸附点累积错位。
+        // - 无损快切档的成片时间轴以「吸附后的保留区间」为准（每段多留一小截）；
+        // - 精确编码档若有过渡，每个接缝还会让成片短 t 秒（重叠式交叉溶解）。
+        // 不按实际成片时间轴换算的话，字幕会随吸附点/过渡点累积错位。
         const keptForSubtitles =
           effectiveVariant === "fastcopy" ? fastcopyPlan?.snapped : undefined;
+        const transitionsForSubtitles =
+          effectiveVariant === "reencode" && transitionPlan.length
+            ? transitionPlan
+            : undefined;
         const cues = transcript.segments.flatMap((segment) =>
           mapRangeToKept(
             segment,
             deletedRegions,
             audioBuffer.duration,
             keptForSubtitles,
+            transitionsForSubtitles,
           ).map(
             (piece) => ({ start: piece.start, end: piece.end, text: segment.text }),
           ),
@@ -1702,16 +1832,27 @@ function App() {
         audioPath,
         subtitlesPath: subtitlePath,
         regionsJson,
+        transitionsJson: JSON.stringify(transitionPlan),
+        fps: videoAsset.fps,
         outputPath,
         variant: effectiveVariant,
         totalDuration: audioBuffer.duration,
         sourceBitrate: videoAsset.audioBitrate,
         sourceChannels: videoAsset.channels,
       });
+      const appliedTransitions = transitionPlan.filter((value) => value > 0);
+      const transitionNote = appliedTransitions.length
+        ? `（精确编码：${appliedTransitions.length} 处交叉溶解，成片比硬切短 ${appliedTransitions.reduce((sum, value) => sum + value, 0).toFixed(1)} 秒）`
+        : "";
+      // 无损快切档的代价也要如实说：切点吸附到关键帧等于少删了一小截静音
+      const snapNote =
+        fastcopyPlan && !fastcopyPlan.fullCover && fastcopyPlan.maxShift > 0.02
+          ? `，切点吸附到关键帧（最多少删 ${fastcopyPlan.maxShift.toFixed(1)} 秒静音）`
+          : "";
       notify(
         effectiveVariant === "fastcopy"
-          ? `视频导出成功${subtitlePath ? "，字幕已写到视频旁边" : ""}（无损快速：画面未重编码）`
-          : `视频导出成功${subtitlePath ? "，字幕已写到视频旁边" : ""}`,
+          ? `视频导出成功${subtitlePath ? "，字幕已写到视频旁边" : ""}（无损快切：画面未重编码${snapNote}）`
+          : `视频导出成功${subtitlePath ? "，字幕已写到视频旁边" : ""}${transitionNote}`,
       );
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
@@ -1742,6 +1883,8 @@ function App() {
     exportSubtitles,
     videoExportVariant,
     effectiveVariant,
+    transitionPlan,
+    videoTransition,
     fastcopyPlan,
     fastcopyFallbackReason,
     ffmpegInfo,
@@ -2396,6 +2539,16 @@ function App() {
     setExportFormat(snapshot.exportFormat);
     setExportBitrateState(snapshot.exportBitrate);
     setExportBitrate(snapshot.exportBitrate);
+    setVideoVariantState(snapshot.videoVariant);
+    persistVideoVariant(snapshot.videoVariant);
+    setVideoTransitionState(snapshot.videoTransition);
+    persistVideoTransition(snapshot.videoTransition);
+    // ffmpeg 路径也回退并静默重探一次（不弹引导框、不发提示，本函数末尾统一提示）
+    if (isTauriDesktop() && snapshot.ffmpegPath !== getFfmpegPath()) {
+      persistFfmpegPath(snapshot.ffmpegPath);
+      setFfmpegPathInput(snapshot.ffmpegPath);
+      void resolveFfmpeg(false);
+    }
     // 模型目录从后端读，快照可能还没补上：没取到就别回退，免得把自定义目录冲成默认
     if (isTauriDesktop() && snapshot.modelDir !== undefined) {
       setModelDirInput(snapshot.modelDir ?? "");
@@ -2718,52 +2871,6 @@ function App() {
         <span className="toolbar-divider" aria-hidden="true" />
         <div className="toolbar-group" aria-label="输出和帮助">
           {videoAsset && (
-            <>
-              <select
-                className="video-variant"
-                value={videoExportVariant}
-                onChange={(event) =>
-                  setVideoExportVariant(event.target.value as VideoExportVariant)
-                }
-                disabled={videoExportProgress !== null}
-                aria-label="视频导出档位"
-                title="无损快速：画面不重编码，秒级完成，但只能从关键帧起切；精确重编码：切点精确到帧，慢且有损，需要 ffmpeg 带 libx264"
-              >
-                <option value="fastcopy" disabled={!fastcopyAvailable}>
-                  视频：无损快速{fastcopyAvailable ? "" : "（本次不可用）"}
-                </option>
-                <option value="reencode" disabled={!ffmpegHasLibx264}>
-                  视频：精确重编码{ffmpegHasLibx264 ? "" : "（缺 libx264）"}
-                </option>
-              </select>
-              {ffmpegInfo && !ffmpegInfo.hasLibx264 && (
-                <>
-                  <span className="video-export-hint">
-                    当前 ffmpeg 不带 libx264，精确重编码不可用
-                  </span>
-                  <button onClick={() => setFfmpegGuideOpen(true)}>
-                    指定 ffmpeg
-                  </button>
-                </>
-              )}
-              {fastcopyFallbackReason && (
-                <span className="video-export-hint">
-                  无损快速不可用：{fastcopyFallbackReason}
-                </span>
-              )}
-              {fastcopyAvailable && fastcopyPlan && !fastcopyPlan.fullCover && (
-                <span className="video-export-hint">
-                  {fastcopyPlan.maxShift > 0.02
-                    ? `切点吸附到关键帧，最多少删 ${fastcopyPlan.maxShift.toFixed(1)} 秒（残留静音，不会吃掉人声）`
-                    : "切点正好落在关键帧上"}
-                  {fastcopyPlan.keyframeInterval > 1.5
-                    ? `；该素材关键帧间隔约 ${fastcopyPlan.keyframeInterval.toFixed(1)} 秒`
-                    : ""}
-                </span>
-              )}
-            </>
-          )}
-          {videoAsset && (
             <label
               className="video-subtitle-toggle"
               title="把转录结果按成片时间轴重映射后，与视频一起导出为同名 .srt（需要先转录）"
@@ -3080,6 +3187,122 @@ function App() {
               ))}
             </div>
           )}
+          {isTauriDesktop() && (
+            <>
+              <div className="setup-row">
+                <label className="setup-grow">
+                  ffmpeg 路径
+                  <input
+                    type="text"
+                    value={ffmpegPathInput}
+                    placeholder="留空则自动探测系统 PATH"
+                    onChange={(event) => setFfmpegPathInput(event.target.value)}
+                    onBlur={() => {
+                      const value = ffmpegPathInput.trim();
+                      if (value !== getFfmpegPath()) void applyFfmpegPath(value);
+                    }}
+                  />
+                </label>
+                <button
+                  onClick={() => void pickFfmpegPath()}
+                  title="选择一个 ffmpeg 可执行文件"
+                >
+                  选择…
+                </button>
+              </div>
+              <div className="setup-row">
+                <small>
+                  {!ffmpegInfo
+                    ? "检测中…"
+                    : !ffmpegInfo.found
+                      ? "未找到可运行的 ffmpeg：视频导入与导出不可用（填的路径不存在时会回退自动探测）"
+                      : `${ffmpegInfo.version ?? "ffmpeg"}｜${
+                          ffmpegInfo.hasLibx264
+                            ? "含 libx264"
+                            : "不含 libx264，精确编码不可用"
+                        }｜${
+                          ffmpegInfo.hasXfade
+                            ? "含 xfade，可用切片过渡"
+                            : "不含 xfade，切片过渡不可用"
+                        }`}
+                </small>
+              </div>
+            </>
+          )}
+          {videoAsset && (
+            <>
+              <div className="setup-row">
+                <label className="setup-checkbox">视频导出档位</label>
+                <label className="setup-checkbox">
+                  <input
+                    type="radio"
+                    name="video-variant"
+                    checked={videoExportVariant === "fastcopy"}
+                    onChange={() => {
+                      setVideoVariantState("fastcopy");
+                      persistVideoVariant("fastcopy");
+                    }}
+                  />
+                  无损快切（默认）
+                </label>
+                <label className="setup-checkbox">
+                  <input
+                    type="radio"
+                    name="video-variant"
+                    checked={videoExportVariant === "reencode"}
+                    onChange={() => {
+                      setVideoVariantState("reencode");
+                      persistVideoVariant("reencode");
+                    }}
+                  />
+                  精确编码
+                </label>
+              </div>
+              <div className="setup-row">
+                <label className="setup-checkbox">切片过渡</label>
+                <input
+                  type="range"
+                  className="setup-range"
+                  min={VIDEO_TRANSITION_RANGE.min}
+                  max={VIDEO_TRANSITION_RANGE.max}
+                  step={VIDEO_TRANSITION_RANGE.step}
+                  value={videoTransition}
+                  disabled={
+                    videoExportVariant !== "reencode" || !ffmpegInfo?.hasXfade
+                  }
+                  onChange={(event) => {
+                    const value = Number(event.target.value);
+                    setVideoTransitionState(value);
+                    persistVideoTransition(value);
+                  }}
+                  aria-label="切片过渡时长"
+                />
+                <small>
+                  {videoTransition === 0 ? "硬切" : `${videoTransition.toFixed(1)} 秒`}
+                </small>
+              </div>
+              <div className="setup-row">
+                <small>
+                  {videoExportVariant !== "reencode"
+                    ? "「无损快切」不重编码画面，做不了交叉溶解 —— 切到「精确编码」后上面这项才生效。"
+                    : videoTransition === 0
+                      ? "接缝处硬切（当前设置）。"
+                      : `接缝处做 ${videoTransition.toFixed(1)} 秒交叉溶解（画面与声音一起淡化），成片会比硬切短 ${videoTransition.toFixed(1)} 秒 × 接缝数。0.1~0.3 秒用于隐藏跳切，再长会像刻意的镜头转场。`}
+                  {" 过渡只在导出时应用，预览仍是硬切。"}
+                </small>
+              </div>
+              {ffmpegInfo &&
+                (!ffmpegInfo.hasLibx264 || !ffmpegInfo.hasXfade) && (
+                  <div className="setup-row">
+                    <small>
+                      {!ffmpegInfo.hasLibx264
+                        ? "当前 ffmpeg 不带 libx264，「精确编码」不可用 —— 在上面填一份完整构建的路径"
+                        : "当前 ffmpeg 不带 xfade 滤镜，「切片过渡」不可用（导出会按硬切）—— 在上面填一份完整构建的路径"}
+                    </small>
+                  </div>
+                )}
+            </>
+          )}
           <div className="setup-row">
             <small>录音格式：48 kHz / mono / PCM WAV</small>
           </div>
@@ -3279,23 +3502,25 @@ function App() {
           </p>
           <div className="setup-row">
             <button onClick={() => void recheckFfmpeg()}>重新检测</button>
-            <button onClick={() => void pickFfmpegPath()}>
-              手动指定 ffmpeg 路径
-            </button>
             <button onClick={() => setFfmpegGuideOpen(false)}>关闭</button>
           </div>
           {ffmpegInfo?.path && (
             <div className="setup-row">
               <small>
-                {ffmpegInfo.version ?? "ffmpeg"}
+                当前：{ffmpegInfo.version ?? "ffmpeg"}
                 ｜
                 {ffmpegInfo.hasLibx264
                   ? "包含 libx264，可用精确重编码"
-                  : "不含 libx264，精确重编码不可用，请指定一份完整构建"}
-                ｜{ffmpegInfo.path}
+                  : "不含 libx264，精确重编码不可用"}
+                ｜{ffmpegInfo.hasXfade ? "含 xfade，可用切片过渡" : "不含 xfade，切片过渡不可用"}
               </small>
             </div>
           )}
+          <div className="setup-row">
+            <small>
+              要指定某一份 ffmpeg，请在设置页的「ffmpeg 路径」里填或选（应用不内置 ffmpeg）。
+            </small>
+          </div>
         </section>
       )}
 

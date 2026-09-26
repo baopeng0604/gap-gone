@@ -121,25 +121,50 @@ export function nextPlayableTime(
  *
  * `keptOverride` 用于**无损快速档**：那一档会把每段起点吸附到关键帧上（成片比「精确
  * 删除」多留一小截），成片时间轴必须以吸附后的区间为基准，否则字幕会随每个吸附点累积错位。
+ *
+ * `transitions` 用于**精确编码档的切片过渡**：每个接缝 t 秒是从相邻两段的边界各取 t
+ * 混合而成（重叠式交叉溶解），所以每段在成片里只剩「主体」、且成片整体比硬切短 Σt。
+ * 不传（或传全 0）时行为与硬切完全一致。
  */
 export function mapRangeToKept(
   range: Region,
   deletedRegions: Region[],
   duration: number,
   keptOverride?: Region[],
+  transitions?: number[],
 ): Region[] {
+  const kept = keptOverride ?? getKeptRegions(deletedRegions, duration);
   const result: Region[] = [];
   let offset = 0;
-  for (const kept of keptOverride ?? getKeptRegions(deletedRegions, duration)) {
-    const start = Math.max(kept.start, range.start);
-    const end = Math.min(kept.end, range.end);
+  for (let index = 0; index < kept.length; index += 1) {
+    const region = kept[index];
+    // 本段头部被上一个接缝取走 t_{i-1}、尾部被本接缝取走 t_i，只剩中间的「主体」
+    const headTrim = index > 0 ? transitions?.[index - 1] ?? 0 : 0;
+    const tailTrim = index < kept.length - 1 ? transitions?.[index] ?? 0 : 0;
+    const bodyStart = region.start + headTrim;
+    const bodyEnd = Math.max(bodyStart, region.end - tailTrim);
+    const start = Math.max(bodyStart, range.start);
+    const end = Math.min(bodyEnd, range.end);
     if (end > start) {
-      result.push({
-        start: offset + (start - kept.start),
-        end: offset + (end - kept.start),
-      });
+      // 字幕伸进被裁掉的那两截时，映射结果也要跟着扩到过渡段上：那部分内容是在
+      // 过渡里播出去的（混合画面），字幕盖住它才不会在溶解时闪一下。
+      const extendedStart = range.start < bodyStart ? start - headTrim : start;
+      const extendedEnd = range.end > bodyEnd ? end + tailTrim : end;
+      const piece = {
+        start: offset + (extendedStart - bodyStart),
+        end: offset + (extendedEnd - bodyStart),
+      };
+      // 横跨接缝的字幕会被切成两段，中间隔着 t 秒的过渡段 —— 那是同一句话，
+      // 合并起来让它盖住过渡，而不是在溶解时闪一下。
+      const previous = result[result.length - 1];
+      if (previous && piece.start - previous.end <= tailTrim + 0.001) {
+        previous.end = piece.end;
+      } else {
+        result.push(piece);
+      }
     }
-    offset += kept.end - kept.start;
+    // 主体 + 紧随其后的过渡段都占据成片时间轴
+    offset += bodyEnd - bodyStart + tailTrim;
   }
   return result;
 }

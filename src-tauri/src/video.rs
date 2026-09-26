@@ -16,6 +16,16 @@
 //    pre-roll 一起拼进去，产出时间轴重叠的垃圾。切点吸附本身由前端按关键帧列表算好再传进来。
 // 3. 抽音轨必须写 32-bit float WAV：口播有效电平常在 −30 dBFS，16-bit 下底噪那段只剩个位数
 //    bit，而降噪模型的抑制决策正依赖对底噪的准确估计（见 AGENTS.md 硬约束 3）。
+// 4. **切片过渡（精确编码档）也走「逐段 + concat」**：每个接缝单独产一段交叉溶解
+//    （前段主体尾 t 秒 与 后段主体头 t 秒，画面 `xfade`，输出 t 秒），与普通段一起交给
+//    concat。这与「对整段跑一次 xfade(offset = 前段时长 − t)」等价，但复用了同一条链路。
+//    三个必须记住的点：① 过渡段要**显式给 `fps=<源帧率>`**，xfade 不收帧率未知的输入
+//    （报 `current rate of 1/0 is invalid`）；② 编码参数必须与普通段**逐项一致**
+//    （libx264 veryfast crf 20 yuv420p + aac 同码率），否则 concat 拼不上；
+//    ③ **音频不要用 `acrossfade`** —— 它在 0.3 秒级的短窗口上偶发一帧都不输出，下游 aac
+//    报 `Could not open encoder before EOF` 整次导出失败（改用 `concat` 硬拼接两段 d/2
+//    窗口 + 两端 5 ms 微淡）。滤镜参数还要用具名写法（`settb=tb=` 等），位置写法只有
+//    ffmpeg 7.0+ 认。重叠式溶解会让成片比硬切**短 Σt**，前端据此重映射字幕。
 
 use std::{
     io::{BufRead, BufReader, Read},
@@ -69,6 +79,9 @@ pub(crate) struct FfmpegInfo {
     /// 系统里常有多份 ffmpeg（应用自带的精简构建），带不带它决定能不能重编码，
     /// 前端据此禁用/提示，不要等到导出时才报 Unknown encoder。
     has_libx264: bool,
+    /// 该构建是否带 `xfade` 滤镜（切片过渡的唯一依赖）。精简构建可能没有它，
+    /// 前端据此禁用「切片过渡」而不是等导出时报 `Filter not found`。
+    has_xfade: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -95,6 +108,11 @@ pub(crate) struct VideoProbe {
     /// 首包 pts=1.000；输入侧 seek 虽有完整帧，但带 pre-roll 的段经 concat demuxer 会报
     /// `non monotonically increasing dts`）。无 B 帧的流 dts=pts，一切正常。
     has_b_frames: bool,
+    /// 源视频帧率的原始分数串（ffprobe 的 `r_frame_rate`，如 "30/1"、"30000/1001"）。
+    /// 精确编码档做切片过渡时 `xfade` 要求显式帧率（不给会报
+    /// `The inputs needs to be a constant frame rate; current rate of 1/0 is invalid`），
+    /// 前端也用它把过渡时长换算成整数帧。
+    fps: String,
     /// 视频关键帧时间戳（秒，升序，保留 ffprobe 的原始精度）。
     /// 无损快速档只能在关键帧上切，前端用它算出吸附后的切点并如实告知偏移量。
     /// **不要四舍五入**：关键帧 16.666667 写成 16.667 就会让 seek 越过它、整段没有画面。
@@ -128,6 +146,89 @@ fn truncate(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// 保留**末尾**的截断。ffmpeg 的报错永远在最后几行，而 `Input #0 … Duration …` 这类
+/// 输入信息在最前面 —— 用 `truncate` 截头会让真正的错误整段丢掉（线上就是这么丢的：
+/// 用户看到的报错只有输入横幅，查不到原因）。
+fn truncate_tail(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let tail: String = trimmed
+        .chars()
+        .rev()
+        .take(max_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("…{tail}")
+}
+
+/// 统一的终端日志。`pnpm tauri dev` 的那个终端窗口是排查的第一现场：错误只 return 给前端时，
+/// 终端上一片安静，出问题只能靠界面里那行 toast（而 toast 只有 300 字符、还会被用户关掉）。
+/// 前缀统一成 `[gap-gone][阶段][级别]`，方便在混杂的输出里过滤。debug 构建带 console、
+/// release 不带（见 main.rs 的 `windows_subsystem`），所以这里不必按构建类型分叉。
+fn log_line(level: &str, stage: &str, message: &str) {
+    eprintln!("[gap-gone][{stage}][{level}] {message}");
+}
+
+/// 关键步骤的选路信息（选中了哪份 ffmpeg、按哪个档位导出）：**不是错误**，
+/// 但出问题时第一批要看的就是它。
+fn log_info(stage: &str, message: &str) {
+    log_line("info", stage, message);
+}
+
+fn log_error(stage: &str, message: &str) {
+    log_line("error", stage, message);
+}
+
+/// 「打日志 + 返回同一个错误」。命令里每个非 ffmpeg 的失败分支都走它，
+/// 免得漏掉某一条路径之后又出现「终端上什么都没有」。
+fn fail<T>(stage: &str, message: String) -> Result<T, String> {
+    log_error(stage, &message);
+    Err(message)
+}
+
+/// 「校验前端传来的临时文件路径 + 失败打日志」。
+/// 这条校验失败会直接否掉整次导出（例如权限/前缀不符），必须能在终端看到。
+fn validate_temp_path(stage: &str, path: &str) -> Result<PathBuf, String> {
+    validate_temp_recording_path(path).map_err(|error| {
+        log_error(stage, &error);
+        error
+    })
+}
+
+/// 把命令行还原成可直接复制粘贴重跑的一行 —— 这条命令能手工复现问题，
+/// 比任何转述都有用（关键帧/seek 那批坑都是这么定位的）。
+fn format_command(program: &str, args: &[String]) -> String {
+    let mut line = program.to_string();
+    for arg in args {
+        line.push(' ');
+        if arg.contains(' ') || arg.contains('"') {
+            line.push('"');
+            line.push_str(arg);
+            line.push('"');
+        } else {
+            line.push_str(arg);
+        }
+    }
+    line
+}
+
+/// ffmpeg/ffprobe 失败时的统一日志：命令 + stderr 末尾（不截断到 300 —— 那是给界面看的，
+/// 终端里给全一点，省得为了看报错再去翻临时文件）。
+fn log_command_failure(stage: &str, program: &str, args: &[String], stderr: &str) {
+    log_error(
+        stage,
+        &format!(
+            "命令失败：\n  {}\n  stderr 末尾：\n{}",
+            format_command(program, args),
+            truncate_tail(stderr, 2000)
+        ),
+    );
+}
+
 fn verify_ffmpeg(path: &Path) -> Option<String> {
     let output = ffmpeg_command(&path.to_string_lossy())
         .arg("-version")
@@ -157,6 +258,22 @@ fn has_encoder(path: &Path, name: &str) -> bool {
         return false;
     };
     String::from_utf8_lossy(&output.stdout).contains(name)
+}
+
+/// 该构建是否带指定滤镜。切片过渡依赖 `xfade`（交叉溶解）—— 实测有些精简构建
+/// （例如某编辑器自带的 6.1.1）连 `xfade` 都没有，选中它时过渡会在导出时才报
+/// `Filter not found`。和 libx264 一样提前探测，前端据此禁用过渡。
+fn has_filter(path: &Path, name: &str) -> bool {
+    let Ok(output) = ffmpeg_command(&path.to_string_lossy())
+        .args(["-hide_banner", "-filters"])
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.split_whitespace().any(|token| token == name))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -207,13 +324,20 @@ pub(crate) async fn detect_ffmpeg(custom_path: Option<String>) -> Result<FfmpegI
         if let Some(custom) = custom_path {
             let path = PathBuf::from(&custom);
             return match verify_ffmpeg(&path) {
-                Some(version) => FfmpegInfo {
-                    found: true,
-                    path: Some(custom),
-                    version: Some(version),
-                    has_libx264: has_encoder(&path, "libx264"),
-                },
-                None => not_found_ffmpeg(),
+                Some(version) => {
+                    log_info("ffmpeg", &format!("使用指定路径：{custom}（{version}）"));
+                    FfmpegInfo {
+                        found: true,
+                        path: Some(custom),
+                        version: Some(version),
+                        has_libx264: has_encoder(&path, "libx264"),
+                        has_xfade: has_filter(&path, "xfade"),
+                    }
+                }
+                None => {
+                    log_error("ffmpeg", &format!("指定路径不可用：{custom}"));
+                    not_found_ffmpeg()
+                }
             };
         }
         let mut fallback: Option<FfmpegInfo> = None;
@@ -230,13 +354,28 @@ pub(crate) async fn detect_ffmpeg(custom_path: Option<String>) -> Result<FfmpegI
                 path: Some(candidate.to_string_lossy().to_string()),
                 version: Some(version),
                 has_libx264,
+                has_xfade: has_filter(&candidate, "xfade"),
             };
             if has_libx264 {
+                log_info(
+                    "ffmpeg",
+                    &format!("自动探测选中：{}", candidate.to_string_lossy()),
+                );
                 return info;
             }
             if fallback.is_none() {
                 fallback = Some(info);
             }
+        }
+        match &fallback {
+            Some(info) => log_error(
+                "ffmpeg",
+                &format!(
+                    "自动探测只找到不带 libx264 的构建：{}（精确编码不可用）",
+                    info.path.as_deref().unwrap_or("?")
+                ),
+            ),
+            None => log_error("ffmpeg", "自动探测未找到任何可用的 ffmpeg"),
         }
         fallback.unwrap_or_else(not_found_ffmpeg)
     })
@@ -250,6 +389,7 @@ fn not_found_ffmpeg() -> FfmpegInfo {
         path: None,
         version: None,
         has_libx264: false,
+        has_xfade: false,
     }
 }
 
@@ -352,6 +492,14 @@ fn parse_video_probe(value: &Value) -> Result<VideoProbe, String> {
             return Err("变帧率视频暂不支持".to_string());
         }
     }
+    // 帧率的原始分数串原样带上（"30/1"、"30000/1001"）：xfade 要求显式帧率，
+    // 前端也用它把过渡时长换算成整数帧。取不到就退回 r_frame_rate 的解析值。
+    let fps = video["r_frame_rate"]
+        .as_str()
+        .filter(|rate| rate.contains('/'))
+        .map(str::to_string)
+        .or_else(|| base_rate.map(|rate| format!("{rate:.6}")))
+        .unwrap_or_else(|| "30".to_string());
 
     // 音轨与画面起点不一致（例如音轨比画面晚 0.5 s）时，抽出的音轨会从 0 起算，
     // 编辑期与导出的画面就对不上。亚帧级差异（AAC 预卷等）在 50 ms 内，放行。
@@ -386,6 +534,7 @@ fn parse_video_probe(value: &Value) -> Result<VideoProbe, String> {
         audio_bitrate: audio["bit_rate"].as_str().and_then(|rate| rate.parse().ok()),
         rotated,
         has_b_frames,
+        fps,
         // 关键帧由 probe_video 追加（多跑一次 ffprobe，见 video_keyframes）
         keyframes: Vec::new(),
     })
@@ -442,36 +591,49 @@ fn video_keyframes(ffprobe: &Path, path: &str) -> Result<Vec<f64>, String> {
 #[tauri::command]
 pub(crate) async fn probe_video(ffmpeg: String, path: String) -> Result<VideoProbe, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let candidate = PathBuf::from(&path);
-        if !candidate.is_file() {
-            return Err("找不到视频文件".to_string());
+        let result = probe_video_inner(&ffmpeg, &path);
+        if let Err(error) = &result {
+            // 「不支持该视频」的那几种拒绝理由也要打到终端：分类是代码判的，
+            // 光看界面提示分不清是格式问题还是 ffprobe 缺失
+            log_error("视频探测", error);
         }
-        let ffprobe = ffprobe_path(&ffmpeg)?;
-        let output = ffmpeg_command(&ffprobe.to_string_lossy())
-            .args([
-                "-v",
-                "error",
-                "-print_format",
-                "json",
-                "-show_format",
-                "-show_streams",
-            ])
-            .arg(&path)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| format!("无法启动 ffprobe: {error}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("视频探测失败: {}", truncate(&stderr, 300)));
-        }
-        let value: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|error| format!("无法解析视频信息: {error}"))?;
-        let mut probe = parse_video_probe(&value)?;
-        probe.keyframes = video_keyframes(&ffprobe, &path)?;
-        Ok(probe)
+        result
     })
     .await
     .map_err(|_| "视频探测线程异常退出".to_string())?
+}
+
+fn probe_video_inner(ffmpeg: &str, path: &str) -> Result<VideoProbe, String> {
+    let candidate = PathBuf::from(path);
+    if !candidate.is_file() {
+        return Err("找不到视频文件".to_string());
+    }
+    let ffprobe = ffprobe_path(ffmpeg)?;
+    let args: Vec<String> = vec![
+        "-v".into(),
+        "error".into(),
+        "-print_format".into(),
+        "json".into(),
+        "-show_format".into(),
+        "-show_streams".into(),
+        path.to_string(),
+    ];
+    let program = ffprobe.to_string_lossy().to_string();
+    let output = ffmpeg_command(&program)
+        .args(&args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("无法启动 ffprobe: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log_command_failure("视频探测", &program, &args, &stderr);
+        return Err(format!("视频探测失败: {}", truncate(&stderr, 300)));
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("无法解析视频信息: {error}"))?;
+    let mut probe = parse_video_probe(&value)?;
+    probe.keyframes = video_keyframes(&ffprobe, path)?;
+    Ok(probe)
 }
 
 /// 抽出视频音轨为临时 WAV（32-bit float）。
@@ -496,21 +658,26 @@ pub(crate) async fn extract_video_audio(
         let wav = temp_dir.join(format!("gap-gone-video-audio-{}.wav", timestamp_ms()));
 
         // -progress pipe:1 输出逐行进度，-nostats 关闭统计行
+        let args: Vec<String> = vec![
+            "-y".into(),
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-progress".into(),
+            "pipe:1".into(),
+            "-nostats".into(),
+            "-nostdin".into(),
+            "-i".into(),
+            video_path.clone(),
+            "-vn".into(),
+            "-map".into(),
+            "0:a:0".into(),
+            "-c:a".into(),
+            "pcm_f32le".into(),
+            wav.to_string_lossy().to_string(),
+        ];
         let mut child = ffmpeg_command(&ffmpeg)
-            .args([
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-progress",
-                "pipe:1",
-                "-nostats",
-                "-nostdin",
-                "-i",
-            ])
-            .arg(&video_path)
-            .args(["-vn", "-map", "0:a:0", "-c:a", "pcm_f32le"])
-            .arg(&wav)
+            .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -548,13 +715,13 @@ pub(crate) async fn extract_video_audio(
         if !status.success() {
             let _ = std::fs::remove_file(&wav);
             let stderr_text = stderr_pump.join().unwrap_or_default();
-            return Err(format!(
-                "抽取音轨失败: {}",
-                truncate(&String::from_utf8_lossy(&stderr_text), 300),
-            ));
+            let stderr_text = String::from_utf8_lossy(&stderr_text).to_string();
+            log_command_failure("抽取音轨", &ffmpeg, &args, &stderr_text);
+            return Err(format!("抽取音轨失败: {}", truncate(&stderr_text, 300)));
         }
         if !wav.is_file() || std::fs::metadata(&wav).map(|m| m.len()).unwrap_or(0) == 0 {
             let _ = std::fs::remove_file(&wav);
+            log_error("抽取音轨", "ffmpeg 没有产出音频文件");
             return Err("抽取音轨失败：ffmpeg 没有产出音频文件".to_string());
         }
         Ok(wav.to_string_lossy().to_string())
@@ -680,6 +847,14 @@ fn run_ffmpeg(
     full_args.push("-nostats".into());
     full_args.push("-nostdin".into());
 
+    // 设了 GAP_GONE_FFMPEG_TRACE 就把每条命令原样打出来。
+    // 为什么需要它：曾经用**手写**的命令去验证导出（参数与程序生成的略有出入），
+    // 结果漏掉了 `-b:a:192k` 这类只有真实命令才有的问题（0.1.69）。想验证导出，
+    // 就得验**程序真正发出的这条命令**，不是照着它重写一遍。
+    if std::env::var_os("GAP_GONE_FFMPEG_TRACE").is_some() {
+        log_info("ffmpeg", &format!("命令：{}", format_command(ffmpeg, &full_args)));
+    }
+
     let mut child = ffmpeg_command(ffmpeg)
         .args(&full_args)
         .stdin(Stdio::null())
@@ -751,9 +926,39 @@ fn run_ffmpeg(
         return Err("已取消导出视频".to_string());
     }
     if !status.success() {
-        return Err(format!("ffmpeg 导出失败: {}", truncate(&stderr_text, 300)));
+        // 终端给全（命令 + stderr 末尾）；界面只留末尾 300 字符：真正的错误在最后，
+        // 前面先是 Input #0 的横幅（见 truncate_tail）
+        log_command_failure("视频导出", ffmpeg, &full_args, &stderr_text);
+        return Err(format!("ffmpeg 导出失败: {}", truncate_tail(&stderr_text, 300)));
     }
     Ok(())
+}
+
+/// 短于一帧的区间/过渡没有意义，按「跳过」处理（30 fps 下 0.034 秒 ≈ 1 帧）。
+const MIN_FRAME_SECONDS: f64 = 0.034;
+
+/// 把一个「源文件 + 窗口」作为输入塞进命令行（输入侧 `-ss` + `-t`）。
+/// 过渡段要 4 个窗口（视频 2 个、音频 2 个），拆出来避免把同一段参数写四遍。
+fn push_window_input(args: &mut Vec<String>, source: &Path, start: f64, duration: f64) {
+    args.push("-ss".into());
+    args.push(format!("{:.3}", start.max(0.0)));
+    args.push("-t".into());
+    args.push(format!("{duration:.3}"));
+    args.push("-i".into());
+    args.push(source.to_string_lossy().to_string());
+}
+
+/// AAC 码率参数：**必须写成两个 argv**（`-b:a` + `192k`）。
+///
+/// 写成单个 `-b:a:192k` 会静默炸掉整条命令：ffmpeg 的 `find_option` 只在**第一个 `:`**
+/// 处比对选项名，于是整串 `a:192k` 被当成流标识符，而**紧随其后的那个 argv 被当成选项值
+/// 吃掉**（值本身没人校验，所以不报「无效码率」这种直接的错）。紧跟其后若是 `-t 4.630`，
+/// 被吃掉的是 `-t`、`4.630` 就成了**裸输出文件名**，报的却是
+/// `Unable to choose an output format for '4.630'` —— 看起来完全不像码率参数的问题。
+/// 实测 ffmpeg 7.1.1 与 8.0.1 行为一致（0.1.69 定位）。
+fn push_aac_bitrate(args: &mut Vec<String>, kbps: u32) {
+    args.push("-b:a".into());
+    args.push(format!("{kbps}k"));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -763,6 +968,8 @@ fn run_video_export(
     input: &Path,
     audio: Option<&Path>,
     regions: &[(f64, f64)],
+    transitions: &[f64],
+    fps: &str,
     output: &Path,
     fastcopy: bool,
     total_duration: f64,
@@ -800,6 +1007,28 @@ fn run_video_export(
     let full_cover =
         regions.len() == 1 && regions[0].0 <= 0.05 && regions[0].1 >= total_duration - 0.05;
 
+    // 切片过渡（精确编码档独有）：每个接缝 t 秒由相邻两段各取 t 秒交叉溶解而成，
+    // 所以成片比硬切短 Σt。t 由前端算好（按帧取整 + 「短段各取一半」保护），这里再做一次
+    // 兜底钳制 —— 取满会把某一段吃光。**快速档与纯 remux 一律硬切**：那是 `-c:v copy`，
+    // 根本没有解码后的画面可供混合。
+    let transitions: Vec<f64> = (0..regions.len().saturating_sub(1))
+        .map(|index| {
+            if fastcopy || full_cover {
+                return 0.0;
+            }
+            let requested = transitions.get(index).copied().unwrap_or(0.0);
+            let (start_a, end_a) = regions[index];
+            let (start_b, end_b) = regions[index + 1];
+            let limit = ((end_a - start_a).max(0.0) / 2.0).min((end_b - start_b).max(0.0) / 2.0);
+            let clamped = requested.clamp(0.0, limit);
+            if clamped < MIN_FRAME_SECONDS {
+                0.0
+            } else {
+                clamped
+            }
+        })
+        .collect();
+
     let temp_dir = gap_gone_temp_dir();
     let _ = std::fs::create_dir_all(&temp_dir);
     let timestamp = timestamp_ms();
@@ -827,7 +1056,7 @@ fn run_video_export(
         if let Some(channels) = replaced_channels {
             args.push("-c:a".into());
             args.push("aac".into());
-            args.push(format!("-b:a:{}k", aac_kbps(channels)));
+            push_aac_bitrate(&mut args, aac_kbps(channels));
             // 容器长度跟较短的那条流：音轨是前端从整段音频渲染出来的，
             // 不裁剪的话音轨比画面长时会拖出一条只有声音的尾巴。
             args.push("-shortest".into());
@@ -853,12 +1082,14 @@ fn run_video_export(
 
     // 逐区间切片：-ss 输入定位（重编码时解码丢弃到精确点，copy 时关键帧对齐），
     // 比滤镜图 select/trim 稳；每段独立编码再 concat。
+    // 成片时长 = 各保留区间之和 − 被过渡重叠掉的那部分（Σt）。
     let total: f64 = regions
         .iter()
         .map(|(start, end)| (end - start).max(0.0))
-        .sum();
+        .sum::<f64>()
+        - transitions.iter().sum::<f64>();
     if total <= 0.0 {
-        return Err("不能导出空视频，请至少保留一段内容".to_string());
+        return fail("视频导出", "不能导出空视频，请至少保留一段内容".to_string());
     }
     let mut done = 0.0f64;
     // 处理后音轨是「已拼接时间轴」：第 i 段对应的音频起点 = 前 i 段时长之和
@@ -869,9 +1100,15 @@ fn run_video_export(
         if cancelled.load(Ordering::SeqCst) {
             return Err("已取消导出视频".to_string());
         }
-        let duration = (end - start).max(0.0);
+        let full_duration = (end - start).max(0.0);
+        // 相邻接缝会从本段头部/尾部各取 t 秒去做交叉溶解，本段只导出中间的「主体」
+        let head_trim = if index > 0 { transitions[index - 1] } else { 0.0 };
+        let tail_trim = transitions.get(index).copied().unwrap_or(0.0);
+        let body_start = start + head_trim;
+        let body_end = (end - tail_trim).max(body_start);
+        let duration = body_end - body_start;
         // 短于一帧的区间跳过视频切片；音频偏移仍按完整时长累计，保持后续段对齐
-        let encode_segment = duration >= 0.034;
+        let encode_segment = duration >= MIN_FRAME_SECONDS;
         if encode_segment {
             let segment_path =
                 temp_dir.join(format!("gap-gone-video-seg-{timestamp}-{index}.mp4"));
@@ -884,10 +1121,10 @@ fn run_video_export(
                 args.push("-i".into());
                 args.push(input.to_string_lossy().to_string());
                 args.push("-ss".into());
-                args.push(format!("{:.4}", start.max(0.0)));
+                args.push(format!("{:.4}", body_start.max(0.0)));
             } else {
                 args.push("-ss".into());
-                args.push(format!("{start:.3}"));
+                args.push(format!("{body_start:.3}"));
                 args.push("-i".into());
                 args.push(input.to_string_lossy().to_string());
                 if let Some(audio) = audio {
@@ -926,10 +1163,10 @@ fn run_video_export(
                 // 重编码会重新生成干净的时间戳（改后实测 6.021 秒 / 180 帧，音频逐块吻合）。
                 args.push("-c:a".into());
                 args.push("aac".into());
-                args.push(format!(
-                    "-b:a:{}k",
-                    aac_kbps(replaced_channels.or(source_channels).unwrap_or(2))
-                ));
+                push_aac_bitrate(
+                    &mut args,
+                    aac_kbps(replaced_channels.or(source_channels).unwrap_or(2)),
+                );
             }
             // 必须每个片段都带 -t：`-ss` 只决定起点，不带它这一段会一路切到片尾。
             args.push("-t".into());
@@ -941,19 +1178,126 @@ fn run_video_export(
             // 空段会让 concat 拼出时间轴重叠的垃圾（实测 3.5 秒的成片变成 10.9 秒），
             // 宁可在这里明确失败：多半是切点落在了关键帧之间。
             if segment_video_packets(&ffprobe, &segment_path) == 0 {
-                return Err(format!(
-                    "第 {} 个保留区间没有导出任何画面（无损快速只能从关键帧起切），请改用「精确重编码」",
-                    index + 1
-                ));
+                return fail(
+                    "视频导出",
+                    format!(
+                        "第 {} 个保留区间没有导出任何画面（无损快速只能从关键帧起切），请改用「精确重编码」",
+                        index + 1
+                    ),
+                );
             }
             segment_paths.push(segment_path);
         }
         done += duration;
-        audio_offset += duration;
+        // 过渡段：**画面交叉溶解，音频在过渡中点硬拼接**（两端各 5 毫秒微淡）。
+        //
+        // 音频为什么不用 `acrossfade`：实测它在 0.3 秒级的短窗口上**偶发一帧都不输出**
+        // （同一条命令连跑 5 次会混出 92 字节的空文件），下游 aac 编码器于是报
+        // `Could not open encoder before EOF` / `Conversion failed!` —— 也就是用户看到的
+        // 「ffmpeg 导出失败（Input #0 … 之后再报错）」。换成 `concat` 后连跑 6 次逐字节一致。
+        // 顺带的好处：口播素材上音频交叉淡化会把相邻两句叠在一起，硬拼接 + 微淡更干净。
+        //
+        // 两个音频窗口各取 d/2，合起来正好 d 秒 —— 与画面溶解时长一致，不会累积音画错位。
+        if tail_trim >= MIN_FRAME_SECONDS {
+            let piece_path =
+                temp_dir.join(format!("gap-gone-video-xfade-{timestamp}-{index}.mp4"));
+            guard.track(piece_path.clone());
+            // 过渡段的两个视频窗口 = 两侧**被裁掉的那两截**，正好接在主体之外，
+            // 所以既不会有内容重复也不会丢内容：
+            //   本段尾巴 [body_end, body_end + t] 与 下一段头部 [start_{i+1}, start_{i+1} + t]
+            // 注意起点不要写成 body_end - t / start_{i+1} + t —— 那会把过渡窗口挪进主体里，
+            // 结果是 A 的最后一截永远不出现、B 的开头被播两遍。
+            let next_region_start = regions[index + 1].0;
+            let audio_after = audio_offset + full_duration;
+            let half = tail_trim / 2.0;
+            // 微淡：盖住硬拼接处的咔嗒声。取 d 的 1/10 且不超过 5 毫秒。
+            let micro_fade = (tail_trim / 10.0).min(0.005).max(0.001);
+            let mut args: Vec<String> = vec!["-y".into(), "-hide_banner".into()];
+            // 输入 0/1：视频窗口各**正好** d 秒（xfade 的 offset=0 要求输入 1 时长恰为 d）
+            push_window_input(&mut args, input, body_end - tail_trim, tail_trim);
+            push_window_input(&mut args, input, next_region_start, tail_trim);
+            // 输入 2/3：音频窗口各 d/2 秒，取「两侧**被裁掉那一截的前半**」——
+            // 与视频窗口（两侧被裁掉那一整截）端点对齐，所以过渡段起点的音频正好接在
+            // 本段主体的最后一个采样之后，不会重复也不会跳内容（0.1.70 修）：
+            //   本段：[body_end, body_end + d/2]（被裁掉的尾巴 [body_end, end] 的前半）
+            //   下段：[next_start, next_start + d/2]（被裁掉的头部 [start, start + d] 的前半）
+            // **不要**退回「主体末尾往前 d/2」（`body_end - d/2`）：那落在主体已播过的一截里，
+            // 接缝处会重复约 d/2（默认 150 ms）的音频，而被裁掉那一截的音频永远不出现。
+            // 处理后音轨是「已拼接时间轴」，同一位置换算成 audio_after - d 起算。
+            let audio_source = audio.unwrap_or(input);
+            let (audio_a_start, audio_b_start) = if audio.is_some() {
+                (audio_after - tail_trim, audio_after)
+            } else {
+                (body_end, next_region_start)
+            };
+            push_window_input(&mut args, audio_source, audio_a_start, half);
+            push_window_input(&mut args, audio_source, audio_b_start, half);
+            // 滤镜参数一律用**具名**写法（`settb=tb=` / `setpts=expr=` / `fps=fps=`）：
+            // 位置写法（`settb=AVTB`、`setpts=PTS-STARTPTS`）只有 ffmpeg 7.0+ 认，
+            // 实测 6.1.1 直接报 `No option name near 'AVTB'`。
+            let filter = format!(
+                "[0:v]settb=tb=AVTB,setpts=expr=PTS-STARTPTS,fps=fps={fps}[v0];\
+                 [1:v]settb=tb=AVTB,setpts=expr=PTS-STARTPTS,fps=fps={fps}[v1];\
+                 [v0][v1]xfade=transition=dissolve:duration={duration:.3}:offset=0,format=yuv420p[v];\
+                 [2:a][3:a]concat=n=2:v=0:a=1,afade=t=in:st=0:d={fade:.3},\
+                 afade=t=out:st={fade_out:.3}:d={fade:.3}[a]",
+                fps = fps,
+                duration = tail_trim,
+                fade = micro_fade,
+                fade_out = (tail_trim - micro_fade).max(0.0),
+            );
+            args.push("-filter_complex".into());
+            args.push(filter);
+            args.push("-map".into());
+            args.push("[v]".into());
+            args.push("-map".into());
+            args.push("[a]".into());
+            // 编码参数必须与普通段逐项一致，否则 concat 拼不上
+            args.extend([
+                "-c:v".into(),
+                "libx264".into(),
+                "-preset".into(),
+                "veryfast".into(),
+                "-crf".into(),
+                "20".into(),
+                "-pix_fmt".into(),
+                "yuv420p".into(),
+                "-c:a".into(),
+                "aac".into(),
+            ]);
+            push_aac_bitrate(
+                &mut args,
+                aac_kbps(replaced_channels.or(source_channels).unwrap_or(2)),
+            );
+            args.push(piece_path.to_string_lossy().to_string());
+            run_ffmpeg(app, ffmpeg, &args, child_slot, cancelled, tail_trim, |f| {
+                (((done + f * tail_trim) / total * 95.0) as f32).clamp(0.0, 95.0)
+            })
+            .map_err(|error| {
+                format!(
+                    "过渡段（第 {}–{} 个保留区间之间）导出失败：{error}",
+                    index + 1,
+                    index + 2
+                )
+            })?;
+            if segment_video_packets(&ffprobe, &piece_path) == 0 {
+                return fail(
+                    "视频导出",
+                    format!(
+                        "第 {} 与第 {} 个保留区间之间的过渡段没有导出画面",
+                        index + 1,
+                        index + 2
+                    ),
+                );
+            }
+            segment_paths.push(piece_path);
+            done += tail_trim;
+        }
+        audio_offset += full_duration;
     }
 
     if segment_paths.is_empty() {
-        return Err("没有可导出的视频区间".to_string());
+        return fail("视频导出", "没有可导出的视频区间".to_string());
     }
 
     // concat demuxer 拼接（所有片段编码参数一致，-c copy 秒级完成）
@@ -996,9 +1340,12 @@ fn run_video_export(
     if let Some(actual) = media_duration(&ffprobe, output) {
         if (actual - total).abs() > 0.3 {
             let _ = std::fs::remove_file(output);
-            return Err(format!(
-                "拼接后的成片时长 {actual:.2} 秒与预期 {total:.2} 秒不符（源音轨时间戳异常），请改用「精确重编码」"
-            ));
+            return fail(
+                "视频导出",
+                format!(
+                    "拼接后的成片时长 {actual:.2} 秒与预期 {total:.2} 秒不符（源音轨时间戳异常），请改用「精确重编码」"
+                ),
+            );
         }
     }
     emit_progress(app, 100.0);
@@ -1008,6 +1355,8 @@ fn run_video_export(
 /// 视频导出。regions_json 是保留区间 [start, end] 数组（原视频时间轴）。
 /// audio_path 提供（应用过降噪/压缩/响度归一化）时替换原音轨为前端渲染的处理后音轨；
 /// 否则 -c:a copy 保留原音轨特征。variant: "fastcopy"（默认，不重编码）/ "reencode"（帧精确）。
+/// transitions_json 是**逐接缝的过渡时长**（秒，长度 = 区间数 − 1，0 = 硬切），只在
+/// reencode 档生效；fps 是源视频帧率的原始分数串（如 "30/1"），xfade 要求显式帧率。
 /// subtitles_path 提供时，导出成功后把该临时字幕文件复制到成片旁边（同名 .srt）。
 #[tauri::command]
 pub(crate) async fn export_video(
@@ -1018,6 +1367,8 @@ pub(crate) async fn export_video(
     audio_path: Option<String>,
     subtitles_path: Option<String>,
     regions_json: String,
+    transitions_json: Option<String>,
+    fps: Option<String>,
     output_path: String,
     variant: String,
     total_duration: f64,
@@ -1027,24 +1378,51 @@ pub(crate) async fn export_video(
     // 参数校验放在占用导出锁之前，失败路径不需要解锁
     let input = PathBuf::from(&input_path);
     if !input.is_file() {
-        return Err("找不到源视频文件".to_string());
+        return fail("视频导出", "找不到源视频文件".to_string());
     }
     let audio = match audio_path.as_deref() {
-        Some(path) => Some(validate_temp_recording_path(path)?),
+        Some(path) => Some(validate_temp_path("视频导出", path)?),
         None => None,
     };
     let subtitles = match subtitles_path.as_deref() {
-        Some(path) => Some(validate_temp_recording_path(path)?),
+        Some(path) => Some(validate_temp_path("视频导出", path)?),
         None => None,
     };
     let output = PathBuf::from(&output_path);
-    let mut regions: Vec<(f64, f64)> = serde_json::from_str(&regions_json)
-        .map_err(|_| "保留区间数据无效".to_string())?;
+    let mut regions: Vec<(f64, f64)> = match serde_json::from_str(&regions_json) {
+        Ok(regions) => regions,
+        Err(_) => return fail("视频导出", "保留区间数据无效".to_string()),
+    };
     if regions.is_empty() {
-        return Err("不能导出空视频，请至少保留一段内容".to_string());
+        return fail("视频导出", "不能导出空视频，请至少保留一段内容".to_string());
     }
     regions.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let fastcopy = variant != "reencode";
+    // 过渡时长由前端算好（已按帧取整、已做「短段各取一半」保护）；这里只做长度与范围校验，
+    // 缺项按硬切处理，绝不因为参数问题把成片算错。
+    let transitions: Vec<f64> = transitions_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Vec<f64>>(json).ok())
+        .unwrap_or_default();
+    let fps = fps.unwrap_or_else(|| "30/1".to_string());
+
+    // 导出计划先落一行到终端：出问题时第一件事就是对照它看「按哪个档位、切了哪几段」，
+    // 而这些参数来自前端，光看界面复现不出来。
+    log_info(
+        "视频导出",
+        &format!(
+            "开始：{}｜保留 {} 段 {:?}｜过渡 {:?}｜fps {fps}｜{}｜输出 {output_path}",
+            if fastcopy { "无损快速" } else { "精确重编码" },
+            regions.len(),
+            regions,
+            transitions,
+            if audio_path.is_some() {
+                "回写处理后音轨"
+            } else {
+                "原音轨"
+            },
+        ),
+    );
 
     if state.running.swap(true, Ordering::SeqCst) {
         return Err("已有视频导出正在进行".to_string());
@@ -1061,6 +1439,8 @@ pub(crate) async fn export_video(
             &input,
             audio.as_deref(),
             &regions,
+            &transitions,
+            &fps,
             &export_output,
             fastcopy,
             total_duration,
@@ -1082,8 +1462,12 @@ pub(crate) async fn export_video(
     if result.is_ok() {
         if let Some(subtitles) = subtitles {
             let target = output.with_extension("srt");
-            std::fs::copy(&subtitles, &target)
-                .map_err(|error| format!("视频已导出，但字幕文件写出失败: {error}"))?;
+            if let Err(error) = std::fs::copy(&subtitles, &target) {
+                return fail(
+                    "视频导出",
+                    format!("视频已导出，但字幕文件写出失败: {error}"),
+                );
+            }
         }
     }
     result
