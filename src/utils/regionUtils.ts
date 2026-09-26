@@ -118,15 +118,19 @@ export function nextPlayableTime(
  * 把源时间轴上的区间映射到成片时间轴（跳过删除区间后的累计时间）。
  * 区间横跨删除段时会被切成多段；整段落在删除区间内返回空数组。
  * 用途：转录时间码在源时间轴上，导出视频的字幕必须换算到成片时间轴。
+ *
+ * `keptOverride` 用于**无损快速档**：那一档会把每段起点吸附到关键帧上（成片比「精确
+ * 删除」多留一小截），成片时间轴必须以吸附后的区间为基准，否则字幕会随每个吸附点累积错位。
  */
 export function mapRangeToKept(
   range: Region,
   deletedRegions: Region[],
   duration: number,
+  keptOverride?: Region[],
 ): Region[] {
   const result: Region[] = [];
   let offset = 0;
-  for (const kept of getKeptRegions(deletedRegions, duration)) {
+  for (const kept of keptOverride ?? getKeptRegions(deletedRegions, duration)) {
     const start = Math.max(kept.start, range.start);
     const end = Math.min(kept.end, range.end);
     if (end > start) {

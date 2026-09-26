@@ -157,6 +157,8 @@ interface VideoProbe {
   audioBitrate: number | null;
   /** 画面是否带旋转元数据（手机竖拍）：允许导入，但禁用「无损快速」。 */
   rotated: boolean;
+  /** 画面是否含 B 帧：含则禁用「无损快速」（输出侧 seek 会整段丢掉第一个 GOP）。 */
+  hasBFrames: boolean;
   /** 关键帧时间戳（秒，升序，ffprobe 原始精度）。无损快速档只能从关键帧起切。 */
   keyframes: number[];
 }
@@ -175,6 +177,8 @@ interface VideoAsset {
   channels: number;
   /** 是否带旋转元数据，带则只能走精确重编码。 */
   rotated: boolean;
+  /** 是否含 B 帧，含则只能走精确重编码（原因见 VideoProbe.hasBFrames）。 */
+  hasBFrames: boolean;
   /** 关键帧时间戳（秒，升序），无损快速档的吸附基准。 */
   keyframes: number[];
 }
@@ -182,11 +186,6 @@ interface VideoAsset {
 /** 视频导出编码档位：fastcopy（默认，不重编码，快）/ reencode（帧精确，慢）。 */
 type VideoExportVariant = "fastcopy" | "reencode";
 
-/**
- * 无损快速档的切点对齐容差（秒）：切点落在关键帧附近这个范围内，
- * 吸附造成的偏移可以忽略；超出就说明这次剪辑无法在不重编码的前提下完成。
- */
-const FASTCOPY_ALIGN_TOLERANCE = 0.1;
 /**
  * 吸附后的起点再往回让 1 ms。关键帧时间戳是 6 位小数（如 16.666667，真值 16.6666666…），
  * 直接拿它当 `-ss`，一旦被四舍五入抬高就会越过关键帧 —— 输出侧 seek 会因此丢掉整段画面。
@@ -1372,20 +1371,21 @@ function App() {
   const fastcopyPlan = useMemo(() => {
     if (!videoAsset || !audioBuffer) return null;
     const kept = getKeptRegions(deletedRegions, audioBuffer.duration);
-    let aligned = kept.length > 0;
+    // 吸附后的区间：起点退到「不超过该点的最近关键帧」，终点不变（`-t` 精确）。
+    // 吸附只会让这一档**少删**（残留一小截静音），不会吃掉人声：起点只会往前挪，
+    // 且下面用 previousEnd 挡住「挪进上一段保留内容里」的情况。
+    const snapped: Region[] = [];
+    let safe = kept.length > 0;
     let maxShift = 0;
     let previousEnd = 0;
     for (const region of kept) {
       const keyframe = lastKeyframeAtOrBefore(videoAsset.keyframes, region.start);
       maxShift = Math.max(maxShift, region.start - keyframe);
-      // 吸附点退回到上一个保留区间的尾巴里 → 等于把已经删掉的内容又搬回来
-      if (keyframe < previousEnd - 0.05) aligned = false;
-      if (
-        region.start - keyframe > FASTCOPY_ALIGN_TOLERANCE ||
-        keyframe >= region.end
-      ) {
-        aligned = false;
-      }
+      // 吸附点退回到上一个保留区间的尾巴里 → 等于把已经删掉的内容又搬回来（时间轴重叠）
+      if (keyframe < previousEnd - 0.05) safe = false;
+      // 吸附后这段没有画面了
+      if (keyframe >= region.end) safe = false;
+      snapped.push({ start: keyframe, end: region.end });
       previousEnd = region.end;
     }
     const fullCover =
@@ -1394,7 +1394,10 @@ function App() {
       kept[0].end >= audioBuffer.duration - 0.05;
     return {
       kept,
-      aligned,
+      /** 吸附后的保留区间：既传给导出命令，也用作字幕重映射的成片时间轴。 */
+      snapped,
+      /** 吸附是否安全（不会与保留内容重叠）。不要求偏移多小 —— 偏移就是「少删的那一截」。 */
+      safe,
       maxShift,
       fullCover,
       keyframeInterval: maxKeyframeInterval(videoAsset.keyframes),
@@ -1405,16 +1408,21 @@ function App() {
   /**
    * 无损快速档的适用条件：
    * - 整段保留（没有剪切）→ 只是重新封装，任何编码都安全；
-   * - 有剪切 → 必须是 H.264、无旋转元数据、切点都落在关键帧上，且音频未被处理过。
+   * - 有剪切 → 必须是 H.264、无旋转元数据、无 B 帧，且**切点能安全吸附到关键帧**
+   *   （吸附不会挪进上一段保留内容里）、音频未被处理过。
    *   HEVC 上输出侧 seek 会静默丢帧（实测 2 秒只剩 34 帧）；带旋转的素材在 concat 后
-   *   不保证还留着 display matrix；处理过音频的音轨起点没法跟着视频吸附到关键帧。
+   *   不保证还留着 display matrix；有 B 帧的素材输出侧 seek 会整段丢掉第一个 GOP
+   *   （实测 1 秒关键帧、请求 5 秒只拿到 122 帧）；处理过音频的音轨起点没法跟着视频吸附到关键帧。
+   *   **吸附本身不算不可用**（0.1.66 起）：它只会让成片「少删一小截」（残留静音），
+   *   代价由 `maxShift` 如实告知；只有「会与保留内容重叠」才判为不可用。
    */
   const fastcopyAvailable =
     Boolean(fastcopyPlan) &&
     !audioProcessed &&
     (fastcopyPlan!.fullCover ||
-      (fastcopyPlan!.aligned &&
+      (fastcopyPlan!.safe &&
         videoAsset?.videoCodec === "h264" &&
+        !videoAsset?.hasBFrames &&
         !videoAsset?.rotated));
   /** 实际使用的档位：选了快速档但不可用时降级为精确重编码，并在导出前说明原因。 */
   const effectiveVariant: VideoExportVariant =
@@ -1425,12 +1433,15 @@ function App() {
     if (videoAsset && videoAsset.videoCodec !== "h264") {
       return `该素材是 ${videoAsset.videoCodec.toUpperCase()} 编码，无损快速会丢画面（将转成 H.264）`;
     }
+    if (videoAsset?.hasBFrames) {
+      return "该素材含 B 帧，无损快速会丢掉切点后的整段画面";
+    }
     if (videoAsset?.rotated) return "该素材带旋转元数据，拼接后方向不保证正确";
-    if (!fastcopyPlan?.aligned) {
+    if (!fastcopyPlan?.safe) {
       const interval = fastcopyPlan?.keyframeInterval ?? 0;
       return interval > 0
-        ? `切点不在关键帧上（该素材关键帧间隔约 ${interval.toFixed(1)} 秒）`
-        : "切点不在关键帧上";
+        ? `切点吸附到关键帧会与保留内容重叠（该素材关键帧间隔约 ${interval.toFixed(1)} 秒）`
+        : "切点吸附到关键帧会与保留内容重叠";
     }
     return null;
   }, [videoExportVariant, fastcopyAvailable, audioProcessed, fastcopyPlan, videoAsset]);
@@ -1569,6 +1580,7 @@ function App() {
         videoCodec: probe.videoCodec,
         channels: probe.channels,
         rotated: probe.rotated ?? false,
+        hasBFrames: probe.hasBFrames ?? false,
         keyframes: probe.keyframes ?? [0],
       });
       notify(
@@ -1644,9 +1656,18 @@ function App() {
         audioPath = prepared;
       }
       if (exportSubtitles && transcript) {
-        // 转录时间码在源时间轴上，成片已跳过切除区间，必须重映射到成片时间轴
+        // 转录时间码在源时间轴上，成片已跳过切除区间，必须重映射到成片时间轴。
+        // 无损快速档的成片时间轴以「吸附后的保留区间」为准（每段多留一小截），
+        // 不按它换算的话字幕会随每个吸附点累积错位。
+        const keptForSubtitles =
+          effectiveVariant === "fastcopy" ? fastcopyPlan?.snapped : undefined;
         const cues = transcript.segments.flatMap((segment) =>
-          mapRangeToKept(segment, deletedRegions, audioBuffer.duration).map(
+          mapRangeToKept(
+            segment,
+            deletedRegions,
+            audioBuffer.duration,
+            keptForSubtitles,
+          ).map(
             (piece) => ({ start: piece.start, end: piece.end, text: segment.text }),
           ),
         );
@@ -1660,15 +1681,12 @@ function App() {
         throw new Error("不能导出空视频，请至少保留一段内容");
       }
       // 无损快速档把每段起点吸附到「不超过该点的最近关键帧」，再往回让 1 ms
-      // （关键帧时间戳只有 6 位小数，抬高一点就会越过它，输出侧 seek 会因此丢掉整段画面）
+      // （关键帧时间戳只有 6 位小数，抬高一点就会越过它，输出侧 seek 会因此丢掉整段画面）。
+      // 吸附结果统一由 fastcopyPlan 算好，不要在这里再推导一遍。
       const planned =
         effectiveVariant === "fastcopy"
-          ? kept.map((region) => ({
-              start: Math.max(
-                0,
-                lastKeyframeAtOrBefore(videoAsset.keyframes, region.start) -
-                  FASTCOPY_SEEK_EPSILON,
-              ),
+          ? (fastcopyPlan?.snapped ?? kept).map((region) => ({
+              start: Math.max(0, region.start - FASTCOPY_SEEK_EPSILON),
               end: region.end,
             }))
           : kept;
@@ -2733,14 +2751,16 @@ function App() {
                   无损快速不可用：{fastcopyFallbackReason}
                 </span>
               )}
-              {fastcopyAvailable &&
-                fastcopyPlan &&
-                !fastcopyPlan.fullCover &&
-                fastcopyPlan.keyframeInterval > 1.5 && (
-                  <span className="video-export-hint">
-                    关键帧间隔约 {fastcopyPlan.keyframeInterval.toFixed(1)} 秒，切点会吸附到关键帧
-                  </span>
-                )}
+              {fastcopyAvailable && fastcopyPlan && !fastcopyPlan.fullCover && (
+                <span className="video-export-hint">
+                  {fastcopyPlan.maxShift > 0.02
+                    ? `切点吸附到关键帧，最多少删 ${fastcopyPlan.maxShift.toFixed(1)} 秒（残留静音，不会吃掉人声）`
+                    : "切点正好落在关键帧上"}
+                  {fastcopyPlan.keyframeInterval > 1.5
+                    ? `；该素材关键帧间隔约 ${fastcopyPlan.keyframeInterval.toFixed(1)} 秒`
+                    : ""}
+                </span>
+              )}
             </>
           )}
           {videoAsset && (

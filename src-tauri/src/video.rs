@@ -88,6 +88,13 @@ pub(crate) struct VideoProbe {
     /// 烘进像素，两条路的方向都对。但它会让「无损快速」档被禁用 —— 因为 concat 不保证
     /// 把 display matrix 带进成片，由前端判定后强制走重编码。
     rotated: bool,
+    /// 视频是否含 B 帧（`has_b_frames > 0`）。有 B 帧就必须禁用「无损快速」：
+    /// 输出侧 `-ss` 按 dts 丢包，而 B 帧重排让每个关键帧的 dts 比 pts 早若干帧，
+    /// 目标点落在关键帧 pts 上时关键帧自己会被丢掉 → ffmpeg 等下一个关键帧 →
+    /// **整段丢掉一个 GOP 的画面**（实测 1 秒关键帧的素材：请求 5 秒只拿到 122 帧 / 5.067 秒，
+    /// 首包 pts=1.000；输入侧 seek 虽有完整帧，但带 pre-roll 的段经 concat demuxer 会报
+    /// `non monotonically increasing dts`）。无 B 帧的流 dts=pts，一切正常。
+    has_b_frames: bool,
     /// 视频关键帧时间戳（秒，升序，保留 ffprobe 的原始精度）。
     /// 无损快速档只能在关键帧上切，前端用它算出吸附后的切点并如实告知偏移量。
     /// **不要四舍五入**：关键帧 16.666667 写成 16.667 就会让 seek 越过它、整段没有画面。
@@ -333,6 +340,8 @@ fn parse_video_probe(value: &Value) -> Result<VideoProbe, String> {
         .and_then(|rotate| rotate.parse::<f64>().ok())
         .is_some_and(|rotation| rotation.abs() > 0.01);
     let rotated = rotated_by_side_data || rotated_by_tag;
+    // B 帧：有它就不能走「无损快速」（原因见 VideoProbe.has_b_frames 的注释）
+    let has_b_frames = video["has_b_frames"].as_i64().unwrap_or(0) > 0;
 
     // 变帧率：r_frame_rate 与 avg_frame_rate 差异过大视为 VFR。
     // NTSC 惯用的 30 vs 29.97 只差 0.1%，1.5 倍容差不会误伤。
@@ -376,6 +385,7 @@ fn parse_video_probe(value: &Value) -> Result<VideoProbe, String> {
         channels: audio["channels"].as_u64().unwrap_or(0) as u16,
         audio_bitrate: audio["bit_rate"].as_str().and_then(|rate| rate.parse().ok()),
         rotated,
+        has_b_frames,
         // 关键帧由 probe_video 追加（多跑一次 ffprobe，见 video_keyframes）
         keyframes: Vec::new(),
     })
