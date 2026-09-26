@@ -1,6 +1,6 @@
 [package]
 name = "gap-gone"
-version = "0.1.61"
+version = "0.1.64"
 description = "Gap Gone - 录音与音频编辑桌面应用"
 authors = ["you"]
 edition = "2021"
@@ -18,7 +18,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# protocol-asset：视频预览走 asset 协议流式读原文件（整段读进内存扛不住 GB 级素材）。
+# 静态 scope 故意留空，只由 allow_video_asset 动态放行当前导入的那一个文件，见 video.rs。
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

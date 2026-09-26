@@ -20,6 +20,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 mod lufs;
 mod transcribe;
+mod video;
 
 #[derive(Default)]
 pub(crate) struct RecordingManager {
@@ -886,6 +887,7 @@ fn greet(name: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .manage(RecordingManager::default())
+        .manage(video::VideoExportManager::default())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -910,7 +912,16 @@ pub fn run() {
             transcribe::cancel_transcribe,
             transcribe::get_transcribe_model_dir,
             transcribe::set_transcribe_model_dir,
-            transcribe::open_transcribe_model_dir
+            transcribe::open_transcribe_model_dir,
+            video::detect_ffmpeg,
+            video::probe_video,
+            video::extract_video_audio,
+            video::prepare_video_export_audio,
+            video::prepare_video_export_subtitles,
+            video::allow_video_asset,
+            video::forbid_video_asset,
+            video::export_video,
+            video::cancel_video_export
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

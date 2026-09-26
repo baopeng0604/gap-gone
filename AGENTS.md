@@ -34,7 +34,7 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 
 * `src/App.tsx` — 主界面与状态编排，播放引擎也在这里（见硬约束 10、11）；`src/components/` 波形/时间轴/转录面板组件，其中 `PlaybackSidebar.tsx` 是左侧播放栏（从头播放、循环、变速）；`src/utils/` 音频分析（静音检测）、降噪、转录、一键语音优化链（`compression.ts`：高通 / 向下扩展 / 自适应压缩）、响度与真峰值限幅（`lufs.ts`：K 计权 LUFS、4× 过采样真峰值、前瞻限幅、`normalizeLoudness`）、MP3/WAV 导出、设置持久化（`settings.ts`，localStorage，新增用户设置一律走这里，key 前缀 `gap-gone-`）。
 
-* `src-tauri/src/lib.rs` — 录音相关原生命令与 cpal 录音流管理（`RecordingManager` 状态机）；`src-tauri/src/transcribe.rs` — SenseVoice 转录（模型下载 + `gap-gone-transcribe` 工作线程）。
+* `src-tauri/src/lib.rs` — 录音相关原生命令与 cpal 录音流管理（`RecordingManager` 状态机）；`src-tauri/src/transcribe.rs` — SenseVoice 转录（模型下载 + `gap-gone-transcribe` 工作线程）；`src-tauri/src/video.rs` — 视频导入/导出（ffmpeg 侧车调用，见硬约束 19）。`src/components/VideoPreview.tsx` 是视频画面预览（跟随播放引擎的时钟）。
 
 ## 关键领域概念
 
@@ -66,6 +66,28 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 
 18. **降噪引擎必须用 DeepFilterNet3 低延迟变体（`default-model-ll`），不是标准变体 —— 这是「能不能跑」的问题，不是性能取舍**。标准 `default-model` 的图在 tract 0.21.4 上过不了 codegen 之后的图压缩（`duplicate name /convt3/Conv.bias`），模型**加载直接失败**；失败又被 `noiseReduction.ts` 的兜底接住，于是降噪悄悄退化成那个粗糙的逐采样增益门 —— 所有基于 DeepFilterNet 的调参（阈值口径、`atten_lim`、post-filter、延迟补偿、float 中间格式）全都作用在一条没跑起来的路径上（0.1.53~0.1.56 四轮全部无效；0.1.57 靠自检定位）。低延迟变体同架构（48000 / hop 480 / fft 960 / nb_df 96），只是 lookahead 从 2 帧降到 0，恰好绕开那个算子（算法延迟按公式现算：`fft_size − hop_size + lookahead × hop_size`，本模型 = **480 采样 = 10 ms**，见硬约束 14。注意 0.1.59~0.1.60 期间这里写的是「2880 采样 = 60 ms」，**那个数字是错的** —— 多出来的 2400 来自同一个任务里多调的那套重置；`delay` 一律由 `model.lookahead` 等字段现算，不要写死数字），`DfParams::default()` 会优先取 `default-model-ll`。**动这块之前先跑两个自检**：① `cargo test --lib deepfilternet_engine_works` —— 不需要录音也不需要界面，加载 + 真推理几个 hop + 断言输出全是有限值，一次就能回答「引擎到底还能不能用」；② `GAP_GONE_DENOISE_TEST_WAV=<真实口播 wav> cargo test --lib diagnostic_denoise_alignment -- --nocapture` —— 用真实素材跑生产路径（复用同一个 `enhance_samples`），打印每档的滞后 / ρ / 块电平 P10·P50·P90，并把结果落盘到 `temp/gap-gone-dfntest/` 供人耳复核。档位循环已扩成「轻 / 中 / 强 / 极限48 / 不掺回100 + 中档复跑」，**复跑与首跑逐采样比对（断言）**，把「每任务重建模型确实复位了滚动缓冲」锁死；截取长度用 `GAP_GONE_DENOISE_TEST_SECONDS` 改（默认 15 秒，`0` 表示整段 —— debug 版推理很慢，素材多长自己掂量）。**这两个自检必须留着** —— 这类失败只在运行期暴露，而它曾经让用户连续四轮试听都「没有任何改进」却查不出原因。另外：`df` 的 rev `d375b2d` 只和 tract 0.21.4 的 API 对得上，`Cargo.toml` 里那 9 个 tract 版本必须整体锁死（升到 0.21.18 会因 `symbol_table` → `symbols` 等改动编译不过）；要升就 rev 和那 9 行一起动，升完立刻跑上面那个自检。
 
+19. **视频导入/导出走系统 ffmpeg（不打包），切点精度由 seek 口径与关键帧决定 —— 几条接线别改坏**。
+   - **导出默认是 `fastcopy`（界面上叫「无损快速」，画面 `-c:v copy`）**，`reencode`（libx264，界面上叫「精确重编码」）用于切点不在关键帧上的场合。**fastcopy 只能从关键帧起切**：前端按 `probe_video` 返回的关键帧列表判定「切点是否都在关键帧上」，不在就自动降级为 reencode 并在导出前说明原因（实测素材：OBS 默认关键帧间隔可达 **8.3 秒**，这种素材上精细剪切根本无法不重编码完成）。档位可用性还要求「音频未被处理过」（见下一条）。
+   - **绝不要加 `-avoid_negative_ts make_zero`**。输入侧 `-ss` 会把请求点之前的内容一起读进来（时间戳为负，当解码参考帧用），make_zero 会把这些 pre-roll「扶正」保留 —— 等效于把切点拉回文件开头。2026-09-26 实测（OBS 31.1 s 素材）：请求 `[5.000, 8.000]` 切出的容器是 **8.0 秒**、首帧与源 **0.000 秒那一帧 framemd5 完全一致**；`-ss 8.333` 时更是产出 `[0, 10.033]`（= 起点+时长）。去掉它之后，同一条命令的首帧精确落在源第 150 帧（5.000 秒）、音频呈现 `[5, 8)`（RMS 轮廓与源逐块吻合）。
+   - **两条路的 seek 口径不同，不要混用**：
+     - `fastcopy` 用**输出侧 `-ss`**（放在 `-i` 之后）+ `-t`。输出侧 seek 会丢掉关键帧之前的 pre-roll，段的物理包数 = 真实时长（实测 2 秒的段 = 2.005 秒 / 60 帧 / 1.31 MB），concat 拼出来时间轴连续。**不能用输入侧**：那样每段会把「到上一个关键帧为止」的数据整段写进文件（实测 3 秒的段装进 240 个包 / 6.33 MB），而 concat demuxer 不认 edit list，会把 pre-roll 一起拼进去 —— 实测 3.5 秒的成片变成 **10.9 秒的垃圾**。
+     - `reencode` 用**输入侧 `-ss`**（解码丢弃到精确点，帧精确）。
+     - 前端吸附时**起点要往回让 1 ms**（`FASTCOPY_SEEK_EPSILON`），Rust 侧再用 4 位小数格式化：关键帧时间戳是 6 位小数（`16.666667`，真值 `16.6666666…`），一旦被四舍五入抬高就会越过关键帧，输出侧 seek 会丢掉**整段画面**（实测 `-ss 16.667` 得到 0.04 MB 的无画面文件）。
+     - **每个片段都必须带 `-t duration`**：`-ss` 只决定起点，不带它这一段会一路切到片尾（实测漏掉时 3 秒的段变成 31.1 秒）。
+   - **fastcopy 的适用条件**：整段保留（没有剪切，只是重新封装，任何编码都安全），或者「**H.264** + 无旋转元数据 + 切点都落在关键帧上 + 音频未被处理过」。**HEVC 绝不能走 fastcopy**：实测同一条 2560×1920 的 HEVC 手机素材，输出侧 seek 会**静默丢帧**（请求 2 秒只产出 34 帧 / 1.23 秒画面，拼接后还报 `Could not find ref with POC 610`，参考帧被丢掉），而完全相同的命令在 H.264 素材上正确（60 帧 / 2.013 秒）。原因是 HEVC 的 dts/pts 重排让 muxer「丢弃到目标点」的逻辑误判。带旋转元数据的素材同样不走 fastcopy：copy 会保留元数据、reencode 由 ffmpeg 的 autorotate 把旋转烘进像素（缩略图逐帧比对方向一致），但 **concat 不保证把 display matrix 带进成片**。
+   - **段落产出后要校验「有视频包」**（`segment_video_packets`）：空段会让 concat 拼出时间轴重叠的垃圾，宁可明确报错「请改用精确重编码」，也不要静默出片。
+   - **拼接后要校验成片时长**（`media_duration` 与各段之和比，阈值 0.3 秒；正常偏差实测只有 0.008 秒）：段音频时间戳异常时 concat 会产出偏长的片子，宁可报错让用户改用精确重编码，也不要静默交付。
+   - **抽音轨写 32-bit float（`-c:a pcm_f32le`）且保持源采样率与声道数**。位深不能退回 16-bit（理由同硬约束 3）；也不要在抽取时下混、重采样，格式转换交给 `noiseReduction.ts` 的 `renderBuffer`。前端读回走 `floatWavToBuffer` 自解析。**波形与播放侧电平按声道下混成一条**显示，与按所有声道统计的处理链同口径。
+   - **两条路的音频处理不同，别统一**：
+     - `fastcopy` 用 `-c:a copy` 原样拷贝（这条路上音频一定未被处理过）。
+     - `reencode` **必须把音轨也重编码为 AAC**（`-c:a aac`，码率 ≥ 每声道 96k 且不低于源码率）。**不要在这里 copy 源音轨** —— 手机录的素材常带 skip samples 前置边数据（实测一条 AAC 首包带 `Skip Samples,41231` = 0.859 秒），copy 会把它带进每一段，而 concat 按时间戳累加后整片错位（实测 6 秒成片变 **6.863 秒、音画差 0.86 秒**）；重编码后实测 6.021 秒 / 180 帧、音频轮廓与预期逐块吻合。**0.1.63 曾据 OBS 素材断言「`-c:a copy` 两条路都安全」—— 那条结论只对没有 priming 边数据的素材成立，0.1.64 已推翻。**
+     - 处理过音频（降噪 / 压缩 / 响度归一化）时用前端渲染的成片音轨回写（`-map 1:a`），此时**必须走 reencode**：处理后音轨的时间轴是「保留区间拼接而成」，起点没法跟着视频吸附到关键帧。回写判据：`hasEnhancedAudio || hasLoudnessApplied || hasCompressionApplied`。转录只读不回写。
+   - **ffmpeg 能力探测与会选择同等重要**。系统里常有多份 ffmpeg（PATH 前面可能是某个应用自带的精简构建，实测 Krita 那份既没有 libx264 也没有 lavfi），探测时**优先选带 libx264 的那一份**，并在 `FfmpegInfo.hasLibx264` 里如实上报，前端据此禁用「精确重编码」、给出「指定 ffmpeg」入口。**ffprobe 必须与 ffmpeg 成套**：先看同目录，再按 PATH / 常见安装位搜一遍，都没有就明确报「未找到 ffprobe」，不要被误报成「不支持的视频」。关键帧用 `ffprobe -select_streams v:0 -skip_frame nokey -show_entries frame=pts_time` 取（比扫全部 packet 便宜，也不受 OBS 的 fragmented MP4 没有 stss 表影响），**原样保留精度、不要四舍五入**。
+   - **大文件全程「路径 + 流」**：导入用 `dialog.open` 拿路径（不走 `<input type=file>` + `arrayBuffer`），画面预览走 asset 协议流式读原文件。`assetProtocol.scope` 故意留空，只由 `allow_video_asset` / `forbid_video_asset` 动态放行当前导入的**那一个**文件 —— **不要退回 `scope: ["**"]`**。CSP 的 `media-src` 需同时含 `asset:` 与 `http://asset.localhost`；改动 `tauri.conf.json` 后必须完全重启 `pnpm tauri dev`。
+   - 拒绝导入的边界（0.1.64 现状）：无音轨、多音轨、变帧率、**音轨与画面起点相差超过 50 ms**（抽出的音轨从 0 起算，会与画面整体错位）。**HEVC 与带旋转元数据的素材已放开**（2026-09-26 实测后决定）：允许导入，但前端据 `videoCodec` / `rotated` 强制改用精确重编码（HEVC 输出 H.264，因此只需要 libx264 一项能力）。另外**判 VFR 不能只看相邻 pts 间隔**：HEVC 的 B 帧重排会造出 -0.067 / 0.133 这种假信号，要看 `packet=duration_time` 与固定窗口内的包数。
+   - 事件与临时文件：抽音轨进度 `video-extract-progress`（payload 是**当前秒数**），导出进度 `video-export-progress`（payload 是**百分比**），取消走 `cancel_video_export`（kill 子进程，片段与 concat 清单由 `TempGuard` 清理）。抽出的音轨、导出片段、重映射字幕统一落 `gap_gone_temp_dir()`，命名 `gap-gone-*`，过 `validate_temp_recording_path` 校验。
+   - **字幕这轮只做「重映射后的 SRT」**（工具栏勾选项，写到视频旁边）：转录时间码在源时间轴上，导出前必须用 `mapRangeToKept` 换算到成片时间轴再 `buildSrt`。**烧录（`-vf subtitles`）尚未实现**，且它必须重编码画面（与 fastcopy 档冲突）、依赖 libass（很多构建没有，实测 Krita 那份没有、LosslessCut 自带的 7.1.1 有）、中文字体还需 `force_style` 兜底。
+
 ## 未结项（0.1.60 留待彻查）
 
 0.1.60 那一轮改动留了尾巴，别当成已完成。现象、复现步骤与排查方向写在 `docs.md` 的「未结项（0.1.60 留待彻查）」，这里只列清单与判据：
@@ -74,6 +96,8 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 2. ~~降噪会在个别块上凭空抬高 5–16 kHz（偶发伪影）~~ —— **0.1.61 已定位并修复，关闭**。根因是每个降噪任务里多调的那套 `init()`/`reset()`/`init_norm_states()`（见硬约束 6），**不是模型、也不是 `atten_lim`**（当时测出「与档位无关」，恰恰是因为根因在接线里）。修复后同素材同档位的逐块 5–16 kHz 改动为「中位 −1.2 / P90 −0.3 / 最大值 −0.1 dB / 0 个块上升」，与官方参考实现逐块一致。当时的现场记录（影响面速查表、绝对电平表、听点 6.5 s 与 9.3 s）保留在 `docs.md` 的对应小节，可作前后对照。
 3. **归一与真峰值限幅是校验盲区**。到目前为止对链路的数字复刻只覆盖到压缩为止（高通 / 扩展 / 压缩），播报里的「响度前 → 后 / 最终真峰值 / 限幅衰减」没有独立校验手段；下次再怀疑播报数字时先补上这一段，否则又会把复刻误差误判成代码 bug。
 4. **导出位深 / 采样率：已评估、结论已定、暂不实施**（详见 `docs.md` 的「导出位深与采样率评估」）。要点：① 链路里有**两处** 16-bit，上游是**录音落盘**（`lib.rs` 的 `WavSpec` 写 i16，而设备多数给 float32 —— 浮点采样一进门就被砍），下游是 `bufferToWav` 的硬编码 16-bit；② **改 24-bit 的听感收益为零**（16-bit 量化噪声 ≈ −101 dBFS，比这类素材 −47 dBFS 的底噪低 54 dB，早被掩蔽），它的价值只在**交接与往返**（48 kHz / 24-bit 是视频后期与 DAW 的通用工作格式）；③ 两处比位深更值得动的地方 —— **采样率跟随设备、不保证 48 kHz**（`buildExportBuffer` 不重采样，44.1 kHz 麦就会导 44.1 kHz），以及 `bufferToWav` 里 `sample | 0` 是**向零截断**而不是四舍五入；④ 真要动时：**`bufferToWav` 不能整体改**（播放源、转录输入、导出三处共用），必须给导出单写一个 24-bit 编码器 + 设置项 `exportFormat` / `exportBitrate` 旁边加位深。
+5. **视频侧的剩余项（0.1.62 实测后的状态）**。copy 档的切点与 A/V 对齐已实测完毕并修好（结论见硬约束 19），剩下两件：① **烧录字幕**尚未实现 —— 需要 libass 能力探测、必须重编码画面、中文字体要 `force_style` 兜底；动手前先用 `ffmpeg -filters` 确认所选构建带 `subtitles` 滤镜（实测 Krita 自带的没有、LosslessCut 自带的 7.1.1 有）。② **换素材 / 换 ffmpeg 的回归**：本次结论全部来自一条 OBS 素材（H.264 1080p30、关键帧间隔 8.3 秒、fragmented MP4、音画同起点）。遇到**普通（非 fragmented）MP4、关键帧间隔 ≤ 1 秒、或从 HEVC 转出来的 H.264** 时，重点回归两件事：无损快速档的切点是否仍精确（`ffprobe -select_streams v:0 -count_packets` 看段的物理包数是否等于真实时长，明显超出就是 pre-roll 又被写进文件了）、以及 concat 后成片时长是否等于各段时长之和。复现命令记在 `docs.md` 的「视频支持」一节。
+
 
 ## 安全基线
 
@@ -95,7 +119,7 @@ Rust 侧改动可用 `cargo check`/`cargo build`（在 `src-tauri/` 下）快速
 
 * `denoise` 是派生操作，绝不能覆盖原始录音。
 
-* **播放速度与循环是会话内参数**，不写 localStorage：重启回到 1.0× 且不循环。它们是试听工具而不是文件属性，持久化容易让人误以为音频本身变快了、或者导出会跟着变。
+* **播放速度与循环是会话内参数**，不写 localStorage：重启回到 1.0× 且不循环。它们是试听工具而不是文件属性，持久化容易让人误以为音频本身变快了、或者导出会跟着变。视频的**导出档位（无损快速 / 精确重编码）与「字幕 SRT」勾选**同理，也是会话内参数；只有**用户手动指定的 ffmpeg 路径**要落盘（`settings.ts` 的 `gap-gone-ffmpeg-path`，自定义优先于 PATH 探测）。
 
 * **改快捷键要同步四处**：`handleKeyDown` 的分支、`isToolbarShortcut` 白名单、按钮的 `aria-keyshortcuts` 与角标、`HelpModal` 的快捷键表。注意 `L` 已归循环播放，响度标准化是 `⇧L`；`[` `]` 调播放速度，别被 range 滑条的焦点守卫挡掉（该守卫已排除 `input[type=range]`）。
 

@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { readFile, writeFile } from "@tauri-apps/plugin-fs";
 import WaveformScore from "./components/WaveformScore";
 import HelpModal from "./components/HelpModal";
 import PlaybackSidebar, {
   SPEED_STEPS,
 } from "./components/PlaybackSidebar";
+import VideoPreview from "./components/VideoPreview";
 import {
   getKeptRegions,
+  mapRangeToKept,
   mergeRegions,
   nextPlayableTime,
   normalizeRegions,
@@ -25,6 +30,7 @@ import {
   getCompressionPreset,
   getExportBitrate,
   getExportFormat,
+  getFfmpegPath,
   getLufsTarget,
   getNoisePreset,
   getSilencePreset,
@@ -35,6 +41,7 @@ import {
   setCompressionPreset as persistCompressionPreset,
   setExportBitrate,
   setExportFormat,
+  setFfmpegPath as persistFfmpegPath,
   setLufsTarget as persistLufsTarget,
   setNoisePreset as persistNoisePreset,
   setSilencePreset as persistSilencePreset,
@@ -54,6 +61,7 @@ import {
 import {
   applyNoiseReduction,
   cancelDeepFilterProcessing,
+  floatWavToBuffer,
   type NoisePreset,
 } from "./utils/noiseReduction";
 import {
@@ -64,6 +72,7 @@ import {
   type CompressionPreset,
 } from "./utils/compression";
 import {
+  buildSrt,
   cancelTranscribe,
   checkTranscribeModel,
   downloadTranscribeModel,
@@ -126,6 +135,83 @@ const silencePresetLabels: Record<SilencePreset, string> = {
   natural: "自然",
   relaxed: "宽松",
 };
+
+/** detect_ffmpeg 的返回：系统 / 用户指定路径的 ffmpeg 探测结果。 */
+interface FfmpegInfo {
+  found: boolean;
+  path: string | null;
+  version: string | null;
+  /** 该构建是否带 libx264：决定「精确重编码」档能不能用。 */
+  hasLibx264: boolean;
+}
+
+/** probe_video 的返回（ffprobe JSON 提炼）。 */
+interface VideoProbe {
+  duration: number;
+  width: number;
+  height: number;
+  videoCodec: string;
+  audioCodec: string;
+  sampleRate: number;
+  channels: number;
+  audioBitrate: number | null;
+  /** 画面是否带旋转元数据（手机竖拍）：允许导入，但禁用「无损快速」。 */
+  rotated: boolean;
+  /** 关键帧时间戳（秒，升序，ffprobe 原始精度）。无损快速档只能从关键帧起切。 */
+  keyframes: number[];
+}
+
+/** 已导入视频的上下文；存在即处于视频模式，导出走 export_video。 */
+interface VideoAsset {
+  /** 原视频绝对路径（ffmpeg 输入）。 */
+  path: string;
+  /** convertFileSrc 转出的 asset 协议地址（<video> 预览用）。 */
+  src: string;
+  /** 原音轨码率，回写 AAC 时用作码率下限。 */
+  audioBitrate: number | null;
+  /** 视频编码名（h264 / hevc…）。非 H.264 只能走精确重编码。 */
+  videoCodec: string;
+  /** 原音轨声道数，重编码回写 AAC 时用来定码率下限（每声道 96k）。 */
+  channels: number;
+  /** 是否带旋转元数据，带则只能走精确重编码。 */
+  rotated: boolean;
+  /** 关键帧时间戳（秒，升序），无损快速档的吸附基准。 */
+  keyframes: number[];
+}
+
+/** 视频导出编码档位：fastcopy（默认，不重编码，快）/ reencode（帧精确，慢）。 */
+type VideoExportVariant = "fastcopy" | "reencode";
+
+/**
+ * 无损快速档的切点对齐容差（秒）：切点落在关键帧附近这个范围内，
+ * 吸附造成的偏移可以忽略；超出就说明这次剪辑无法在不重编码的前提下完成。
+ */
+const FASTCOPY_ALIGN_TOLERANCE = 0.1;
+/**
+ * 吸附后的起点再往回让 1 ms。关键帧时间戳是 6 位小数（如 16.666667，真值 16.6666666…），
+ * 直接拿它当 `-ss`，一旦被四舍五入抬高就会越过关键帧 —— 输出侧 seek 会因此丢掉整段画面。
+ */
+const FASTCOPY_SEEK_EPSILON = 0.001;
+
+function lastKeyframeAtOrBefore(keyframes: number[], time: number): number {
+  let result = 0;
+  for (const keyframe of keyframes) {
+    if (keyframe <= time + 1e-9) {
+      result = keyframe;
+    } else {
+      break;
+    }
+  }
+  return result;
+}
+
+function maxKeyframeInterval(keyframes: number[]): number {
+  let max = 0;
+  for (let index = 1; index < keyframes.length; index += 1) {
+    max = Math.max(max, keyframes[index] - keyframes[index - 1]);
+  }
+  return max;
+}
 
 function formatDb(value: number) {
   return Number.isFinite(value) ? `${value.toFixed(1)} dBFS` : "-∞ dBFS";
@@ -389,19 +475,29 @@ function toDb(value: number) {
 /**
  * 从当前播放位置取一个窗口的采样算 RMS/Peak，不依赖 AnalyserNode 过音频图。
  * 窗口长度由调用方按秒数换算（见 PLAYBACK_METER_WINDOW_SEC），不再写死。
+ * 多声道按所有声道下混后统计：只读左声道会低估立体声素材的峰值，
+ * 与整段峰值（bufferTruePeakDb）的口径也不一致。
  */
 function levelFromBuffer(buffer: AudioBuffer, time: number, windowSize: number) {
-  const channel = buffer.getChannelData(0);
+  const channels = Array.from({ length: buffer.numberOfChannels }, (_, index) =>
+    buffer.getChannelData(index),
+  );
+  const sampleCount = channels[0].length;
   const start = Math.max(
     0,
-    Math.min(channel.length - 1, Math.floor(time * buffer.sampleRate)),
+    Math.min(sampleCount - 1, Math.floor(time * buffer.sampleRate)),
   );
-  const end = Math.min(channel.length, start + windowSize);
+  const end = Math.min(sampleCount, start + windowSize);
   const count = Math.max(1, end - start);
   let sumSquares = 0;
   let peak = 0;
   for (let i = start; i < end; i++) {
-    const sample = channel[i];
+    let sample = channels[0][i];
+    if (channels.length > 1) {
+      sample = 0;
+      for (const data of channels) sample += data[i];
+      sample /= channels.length;
+    }
     sumSquares += sample * sample;
     const abs = Math.abs(sample);
     if (abs > peak) peak = abs;
@@ -446,6 +542,27 @@ function App() {
   const noticeTimerRef = useRef<number>(0);
   /** 设置面板打开时的快照，供「取消」回退；面板关闭时清空。 */
   const setupSnapshotRef = useRef<SetupSnapshot | null>(null);
+
+  // ---- 视频模式的状态：videoAsset 为 null 即纯音频模式 ----
+  const [videoAsset, setVideoAsset] = useState<VideoAsset | null>(null);
+  const [ffmpegInfo, setFfmpegInfo] = useState<FfmpegInfo | null>(null);
+  const [ffmpegGuideOpen, setFfmpegGuideOpen] = useState(false);
+  /** 导入阶段：extract = ffmpeg 抽音轨（有百分比），decode = 前端解析进缓冲。 */
+  const [videoImportStage, setVideoImportStage] = useState<
+    "extract" | "decode" | null
+  >(null);
+  const [videoImportProgress, setVideoImportProgress] = useState<number | null>(
+    null,
+  );
+  // 导出档位与「是否顺带写一份字幕」是会话内选择，不落盘（和播放速度同一类参数）。
+  const [videoExportVariant, setVideoExportVariant] =
+    useState<VideoExportVariant>("fastcopy");
+  const [videoExportProgress, setVideoExportProgress] = useState<number | null>(
+    null,
+  );
+  const [exportSubtitles, setExportSubtitles] = useState(false);
+  /** 已放行给 asset 协议的视频路径，换素材或关闭视频时收回。 */
+  const assetAllowedRef = useRef<string | null>(null);
 
   /**
    * 展示提示：info（成功/结果通知）3 秒后自动消失；
@@ -1045,6 +1162,7 @@ function App() {
       setHasEnhancedAudio(false);
       setTranscript(null);
       resetEditing();
+      clearVideoAsset();
     } catch {
       notify("无法解析音频文件", "error");
     } finally {
@@ -1235,8 +1353,392 @@ function App() {
     }, 250);
   };
 
+  // ---- 视频模式：ffmpeg 解析 / 导入 / 导出 ----
+
+  /**
+   * 音轨是否被处理过（降噪 / 压缩 / 响度归一化任一）。
+   * 处理过就必须把前端渲染的成片音轨回写进视频；只做过切除则一律 copy 原音轨，
+   * 保住原始声道数与码率。
+   */
+  const audioProcessed =
+    hasEnhancedAudio || hasLoudnessApplied || hasCompressionApplied;
+
+  /**
+   * 无损快速档（画面不重编码）只能从关键帧起切。这里按探测到的关键帧算出：本次剪辑的切点
+   * 是否都落在关键帧上、吸附会造成多大偏移。不满足就不能硬上 —— 吸附会把切点整体挪到
+   * 关键帧（OBS 默认关键帧间隔可达 8.3 秒），删除区间可能直接失效。
+   * fullCover 表示整段保留（没有剪切）：这种导出只是重新封装，任何编码都安全。
+   */
+  const fastcopyPlan = useMemo(() => {
+    if (!videoAsset || !audioBuffer) return null;
+    const kept = getKeptRegions(deletedRegions, audioBuffer.duration);
+    let aligned = kept.length > 0;
+    let maxShift = 0;
+    let previousEnd = 0;
+    for (const region of kept) {
+      const keyframe = lastKeyframeAtOrBefore(videoAsset.keyframes, region.start);
+      maxShift = Math.max(maxShift, region.start - keyframe);
+      // 吸附点退回到上一个保留区间的尾巴里 → 等于把已经删掉的内容又搬回来
+      if (keyframe < previousEnd - 0.05) aligned = false;
+      if (
+        region.start - keyframe > FASTCOPY_ALIGN_TOLERANCE ||
+        keyframe >= region.end
+      ) {
+        aligned = false;
+      }
+      previousEnd = region.end;
+    }
+    const fullCover =
+      kept.length === 1 &&
+      kept[0].start <= 0.05 &&
+      kept[0].end >= audioBuffer.duration - 0.05;
+    return {
+      kept,
+      aligned,
+      maxShift,
+      fullCover,
+      keyframeInterval: maxKeyframeInterval(videoAsset.keyframes),
+    };
+  }, [videoAsset, audioBuffer, deletedRegions]);
+
+  const ffmpegHasLibx264 = ffmpegInfo?.hasLibx264 ?? false;
+  /**
+   * 无损快速档的适用条件：
+   * - 整段保留（没有剪切）→ 只是重新封装，任何编码都安全；
+   * - 有剪切 → 必须是 H.264、无旋转元数据、切点都落在关键帧上，且音频未被处理过。
+   *   HEVC 上输出侧 seek 会静默丢帧（实测 2 秒只剩 34 帧）；带旋转的素材在 concat 后
+   *   不保证还留着 display matrix；处理过音频的音轨起点没法跟着视频吸附到关键帧。
+   */
+  const fastcopyAvailable =
+    Boolean(fastcopyPlan) &&
+    !audioProcessed &&
+    (fastcopyPlan!.fullCover ||
+      (fastcopyPlan!.aligned &&
+        videoAsset?.videoCodec === "h264" &&
+        !videoAsset?.rotated));
+  /** 实际使用的档位：选了快速档但不可用时降级为精确重编码，并在导出前说明原因。 */
+  const effectiveVariant: VideoExportVariant =
+    videoExportVariant === "fastcopy" && fastcopyAvailable ? "fastcopy" : "reencode";
+  const fastcopyFallbackReason = useMemo(() => {
+    if (videoExportVariant !== "fastcopy" || fastcopyAvailable) return null;
+    if (audioProcessed) return "音轨已被处理过（降噪 / 压缩 / 响度归一化）";
+    if (videoAsset && videoAsset.videoCodec !== "h264") {
+      return `该素材是 ${videoAsset.videoCodec.toUpperCase()} 编码，无损快速会丢画面（将转成 H.264）`;
+    }
+    if (videoAsset?.rotated) return "该素材带旋转元数据，拼接后方向不保证正确";
+    if (!fastcopyPlan?.aligned) {
+      const interval = fastcopyPlan?.keyframeInterval ?? 0;
+      return interval > 0
+        ? `切点不在关键帧上（该素材关键帧间隔约 ${interval.toFixed(1)} 秒）`
+        : "切点不在关键帧上";
+    }
+    return null;
+  }, [videoExportVariant, fastcopyAvailable, audioProcessed, fastcopyPlan, videoAsset]);
+
+  /** 收回 asset 协议的单个文件放行。 */
+  const releaseVideoAsset = useCallback((path: string | null) => {
+    if (!path) return;
+    if (assetAllowedRef.current === path) assetAllowedRef.current = null;
+    void invoke("forbid_video_asset", { path }).catch(() => undefined);
+  }, []);
+
+  /** 退出视频模式（打开音频文件、新录音时调用）。 */
+  const clearVideoAsset = useCallback(() => {
+    releaseVideoAsset(assetAllowedRef.current);
+    setVideoAsset(null);
+  }, [releaseVideoAsset]);
+
+  /** 解析可用的 ffmpeg 路径；未安装时打开引导弹框并返回 null。 */
+  const resolveFfmpeg = useCallback(async (): Promise<string | null> => {
+    if (!isTauriDesktop()) return null;
+    const custom = getFfmpegPath();
+    let info = await invoke<FfmpegInfo>("detect_ffmpeg", {
+      customPath: custom || null,
+    });
+    if (!info.found && custom) {
+      // 手动指定的路径失效（升级 / 移动后），回退自动探测
+      info = await invoke<FfmpegInfo>("detect_ffmpeg", { customPath: null });
+    }
+    setFfmpegInfo(info);
+    if (!info.found || !info.path) {
+      setFfmpegGuideOpen(true);
+      return null;
+    }
+    return info.path;
+  }, []);
+
+  const recheckFfmpeg = useCallback(async () => {
+    const ffmpeg = await resolveFfmpeg();
+    if (ffmpeg) {
+      setFfmpegGuideOpen(false);
+      notify("ffmpeg 已就绪，可以打开视频了");
+    }
+  }, [resolveFfmpeg, notify]);
+
+  const pickFfmpegPath = useCallback(async () => {
+    const picked = await openDialog({
+      multiple: false,
+      // 非 Windows 的可执行文件没有扩展名，不设过滤器（设置过滤器会让它从列表里消失）
+      filters: navigator.userAgent.includes("Windows")
+        ? [{ name: "ffmpeg 可执行文件", extensions: ["exe"] }]
+        : undefined,
+    });
+    const path = typeof picked === "string" ? picked : null;
+    if (!path) return;
+    const info = await invoke<FfmpegInfo>("detect_ffmpeg", { customPath: path });
+    if (info.found) {
+      persistFfmpegPath(path);
+      setFfmpegInfo(info);
+      setFfmpegGuideOpen(false);
+      notify("ffmpeg 已就绪，可以打开视频了");
+    } else {
+      notify("该路径无法运行 ffmpeg，请确认选择的是 ffmpeg 可执行文件", "error");
+    }
+  }, [notify]);
+
+  /**
+   * 打开视频：dialog 拿路径（不走 <input type=file>，大文件不进内存）→
+   * ffmpeg 抽音轨到临时目录 → 前端解析进现有编辑管线，波形 / 静音 / 切除全部复用。
+   */
+  const handleVideoUpload = useCallback(async () => {
+    if (!isTauriDesktop() || !audioContextRef.current) return;
+    if (
+      isProcessing ||
+      recorder.status === "recording" ||
+      recordingCountdown !== null
+    ) {
+      return;
+    }
+    const ffmpeg = await resolveFfmpeg();
+    if (!ffmpeg) return; // 引导弹框已打开
+    const picked = await openDialog({
+      multiple: false,
+      filters: [
+        {
+          name: "视频",
+          extensions: ["mp4", "mov", "mkv", "webm", "avi", "m4v"],
+        },
+      ],
+    });
+    const path = typeof picked === "string" ? picked : null;
+    if (!path) return;
+    setIsProcessing(true);
+    setVideoImportStage("extract");
+    setVideoImportProgress(0);
+    let extractedPath: string | null = null;
+    let unlistenExtract: (() => void) | null = null;
+    try {
+      const probe = await invoke<VideoProbe>("probe_video", { ffmpeg, path });
+      // 抽音轨进度：payload 是当前秒数，占总进度 0-95%，留 5% 给前端解析
+      unlistenExtract = await listen<number>(
+        "video-extract-progress",
+        (event) => {
+          if (probe.duration > 0) {
+            setVideoImportProgress(
+              Math.min(95, (event.payload / probe.duration) * 95),
+            );
+          }
+        },
+      );
+      extractedPath = await invoke<string>("extract_video_audio", {
+        ffmpeg,
+        videoPath: path,
+      });
+      setVideoImportProgress(95);
+      setVideoImportStage("decode");
+      stopPlayback(false);
+      // ffmpeg 写的是 32-bit float WAV，自解析读回（与降噪结果同一条路），
+      // 不走 decodeAudioData：float WAVE_FORMAT_EXTENSIBLE 的解码支持视 WebView 而定。
+      const decoded = floatWavToBuffer(
+        audioContextRef.current,
+        await readFile(extractedPath),
+      );
+      // asset 协议只放行当前这一个视频文件，放新的之前先收回旧的
+      releaseVideoAsset(assetAllowedRef.current);
+      await invoke("allow_video_asset", { path });
+      assetAllowedRef.current = path;
+      setAudioBuffer(decoded);
+      originalBufferRef.current = decoded;
+      setHasEnhancedAudio(false);
+      setTranscript(null);
+      resetEditing();
+      setVideoAsset({
+        path,
+        src: convertFileSrc(path),
+        audioBitrate: probe.audioBitrate,
+        videoCodec: probe.videoCodec,
+        channels: probe.channels,
+        rotated: probe.rotated ?? false,
+        keyframes: probe.keyframes ?? [0],
+      });
+      notify(
+        `视频已导入（${probe.width}×${probe.height}，${probe.videoCodec.toUpperCase()}，音轨 ${probe.sampleRate} Hz）：照常编辑波形与区间，导出时生成视频`,
+      );
+    } catch (cause) {
+      notify(
+        `视频导入失败：${cause instanceof Error ? cause.message : String(cause)}`,
+        "error",
+      );
+    } finally {
+      unlistenExtract?.();
+      setVideoImportStage(null);
+      setVideoImportProgress(null);
+      setIsProcessing(false);
+      if (extractedPath) {
+        void invoke("delete_recording_file", { path: extractedPath }).catch(
+          () => undefined,
+        );
+      }
+    }
+  }, [
+    isProcessing,
+    recorder.status,
+    recordingCountdown,
+    resolveFfmpeg,
+    stopPlayback,
+    releaseVideoAsset,
+    notify,
+  ]);
+
+  /**
+   * 视频导出。未处理过音频时 ffmpeg 直接切原音轨（-c:a copy，保留原声道与码率）；
+   * 处理过降噪 / 压缩 / 响度归一化时，把「处理后 + 已切除」的音轨写临时 WAV 回写。
+   * 默认档不重编码画面（快、无损），代价是切点落在关键帧附近。
+   */
+  const handleVideoExport = useCallback(async () => {
+    if (!audioBuffer || !videoAsset) return;
+    const ffmpeg = await resolveFfmpeg();
+    if (!ffmpeg) return; // 引导弹框已打开
+    if (effectiveVariant === "reencode" && ffmpegInfo && !ffmpegInfo.hasLibx264) {
+      notify(
+        `当前 ffmpeg（${ffmpegInfo.path ?? "未知路径"}）不带 libx264，无法精确重编码。请手动指定一份完整构建，或把 OBS 的关键帧间隔设为 1 秒后重录`,
+        "error",
+      );
+      return;
+    }
+    if (fastcopyFallbackReason) {
+      notify(`本次改用「精确重编码」：${fastcopyFallbackReason}`);
+    }
+    const outputPath = await saveDialog({
+      defaultPath: createExportFileName(
+        "mp4",
+        transcript ? extractKeyword(transcript.segments) : null,
+      ),
+      filters: [{ name: "MP4 视频", extensions: ["mp4"] }],
+    });
+    if (!outputPath) return;
+    stopPlayback(false);
+    setVideoExportProgress(0);
+    const unlisten = await listen<number>("video-export-progress", (event) => {
+      setVideoExportProgress(Math.max(0, event.payload));
+    });
+    let processedAudioPath: string | null = null;
+    let subtitlePath: string | null = null;
+    try {
+      let audioPath: string | null = null;
+      if (audioProcessed) {
+        const wav = bufferToWav(buildExportBuffer(audioBuffer, deletedRegions));
+        const prepared = await invoke<string>("prepare_video_export_audio");
+        await writeFile(prepared, new Uint8Array(await wav.arrayBuffer()));
+        processedAudioPath = prepared;
+        audioPath = prepared;
+      }
+      if (exportSubtitles && transcript) {
+        // 转录时间码在源时间轴上，成片已跳过切除区间，必须重映射到成片时间轴
+        const cues = transcript.segments.flatMap((segment) =>
+          mapRangeToKept(segment, deletedRegions, audioBuffer.duration).map(
+            (piece) => ({ start: piece.start, end: piece.end, text: segment.text }),
+          ),
+        );
+        const prepared = await invoke<string>("prepare_video_export_subtitles");
+        await writeFile(prepared, new TextEncoder().encode(buildSrt(cues)));
+        subtitlePath = prepared;
+      }
+      const kept =
+        fastcopyPlan?.kept ?? getKeptRegions(deletedRegions, audioBuffer.duration);
+      if (!kept.length) {
+        throw new Error("不能导出空视频，请至少保留一段内容");
+      }
+      // 无损快速档把每段起点吸附到「不超过该点的最近关键帧」，再往回让 1 ms
+      // （关键帧时间戳只有 6 位小数，抬高一点就会越过它，输出侧 seek 会因此丢掉整段画面）
+      const planned =
+        effectiveVariant === "fastcopy"
+          ? kept.map((region) => ({
+              start: Math.max(
+                0,
+                lastKeyframeAtOrBefore(videoAsset.keyframes, region.start) -
+                  FASTCOPY_SEEK_EPSILON,
+              ),
+              end: region.end,
+            }))
+          : kept;
+      const regionsJson = JSON.stringify(
+        planned.map((region) => [
+          Number(region.start.toFixed(6)),
+          Number(region.end.toFixed(6)),
+        ]),
+      );
+      await invoke("export_video", {
+        ffmpeg,
+        inputPath: videoAsset.path,
+        audioPath,
+        subtitlesPath: subtitlePath,
+        regionsJson,
+        outputPath,
+        variant: effectiveVariant,
+        totalDuration: audioBuffer.duration,
+        sourceBitrate: videoAsset.audioBitrate,
+        sourceChannels: videoAsset.channels,
+      });
+      notify(
+        effectiveVariant === "fastcopy"
+          ? `视频导出成功${subtitlePath ? "，字幕已写到视频旁边" : ""}（无损快速：画面未重编码）`
+          : `视频导出成功${subtitlePath ? "，字幕已写到视频旁边" : ""}`,
+      );
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      if (message.includes("取消")) {
+        notify("视频导出已取消");
+      } else {
+        notify(`视频导出失败：${message}`, "error");
+      }
+    } finally {
+      unlisten();
+      setVideoExportProgress(null);
+      if (processedAudioPath) {
+        void invoke("delete_recording_file", { path: processedAudioPath }).catch(
+          () => undefined,
+        );
+      }
+      if (subtitlePath) {
+        void invoke("delete_recording_file", { path: subtitlePath }).catch(
+          () => undefined,
+        );
+      }
+    }
+  }, [
+    audioBuffer,
+    videoAsset,
+    audioProcessed,
+    deletedRegions,
+    exportSubtitles,
+    videoExportVariant,
+    effectiveVariant,
+    fastcopyPlan,
+    fastcopyFallbackReason,
+    ffmpegInfo,
+    transcript,
+    resolveFfmpeg,
+    stopPlayback,
+    notify,
+  ]);
+
   const handleExport = useCallback(async () => {
     if (!audioBuffer) return;
+    if (videoAsset) {
+      await handleVideoExport();
+      return;
+    }
     setIsProcessing(true);
     try {
       // WAV 为默认格式（同步 PCM 编码）；MP3 走纯 JS 编码，分块让出主线程
@@ -1263,7 +1765,15 @@ function App() {
     } finally {
       setIsProcessing(false);
     }
-  }, [audioBuffer, deletedRegions, exportBitrate, exportFormat, transcript]);
+  }, [
+    audioBuffer,
+    deletedRegions,
+    exportBitrate,
+    exportFormat,
+    videoAsset,
+    handleVideoExport,
+    transcript,
+  ]);
 
   const confirmRecording = async () => {
     if (!recorder.recordedBlob || !audioContextRef.current) return;
@@ -1278,6 +1788,7 @@ function App() {
       setHasEnhancedAudio(false);
       setTranscript(null);
       resetEditing();
+      clearVideoAsset();
       recorder.clearReview();
     } catch {
       notify("无法解析这段录音", "error");
@@ -2027,6 +2538,26 @@ function App() {
               style={{ display: "none" }}
             />
           </label>
+          {isTauriDesktop() && (
+            <button
+              onClick={() => void handleVideoUpload()}
+              disabled={
+                isProcessing ||
+                recorder.status === "recording" ||
+                recordingCountdown !== null
+              }
+              title="导入视频文件：抽出音轨照常编辑，导出时生成 MP4（需要系统 ffmpeg）"
+            >
+              打开视频
+            </button>
+          )}
+          {videoImportStage && (
+            <span className="denoise-progress">
+              {videoImportStage === "extract"
+                ? `提取音轨 ${Math.round(videoImportProgress ?? 0)}%`
+                : "解析音轨…"}
+            </span>
+          )}
           <button
             onClick={startRecordingWithCountdown}
             title="快捷键 R：开始录音"
@@ -2168,10 +2699,85 @@ function App() {
         </div>
         <span className="toolbar-divider" aria-hidden="true" />
         <div className="toolbar-group" aria-label="输出和帮助">
-          <button onClick={handleExport} disabled={!audioBuffer || isProcessing}>
-            导出 {exportFormat === "mp3" ? "MP3" : "WAV"}{" "}
+          {videoAsset && (
+            <>
+              <select
+                className="video-variant"
+                value={videoExportVariant}
+                onChange={(event) =>
+                  setVideoExportVariant(event.target.value as VideoExportVariant)
+                }
+                disabled={videoExportProgress !== null}
+                aria-label="视频导出档位"
+                title="无损快速：画面不重编码，秒级完成，但只能从关键帧起切；精确重编码：切点精确到帧，慢且有损，需要 ffmpeg 带 libx264"
+              >
+                <option value="fastcopy" disabled={!fastcopyAvailable}>
+                  视频：无损快速{fastcopyAvailable ? "" : "（本次不可用）"}
+                </option>
+                <option value="reencode" disabled={!ffmpegHasLibx264}>
+                  视频：精确重编码{ffmpegHasLibx264 ? "" : "（缺 libx264）"}
+                </option>
+              </select>
+              {ffmpegInfo && !ffmpegInfo.hasLibx264 && (
+                <>
+                  <span className="video-export-hint">
+                    当前 ffmpeg 不带 libx264，精确重编码不可用
+                  </span>
+                  <button onClick={() => setFfmpegGuideOpen(true)}>
+                    指定 ffmpeg
+                  </button>
+                </>
+              )}
+              {fastcopyFallbackReason && (
+                <span className="video-export-hint">
+                  无损快速不可用：{fastcopyFallbackReason}
+                </span>
+              )}
+              {fastcopyAvailable &&
+                fastcopyPlan &&
+                !fastcopyPlan.fullCover &&
+                fastcopyPlan.keyframeInterval > 1.5 && (
+                  <span className="video-export-hint">
+                    关键帧间隔约 {fastcopyPlan.keyframeInterval.toFixed(1)} 秒，切点会吸附到关键帧
+                  </span>
+                )}
+            </>
+          )}
+          {videoAsset && (
+            <label
+              className="video-subtitle-toggle"
+              title="把转录结果按成片时间轴重映射后，与视频一起导出为同名 .srt（需要先转录）"
+            >
+              <input
+                type="checkbox"
+                checked={exportSubtitles}
+                disabled={!transcript}
+                onChange={(event) => setExportSubtitles(event.target.checked)}
+              />
+              字幕 SRT
+            </label>
+          )}
+          <button
+            onClick={handleExport}
+            disabled={!audioBuffer || isProcessing || videoExportProgress !== null}
+          >
+            导出 {videoAsset ? "视频" : exportFormat === "mp3" ? "MP3" : "WAV"}{" "}
             <span className="shortcut-key">⌘/Ctrl+S</span>
           </button>
+          {videoExportProgress !== null && (
+            <>
+              <span className="denoise-progress">
+                导出视频 {Math.round(videoExportProgress)}%
+              </span>
+              <button
+                onClick={() =>
+                  void invoke("cancel_video_export").catch(() => undefined)
+                }
+              >
+                取消导出
+              </button>
+            </>
+          )}
           <button onClick={() => setHelpOpen(true)}>
             帮助 <span className="shortcut-key">H</span>
           </button>
@@ -2634,6 +3240,45 @@ function App() {
         </section>
       )}
 
+      {ffmpegGuideOpen && (
+        <section
+          className="recording-setup ffmpeg-guide"
+          role="dialog"
+          aria-label="需要安装 ffmpeg"
+        >
+          <div className="setup-row">
+            <strong>视频功能需要系统 ffmpeg</strong>
+          </div>
+          <p>
+            视频的导入与导出都由系统 ffmpeg 完成（应用不内置 ffmpeg）。安装后点「重新检测」：
+          </p>
+          <p className="ffmpeg-guide-command">
+            {navigator.userAgent.includes("Windows")
+              ? "winget install Gyan.FFmpeg ／ scoop install ffmpeg ／ choco install ffmpeg"
+              : "brew install ffmpeg"}
+          </p>
+          <div className="setup-row">
+            <button onClick={() => void recheckFfmpeg()}>重新检测</button>
+            <button onClick={() => void pickFfmpegPath()}>
+              手动指定 ffmpeg 路径
+            </button>
+            <button onClick={() => setFfmpegGuideOpen(false)}>关闭</button>
+          </div>
+          {ffmpegInfo?.path && (
+            <div className="setup-row">
+              <small>
+                {ffmpegInfo.version ?? "ffmpeg"}
+                ｜
+                {ffmpegInfo.hasLibx264
+                  ? "包含 libx264，可用精确重编码"
+                  : "不含 libx264，精确重编码不可用，请指定一份完整构建"}
+                ｜{ffmpegInfo.path}
+              </small>
+            </div>
+          )}
+        </section>
+      )}
+
       {recorder.error && <div className="inline-error">{recorder.error}</div>}
       {noiseNotice && (
         <div className="inline-notice" role="status">
@@ -2648,6 +3293,14 @@ function App() {
             <div className="spinner" />
             <p>处理中...</p>
           </div>
+        )}
+        {videoAsset && (
+          <VideoPreview
+            src={videoAsset.src}
+            position={currentTime}
+            isPlaying={isPlaying}
+            playbackRate={playbackSpeed}
+          />
         )}
         {audioBuffer ? (
           <WaveformScore

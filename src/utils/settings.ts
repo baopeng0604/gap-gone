@@ -22,6 +22,8 @@ export const SETTINGS_KEYS = {
   // transcribe.ts 已有的两个 key 沿用，用户数据不迁移不丢失
   autoTranscribe: "gap-gone-auto-transcribe",
   modelDir: "gap-gone-model-dir",
+  // 用户手动指定的 ffmpeg 路径（视频导入/导出依赖系统 ffmpeg）
+  ffmpegPath: "gap-gone-ffmpeg-path",
 } as const;
 
 export type ExportFormat = "mp3" | "wav";
@@ -176,4 +178,13 @@ export function setLufsTarget(target: number) {
     Math.min(LUFS_TARGET_RANGE.max, target),
   );
   writeString(SETTINGS_KEYS.lufsTarget, String(Math.round(clamped * 10) / 10));
+}
+
+/** 用户手动指定的 ffmpeg 路径（空串 = 未指定，走自动探测）。 */
+export function getFfmpegPath(): string {
+  return readString(SETTINGS_KEYS.ffmpegPath) ?? "";
+}
+
+export function setFfmpegPath(path: string) {
+  writeString(SETTINGS_KEYS.ffmpegPath, path || null);
 }

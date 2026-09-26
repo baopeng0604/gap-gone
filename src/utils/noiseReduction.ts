@@ -158,25 +158,25 @@ function compatibilityReduction(
 }
 
 /**
- * 读回我们自己写的 32-bit float WAV。
+ * 读回 32-bit float WAV：降噪结果，以及 ffmpeg 从视频里抽出的音轨（video.rs 同样写 float）。
  *
- * 不走 `decodeAudioData`：格式是我们自己写的，按 chunk 扫一遍就够了 —— 省掉一次
- * 编解码往返，也不依赖 WebView 对 IEEE float WAV 的解码支持。
- * 按 chunk 扫描而不是写死偏移：hound 写 float 时会用 40 字节的
+ * 不走 `decodeAudioData`：格式是我们自己（或 ffmpeg）按约定写的，按 chunk 扫一遍就够了 ——
+ * 省掉一次编解码往返，也不依赖 WebView 对 IEEE float WAV 的解码支持。
+ * 按 chunk 扫描而不是写死偏移：hound 与 ffmpeg 写 float 时会用 40 字节的
  * WAVE_FORMAT_EXTENSIBLE，我们写的是 16 字节 PCMWAVEFORMAT，两种都要认。
  */
-function floatWavToBuffer(context: AudioContext, bytes: Uint8Array): AudioBuffer {
+export function floatWavToBuffer(context: AudioContext, bytes: Uint8Array): AudioBuffer {
   const view = new DataView(
     bytes.buffer as ArrayBuffer,
     bytes.byteOffset,
     bytes.byteLength,
   );
-  if (view.byteLength < 44) throw new Error("降噪结果不是有效的 WAV");
+  if (view.byteLength < 44) throw new Error("WAV 数据无效");
   if (
     view.getUint32(0, false) !== 0x52494646 || // "RIFF"
     view.getUint32(8, false) !== 0x57415645 // "WAVE"
   ) {
-    throw new Error("降噪结果不是有效的 WAV");
+    throw new Error("WAV 数据无效");
   }
   let channels = 1;
   let sampleRate = 48000;
@@ -202,11 +202,11 @@ function floatWavToBuffer(context: AudioContext, bytes: Uint8Array): AudioBuffer
     // chunk 按偶数字节对齐
     pos = body + size + (size & 1);
   }
-  if (dataOffset < 0) throw new Error("降噪结果缺少 data 块");
-  if (bits !== 32) throw new Error(`降噪结果位深应为 32 位，实际 ${bits} 位`);
+  if (dataOffset < 0) throw new Error("WAV 缺少 data 块");
+  if (bits !== 32) throw new Error(`WAV 位深应为 32 位，实际 ${bits} 位`);
 
   const frames = Math.floor(dataLength / 4 / Math.max(1, channels));
-  if (frames <= 0) throw new Error("降噪结果没有采样");
+  if (frames <= 0) throw new Error("WAV 没有采样");
   const result = context.createBuffer(channels, frames, sampleRate);
   for (let c = 0; c < channels; c++) {
     const target = result.getChannelData(c);

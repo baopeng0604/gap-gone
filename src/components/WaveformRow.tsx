@@ -51,7 +51,18 @@ function drawWaveformSlice({
   ctx.lineTo(width, height / 2);
   ctx.stroke();
 
-  const channelData = buffer.getChannelData(0);
+  // 波形按声道下混成一条：视频导入的立体声音轨若只画左声道，显示不完整、
+  // 与按所有声道统计的处理链（静音检测 / 压缩 / LUFS）口径也不一致。
+  const channels = Array.from({ length: buffer.numberOfChannels }, (_, index) =>
+    buffer.getChannelData(index),
+  );
+  const sampleCount = channels[0].length;
+  const sampleAt = (index: number) => {
+    if (channels.length === 1) return channels[0][index];
+    let sum = 0;
+    for (const data of channels) sum += data[index];
+    return sum / channels.length;
+  };
   const startSample = Math.floor(startTime * buffer.sampleRate);
   const endSample = Math.floor(endTime * buffer.sampleRate);
   const totalSamples = Math.max(1, endSample - startSample);
@@ -67,12 +78,12 @@ function drawWaveformSlice({
     let max = -1.0;
 
     const offset = startSample + i * step;
-    if (offset >= channelData.length) break;
+    if (offset >= sampleCount) break;
 
     for (let j = 0; j < step; j++) {
       const idx = offset + j;
-      if (idx >= channelData.length) break;
-      const datum = channelData[idx];
+      if (idx >= sampleCount) break;
+      const datum = sampleAt(idx);
       if (datum < min) min = datum;
       if (datum > max) max = datum;
     }
