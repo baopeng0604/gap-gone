@@ -16,6 +16,11 @@ interface WaveSidebarProps {
   lufs: number;
   /** 达标判定的目标 LUFS（用户可在设置里改）。 */
   lufsTarget: number;
+  /**
+   * 「回到顶部」。锁视口外壳（0.1.75）之后纵向滚动由 `.work-area` 负责，
+   * 页面本身不再滚动，所以这个动作必须由父组件给（不能再直接 window.scrollTo）。
+   */
+  onBackToTop: () => void;
 }
 
 const MIN_DB = -60;
@@ -36,6 +41,7 @@ export default function WaveSidebar({
   filePeakDb,
   lufs,
   lufsTarget,
+  onBackToTop,
 }: WaveSidebarProps) {
   const live = Boolean(level);
   const rmsDb = level?.rmsDb ?? Number.NEGATIVE_INFINITY;
@@ -108,7 +114,7 @@ export default function WaveSidebar({
       <button
         type="button"
         className="sidebar-top-btn"
-        onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+        onClick={onBackToTop}
         title="一键滚动回波形顶部"
       >
         <span aria-hidden="true">↑</span>

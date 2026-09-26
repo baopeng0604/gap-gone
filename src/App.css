@@ -1,22 +1,45 @@
 .container {
   display: flex;
   flex-direction: column;
-  min-height: 100vh; /* Allow growth */
+  /* 锁视口的外壳（0.1.75）：整页不再滚动，纵向滚动交给 .work-area。
+     固定区从上到下是：工具栏两行 → 导入进度/错误横幅/提示条 → 视频预览；
+     转录面板是独立的吸底 dock；中间只有 .work-area 能滚。 */
+  height: 100vh;
   width: 100%; /* Fix horizontal scroll caused by 100vw */
   max-width: 100vw;
   /* 注意：这里必须用 clip 而不是 hidden——hidden 会创建滚动容器，
-     导致内部 sticky 元素（吸顶工具栏/吸底转录面板）失效 */
+     导致内部 sticky 元素（吸顶工具栏/吸底转录面板）失效。
+     也**不要**加 overflow-y: hidden：极矮窗口（固定区加起来超过视口）时
+     内容要能溢出、让整页滚动兜底，否则底部会被裁掉、点不到。 */
   overflow-x: clip;
   background-color: #121212;
   color: #e0e0e0;
 }
 
-/* 转录文字面板：吸底常驻，列表内部单独滚动 */
+/* 锁视口外壳里**唯一**的纵向滚动容器：工具栏与视频预览在上方常驻、
+   转录面板吸底，中间的波形区在这里滚。
+   刻意**不加** position: relative —— 处理中的遮罩（.loading-overlay，absolute + inset:0）
+   的包含块是初始包含块，靠它盖住整屏；一旦这里变成定位祖先，遮罩就会缩进滚动区、
+   并随内容一起滚走。 */
+.work-area {
+  flex: 1;
+  /* flex 子项默认 min-height: auto，不归零它就不会成为滚动容器 */
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+/* 转录文字面板：外壳里的吸底 dock，在滚动区之外，不随内容滚动 */
 .transcript-panel {
+  /* 极矮窗口下整页会溢出滚动，sticky 让面板仍贴在视口底部（正常情况下不起作用） */
   position: sticky;
   bottom: 0.5rem;
   z-index: 15;
-  width: min(1000px, calc(100% - 2rem));
+  /* 不被 flex 压缩：高度由上面 5 行的上限决定 */
+  flex: none;
+  /* 与波形容器同宽同左边缘（宽窗口 1080px 居中，工具栏同一条公式） */
+  width: min(1080px, calc(100% - 2rem));
   /* 与 1080px 工具栏左对齐。注意用 50% 而不是 100vw：
      100vw 含滚动条宽度，会导致与居中工具栏错位约半个滚动条宽。 */
   margin: 0.5rem 0 1.5rem;
@@ -25,6 +48,17 @@
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 8px;
   overflow: hidden;
+}
+
+/* 窄窗口的例外：视口小于 1272px 时，(100vw − 1080) / 2 已经不足 96px，
+   波形自己也被左右两条 72px 固定侧栏压着；转录面板是实体内容（有按钮和文字），
+   盖上去会挡住侧栏底部的按钮，所以这里让它再让出左右各 96px
+   （1rem 边距 + 72px 侧栏 + 8px 间隙）。宽窗口则与波形完全对齐。 */
+@media (max-width: 1272px) {
+  .transcript-panel {
+    width: min(1080px, calc(100% - 14rem));
+    margin-left: max(calc(50% - 540px), 6rem);
+  }
 }
 
 .transcript-header {
@@ -410,14 +444,7 @@
   margin-left: 0.5rem;
 }
 
-/* 语音优化链的前置提示：只提示、不拦截 */
-.chain-hint {
-  font-size: 0.75rem;
-  color: #8a8a8a;
-  font-weight: normal;
-  margin-left: 0.4rem;
-  white-space: nowrap;
-}
+/* 语音优化链的前置提示原来挂在工具栏上（.chain-hint），工具栏太挤，已移进设置页静态说明 */
 
 /* 设置面板行布局 */
 .setup-row {
@@ -487,9 +514,12 @@
 }
 
 .controls {
-  /* 流式布局 + 吸顶：高度变化时下方内容自然下移，不再需要给波形/弹窗留写死的 padding/top */
+  /* 锁视口外壳的固定区成员（0.1.75）：高度由内容决定，不被 flex 压缩，
+     否则矮窗口下工具栏会被挤扁、点不准。sticky 在新外壳里已不起作用
+     （.container 不再滚动），留着只为极矮窗口整页溢出时的兜底。 */
   position: sticky;
   top: 0.5rem;
+  flex: none;
   display: flex;
   flex-direction: column;
   flex-wrap: wrap;
@@ -1264,19 +1294,118 @@ button:disabled {
 /* 画面预览：贴在波形上方居中，高度设上限，避免把波形挤出视口 */
 .video-preview {
   display: flex;
-  justify-content: center;
-  width: 100%;
-  max-width: 1000px;
+  /* 画面靠左、信息卡紧随其后（0.1.78）：右侧那块原来是黑边，现在给卡片 */
+  justify-content: flex-start;
+  align-items: center;
+  gap: 0.75rem;
+  /* 与波形容器 .waveform-score-container 同宽同左边缘：宽窗口都是 1080px 居中、
+     窄窗口都是「整宽 − 2rem」。工具栏用的是同一条公式，所以视频框、波形、转录 dock
+     共用同一条左右边界线（0.1.76）。 */
+  width: min(1080px, calc(100% - 2rem));
   margin: 0 auto 0.75rem;
+  /* 外壳的固定区成员：不被 flex 压缩，否则矮窗口下画面会被挤扁 */
+  flex: none;
 }
 
 .video-preview video {
-  width: 100%;
-  max-height: 320px;
+  /* 收紧到画面本身（等比缩放到 240 高）：不再撑满整行留两侧黑边，
+     右侧空出来的位置正好放信息卡。 */
+  width: auto;
+  max-width: 100%;
+  /* 240px = 原来的 320px 再小 1/4：锁视口后预览高度直接从波形区里扣（0.1.75） */
+  max-height: 240px;
+  flex: none;
   background: #000;
   border: 1px solid #333;
   border-radius: 8px;
   object-fit: contain;
+}
+
+/* 画面右侧的信息卡：宽度由 App.tsx 算好（VIDEO_INFO_* 常量）后内联进去，
+   放不下时父组件整块不渲染。上半是动态的「本次导出会怎样」，下半是素材参数。 */
+.video-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  flex: none;
+  box-sizing: border-box;
+  padding: 0.5rem 0.7rem;
+  background: #1e1e1e;
+  border: 1px solid #333333;
+  border-radius: 8px;
+  font-size: 0.78rem;
+  color: #cfcfcf;
+}
+
+.video-meta-verdict {
+  display: flex;
+  flex-direction: column;
+  gap: 0.12rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.video-meta-label {
+  font-size: 0.7rem;
+  color: #8a8a8a;
+}
+
+.video-meta-verdict strong {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #e0e0e0;
+}
+
+.video-meta-verdict p {
+  margin: 0;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: #9a9a9a;
+}
+
+/* 唯一的「动手就能改善」提示（关键帧间隔）：用一点暖色，但不是警告 —— 素材本身没问题 */
+.video-meta-advice {
+  color: #e6b84e;
+}
+
+.video-meta-facts,
+.video-meta-params {
+  display: grid;
+  gap: 0.1rem 1rem;
+}
+
+.video-meta-params {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding-top: 0.35rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* 卡片被压窄时参数表退成一列（480px 以下，由组件按宽度决定） */
+.video-meta-params-single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.video-meta-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.video-meta-key {
+  flex: none;
+  color: #8a8a8a;
+}
+
+.video-meta-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #d0d0d0;
 }
 
 .video-subtitle-toggle {

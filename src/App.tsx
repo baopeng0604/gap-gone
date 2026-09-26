@@ -9,6 +9,7 @@ import PlaybackSidebar, {
   SPEED_STEPS,
 } from "./components/PlaybackSidebar";
 import VideoPreview from "./components/VideoPreview";
+import VideoInfoCard from "./components/VideoInfoCard";
 import {
   getKeptRegions,
   mapRangeToKept,
@@ -180,6 +181,8 @@ interface VideoProbe {
   fps: string;
   /** 关键帧时间戳（秒，升序，ffprobe 原始精度）。无损快速档只能从关键帧起切。 */
   keyframes: number[];
+  /** 文件大小（字节，0 = 读不到）。只用于右上角信息卡展示。 */
+  size: number;
 }
 
 /** 已导入视频的上下文；存在即处于视频模式，导出走 export_video。 */
@@ -202,6 +205,16 @@ interface VideoAsset {
   fps: string;
   /** 关键帧时间戳（秒，升序），无损快速档的吸附基准。 */
   keyframes: number[];
+  /** 画面像素尺寸（决定预览框收紧后有多宽，右侧信息卡按它算可用空间）。 */
+  width: number;
+  height: number;
+  /** 源时长（秒）。信息卡展示用；成片时长按切除区间另算。 */
+  duration: number;
+  /** 音轨编码与采样率（信息卡展示用）。 */
+  audioCodec: string;
+  sampleRate: number;
+  /** 文件大小（字节，0 = 读不到）。 */
+  size: number;
 }
 
 /**
@@ -214,6 +227,19 @@ interface VideoAsset {
  * 直接拿它当 `-ss`，一旦被四舍五入抬高就会越过关键帧 —— 输出侧 seek 会因此丢掉整段画面。
  */
 const FASTCOPY_SEEK_EPSILON = 0.001;
+
+/**
+ * 视频预览行与右侧信息卡的几何参数。**这些数字与 App.css 里 `.video-preview` 的规则
+ * 是一套，改一处必须两处一起改**（CSS 定版式，这里只是为了让卡片自己知道还剩多少宽度）：
+ * 行宽 = `min(1080px, 100% - 2rem)`，画面框高上限 240px（`width: auto` 等比收窄），
+ * 画面与卡片间距 0.75rem。卡片宽度 560 是目标值，压到 380 以下就整块不显示。
+ */
+const VIDEO_PREVIEW_ROW_MAX_WIDTH = 1080;
+const VIDEO_PREVIEW_ROW_PADDING = 32; // 100% - 2rem
+const VIDEO_PREVIEW_MAX_HEIGHT = 240;
+const VIDEO_PREVIEW_GAP = 12; // 0.75rem
+const VIDEO_INFO_MAX_WIDTH = 560;
+const VIDEO_INFO_MIN_WIDTH = 380;
 /**
  * 短于一帧的过渡没有意义（30 fps 下 0.034 秒 ≈ 1 帧），按硬切处理。
  * 与 Rust 的 `MIN_FRAME_SECONDS` 同一个值，改一处要改两处。
@@ -785,7 +811,21 @@ function App() {
   const recordingCountdownRef = useRef<number | null>(null);
   const countdownAudioRef = useRef<HTMLAudioElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  /**
+   * 视口宽度。锁视口外壳（0.1.75）之后页面不再滚动，它也就是 `.container` 的宽度；
+   * 视频预览右侧的信息卡要按「行宽 − 画面宽」算可用空间，所以要跟着窗口变化。
+   */
+  const [viewportWidth, setViewportWidth] = useState(() =>
+    typeof document === "undefined" ? 1280 : document.documentElement.clientWidth,
+  );
+  useEffect(() => {
+    const update = () => setViewportWidth(document.documentElement.clientWidth);
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
   const waveformViewRef = useRef<HTMLDivElement>(null);
+  /** 锁视口外壳里唯一的纵向滚动容器（波形 + 空状态在里面滚）。 */
+  const workAreaRef = useRef<HTMLDivElement>(null);
   const followRowRef = useRef(-1);
   /**
    * 播放用媒体元素。变速不变调只能靠它：AudioBufferSourceNode 的
@@ -1192,8 +1232,23 @@ function App() {
 
   /** 设置/录音入口把波形预览与页面滚回顶部，保证提示、倒计时等可见。 */
   const scrollPreviewToTop = useCallback(() => {
+    // 锁视口外壳之后页面自己不再滚动：纵向滚动落在 .work-area / .waveform-view 上
+    // （两处都滚一次，不滚的那个是空操作），横向仍需清掉波形区的偏移。
+    workAreaRef.current?.scrollTo({ top: 0 });
     waveformViewRef.current?.scrollTo({ top: 0, left: 0 });
+    // 极矮窗口下整页会溢出滚动（外壳故意不裁切），这一句是那时的兜底。
     window.scrollTo({ top: 0, left: 0 });
+  }, []);
+
+  /**
+   * 右侧栏「回到顶部」按钮。锁视口外壳后页面本身不再滚动，纵向滚动落在
+   * `.work-area` 或 `.waveform-view` 上（`.waveform-view` 只声明了 overflow-x，
+   * 但按规范 overflow-y 会被计算成 auto，所以它自己也会成为滚动容器）——
+   * 两处都滚一次，不滚的那个是空操作，别去猜谁在滚。
+   */
+  const scrollWorkAreaToTop = useCallback(() => {
+    waveformViewRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+    workAreaRef.current?.scrollTo({ top: 0, behavior: "smooth" });
   }, []);
 
   const handleFileUpload = async (
@@ -1203,8 +1258,9 @@ function App() {
     if (!file || !audioContextRef.current) return;
     setIsProcessing(true);
     stopPlayback(false);
+    let decoded: AudioBuffer | null = null;
     try {
-      const decoded = await audioContextRef.current.decodeAudioData(
+      decoded = await audioContextRef.current.decodeAudioData(
         await file.arrayBuffer(),
       );
       setAudioBuffer(decoded);
@@ -1218,6 +1274,12 @@ function App() {
     } finally {
       event.target.value = "";
       setIsProcessing(false);
+    }
+    // 设置页「自动转录」开启时，打开文件后直接转录。与确认录音同一条规矩：
+    // 必须在 isProcessing 清掉之后再调（转录自己会置 isProcessing，先调会被 finally
+    // 的 false 冲掉），且必须传 decoded（此刻 audioBuffer 状态还没更新）。
+    if (decoded && autoTranscribeEnabled) {
+      void handleTranscribe(decoded);
     }
   };
 
@@ -1497,6 +1559,42 @@ function App() {
   }, [videoExportVariant, fastcopyAvailable, audioProcessed, fastcopyPlan, videoAsset]);
 
   /**
+   * 视频预览右侧信息卡的宽度。画面框是 `width: auto` + `max-height: 240px`，
+   * 所以画面显示宽 = 像素宽 × min(240, 像素高) ÷ 像素高；行宽与 CSS 同口径。
+   * 可用空间不足最小宽度就返回 0（父组件据此不渲染整块）—— 宁可没有，也不挤成一团。
+   */
+  const videoInfoWidth = useMemo(() => {
+    if (!videoAsset || videoAsset.width <= 0 || videoAsset.height <= 0) return 0;
+    const shownHeight = Math.min(VIDEO_PREVIEW_MAX_HEIGHT, videoAsset.height);
+    const shownWidth = (videoAsset.width * shownHeight) / videoAsset.height;
+    const rowWidth = Math.min(
+      VIDEO_PREVIEW_ROW_MAX_WIDTH,
+      viewportWidth - VIDEO_PREVIEW_ROW_PADDING,
+    );
+    const available = rowWidth - shownWidth - VIDEO_PREVIEW_GAP;
+    if (available < VIDEO_INFO_MIN_WIDTH) return 0;
+    return Math.min(VIDEO_INFO_MAX_WIDTH, available);
+  }, [videoAsset, viewportWidth]);
+
+  /**
+   * 「关键帧间隔太长」是唯一一条用户动手就能改善的（重录时改 OBS 设置），所以只给它
+   * 一句建议；HEVC / 含 B 帧 / 带旋转 这些是素材属性，改不了，只陈述事实。
+   */
+  const fastcopyAdvice = useMemo(() => {
+    if (!videoAsset) return null;
+    const interval = fastcopyPlan?.keyframeInterval ?? 0;
+    if (interval <= 2) return null;
+    if (
+      videoAsset.videoCodec !== "h264" ||
+      videoAsset.hasBFrames ||
+      videoAsset.rotated
+    ) {
+      return null;
+    }
+    return `重录时把 OBS 的「关键帧间隔」设成 1 秒（现在是约 ${interval.toFixed(1)} 秒），切点就不用吸附到关键帧、也不会少删一小截静音`;
+  }, [videoAsset, fastcopyPlan]);
+
+  /**
    * 逐接缝的过渡时长（秒，长度 = 保留区间数 − 1；0 = 硬切）。这是导出与字幕换算的
    * **唯一来源**，Rust 侧只做兜底钳制、不再自己推导。三条规则：
    * - **只在「精确编码」档生效**：无损快切是 `-c:v copy`，画面根本没解码，做不了过渡；
@@ -1646,6 +1744,7 @@ function App() {
     setVideoImportProgress(0);
     let extractedPath: string | null = null;
     let unlistenExtract: (() => void) | null = null;
+    let decoded: AudioBuffer | null = null;
     try {
       const probe = await invoke<VideoProbe>("probe_video", { ffmpeg, path });
       // 抽音轨进度：payload 是当前秒数，占总进度 0-95%，留 5% 给前端解析
@@ -1668,7 +1767,7 @@ function App() {
       stopPlayback(false);
       // ffmpeg 写的是 32-bit float WAV，自解析读回（与降噪结果同一条路），
       // 不走 decodeAudioData：float WAVE_FORMAT_EXTENSIBLE 的解码支持视 WebView 而定。
-      const decoded = floatWavToBuffer(
+      decoded = floatWavToBuffer(
         audioContextRef.current,
         await readFile(extractedPath),
       );
@@ -1691,6 +1790,12 @@ function App() {
         hasBFrames: probe.hasBFrames ?? false,
         fps: probe.fps ?? "30/1",
         keyframes: probe.keyframes ?? [0],
+        width: probe.width,
+        height: probe.height,
+        duration: probe.duration,
+        audioCodec: probe.audioCodec,
+        sampleRate: probe.sampleRate,
+        size: probe.size ?? 0,
       });
       notify(
         `视频已导入（${probe.width}×${probe.height}，${probe.videoCodec.toUpperCase()}，音轨 ${probe.sampleRate} Hz）：照常编辑波形与区间，导出时生成视频`,
@@ -1711,6 +1816,15 @@ function App() {
         );
       }
     }
+    // 设置页「自动转录」开启时，视频进来就直接转录 —— 导入整段素材的目的通常就是
+    // 靠逐字稿切气口，导出视频时还要用它重映射字幕。规矩同确认录音：等 isProcessing
+    // 清掉之后再调，且必须显式传 decoded（此刻 audioBuffer 状态还没更新）。
+    if (decoded && autoTranscribeEnabled) {
+      // 提示条只有一个槽位：立刻转录会马上把上面那条「视频已导入（1920×1080…）」顶掉，
+      // 所以先让它露一下脸（转录一开始就会换成「正在加载转录模型…」）。
+      await new Promise((resolve) => window.setTimeout(resolve, 1200));
+      void handleTranscribe(decoded);
+    }
   }, [
     isProcessing,
     recorder.status,
@@ -1719,6 +1833,7 @@ function App() {
     stopPlayback,
     releaseVideoAsset,
     notify,
+    autoTranscribeEnabled,
   ]);
 
   /**
@@ -2846,14 +2961,6 @@ function App() {
           >
             压缩
           </button>
-          {audioBuffer && !hasEnhancedAudio && (
-            <span
-              className="chain-hint"
-              title="扩展器只兜得住残余底噪：先「一键降噪」再优化，成品更干净"
-            >
-              建议先降噪
-            </span>
-          )}
           {hasCompressionApplied && (
             <button
               onClick={revertCompression}
@@ -3057,8 +3164,13 @@ function App() {
                       setAutoTranscribe(event.target.checked);
                     }}
                   />
-                  录音确定编辑后自动转录
+                  导入或录音后自动转录
                 </label>
+              </div>
+              <div className="setup-row">
+                <small>
+                  「打开音频」「导入视频」「录音确定编辑」三条路径都会自动开始转录（需已下载模型，首次会自动下载）。关掉则只在手动点「转录文字」时转。
+                </small>
               </div>
               <div className="setup-row">
                 <label
@@ -3154,6 +3266,12 @@ function App() {
               />
               LUFS
             </label>
+          </div>
+          <div className="setup-row">
+            <small>
+              语音优化建议：点「压缩」前先做一次「一键降噪」。压缩是整条链（高通 80 Hz → 向下扩展 → 压缩 → 响度标准化），其中向下扩展器只兜得住
+              残余底噪 —— 先降噪，最终成品更干净。
+            </small>
           </div>
           <div className="setup-row">
             <label className="setup-checkbox">导出格式</label>
@@ -3574,38 +3692,70 @@ function App() {
         </div>
       )}
 
-      <div className="waveform-view" ref={waveformViewRef}>
-        {isProcessing && !transcribeProgress && (
-          <div className="loading-overlay">
-            <div className="spinner" />
-            <p>处理中...</p>
-          </div>
-        )}
-        {videoAsset && (
-          <VideoPreview
-            src={videoAsset.src}
-            position={currentTime}
-            isPlaying={isPlaying}
-            playbackRate={playbackSpeed}
-          />
-        )}
-        {audioBuffer ? (
-          <WaveformScore
-            buffer={audioBuffer}
-            currentTime={currentTime}
-            onSeek={handleSeek}
-            regions={deletedRegions}
-            onRegionAdd={handleRegionAdd}
-            onRegionRemove={handleRegionRemove}
-            editMode={editMode}
-            selection={selection}
-            onSelectionChange={setSelection}
-            previewRegions={detectedSilenceRegions}
-            words={transcript?.words ?? null}
-          />
-        ) : (
-          <div className="empty-state">请打开音频或点击“录音”开始</div>
-        )}
+      {/* 视频预览是锁视口外壳的固定区成员：留在滚动区之外，页面滚动时画面不动。
+          画面靠左、右侧空出来的那块放信息卡（宽度不够时 videoInfoWidth 为 0，整块不渲染）。 */}
+      {videoAsset && (
+        <VideoPreview
+          src={videoAsset.src}
+          position={currentTime}
+          isPlaying={isPlaying}
+          playbackRate={playbackSpeed}
+        >
+          {videoInfoWidth > 0 && (
+            <VideoInfoCard
+              width={videoInfoWidth}
+              asset={{
+                width: videoAsset.width,
+                height: videoAsset.height,
+                duration: videoAsset.duration,
+                fps: videoAsset.fps,
+                videoCodec: videoAsset.videoCodec,
+                audioCodec: videoAsset.audioCodec,
+                sampleRate: videoAsset.sampleRate,
+                channels: videoAsset.channels,
+                size: videoAsset.size,
+              }}
+              plan={{
+                variant: effectiveVariant,
+                fallbackReason: fastcopyFallbackReason,
+                advice: fastcopyAdvice,
+                keyframeInterval: fastcopyPlan?.keyframeInterval ?? 0,
+                maxShift: fastcopyPlan?.maxShift ?? 0,
+                audioProcessed,
+                exportSubtitles,
+              }}
+            />
+          )}
+        </VideoPreview>
+      )}
+
+      {/* 外壳里唯一的纵向滚动容器：工具栏与视频预览在上方常驻，转录面板吸底 */}
+      <div className="work-area" ref={workAreaRef}>
+        <div className="waveform-view" ref={waveformViewRef}>
+          {isProcessing && !transcribeProgress && (
+            <div className="loading-overlay">
+              <div className="spinner" />
+              <p>处理中...</p>
+            </div>
+          )}
+          {audioBuffer ? (
+            <WaveformScore
+              buffer={audioBuffer}
+              currentTime={currentTime}
+              onSeek={handleSeek}
+              regions={deletedRegions}
+              onRegionAdd={handleRegionAdd}
+              onRegionRemove={handleRegionRemove}
+              editMode={editMode}
+              selection={selection}
+              onSelectionChange={setSelection}
+              previewRegions={detectedSilenceRegions}
+              words={transcript?.words ?? null}
+            />
+          ) : (
+            <div className="empty-state">请打开音频或点击“录音”开始</div>
+          )}
+        </div>
       </div>
 
       {audioBuffer && (
@@ -3614,6 +3764,7 @@ function App() {
           filePeakDb={filePeakDb}
           lufs={timelineLufs}
           lufsTarget={lufsTargetDb}
+          onBackToTop={scrollWorkAreaToTop}
         />
       )}
 

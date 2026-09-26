@@ -117,6 +117,9 @@ pub(crate) struct VideoProbe {
     /// 无损快速档只能在关键帧上切，前端用它算出吸附后的切点并如实告知偏移量。
     /// **不要四舍五入**：关键帧 16.666667 写成 16.667 就会让 seek 越过它、整段没有画面。
     keyframes: Vec<f64>,
+    /// 文件大小（字节，0 = 读不到）。**只用于界面上展示**，不参与任何判定。
+    /// 取 ffprobe 的 `format.size`（字符串），比再调一次 fs::stat 省事，也不用动 fs 授权。
+    size: u64,
 }
 
 fn ffmpeg_command(program: &str) -> Command {
@@ -537,6 +540,11 @@ fn parse_video_probe(value: &Value) -> Result<VideoProbe, String> {
         fps,
         // 关键帧由 probe_video 追加（多跑一次 ffprobe，见 video_keyframes）
         keyframes: Vec::new(),
+        size: value["format"]["size"]
+            .as_str()
+            .and_then(|size| size.parse::<u64>().ok())
+            .or_else(|| value["format"]["size"].as_u64())
+            .unwrap_or(0),
     })
 }
 

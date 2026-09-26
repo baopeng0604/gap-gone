@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 
 interface VideoPreviewProps {
   /** convertFileSrc 转出的 asset 协议地址。 */
@@ -8,18 +8,24 @@ interface VideoPreviewProps {
   isPlaying: boolean;
   /** 与音频同一档变速：两边速度不同的话会一直互相追，画面反复卡顿。 */
   playbackRate: number;
+  /** 画面右侧的信息卡（宽度不够时父组件不传，这里就没有）。 */
+  children?: ReactNode;
 }
 
 /**
  * 与音频时间轴同步的视频画面预览。
  * `<video>` 静音播放（声音由播放引擎的媒体元素输出），播放 / 暂停 / seek /
  * 跳过切除区间全部以播放引擎为准：位置偏差超过容差或播放态变化时强制对齐。
+ *
+ * 画面**靠左显示**（0.1.78）：`<video>` 用 `width: auto` 收紧到画面本身，不再撑满
+ * 整行留出两侧黑边，右侧空出来的那块给信息卡。
  */
 export default function VideoPreview({
   src,
   position,
   isPlaying,
   playbackRate,
+  children,
 }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -46,6 +52,7 @@ export default function VideoPreview({
   return (
     <div className="video-preview">
       <video ref={videoRef} src={src} muted playsInline preload="auto" />
+      {children}
     </div>
   );
 }
