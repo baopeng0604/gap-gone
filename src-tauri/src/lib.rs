@@ -137,12 +137,25 @@ fn list_audio_input_devices() -> Result<Vec<AudioDevice>, String> {
 /// 把交错的立体声或多声道数据下混为单声道。
 /// Windows WASAPI 共享模式下采集流只接受设备混音格式，
 /// 声道数必须与设备一致，因此只能在回调里转成单声道。
+///
+/// 取「各声道绝对值最大者」（保号），**不做平均**：单麦克风信号常只落在单个
+/// 声道上，`(L+R)/2` 会把它整体砍掉 6 dB（−6.02 dBFS），电平表与落盘 WAV 同步偏低。
+/// 两边若是同一信号复制，取最大与平均等价（不改变现状）；真立体声时取较响的一侧，
+/// 比平均更不容易相互抵消。
 fn downmix_to_mono(data: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         return data.to_vec();
     }
     data.chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
+        .map(|frame| {
+            let mut loudest = 0.0f32;
+            for &sample in frame {
+                if sample.abs() > loudest.abs() {
+                    loudest = sample;
+                }
+            }
+            loudest
+        })
         .collect()
 }
 
