@@ -716,6 +716,9 @@
   align-items: flex-start;
   margin: 0 auto;
   padding-bottom: 2rem; /* Add bottom spacing */
+  /* 不被 flex 压缩：行数多时容器要按内容撑高、溢出后由 .waveform-view 滚动，
+     否则容器会被压到 min-height，行也跟着缩。 */
+  flex: none;
 }
 
 .waveform-row-container {
@@ -725,6 +728,9 @@
   border-radius: 8px;
   overflow: visible;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  /* 极矮/多行时不被 flex 压缩：行高（波形 120 + 词带 32）必须保持，
+     否则 .waveform-row-clip 的 overflow:hidden 会把波形裁掉、只剩词带文字。 */
+  flex: none;
 }
 
 .waveform-row-clip {
