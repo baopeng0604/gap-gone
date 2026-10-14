@@ -2449,6 +2449,7 @@ function App() {
         "BracketLeft",
         "BracketRight",
         "Space",
+        "Enter",
       ].includes(event.code);
       if (
         target instanceof HTMLElement &&
@@ -2458,7 +2459,12 @@ function App() {
         return;
       }
 
-      if (event.code === "Enter" && recorder.status === "review") {
+      if (
+        (event.code === "Enter" || event.code === "KeyS") &&
+        recorder.status === "review"
+      ) {
+        // 录音结果预览：Enter 与 S 都可以确定并进入编辑，
+        // 与录音中「S 或 Enter 停止」对称，连续按同一个键就能走完录音流程。
         event.preventDefault();
         void confirmRecording();
       } else if (
@@ -2482,10 +2488,11 @@ function App() {
         event.preventDefault();
         restoreLastAutoDetection();
       } else if (
-        event.code === "KeyS" &&
+        (event.code === "KeyS" || event.code === "Enter") &&
         recorder.status === "recording" &&
         !hasPrimaryModifier
       ) {
+        // 录音中：S 与 Enter 都可以停止录音（Ctrl/Cmd+S 仍是导出，不算）。
         event.preventDefault();
         void recorder.stopRecording();
       } else if (
@@ -3613,10 +3620,10 @@ function App() {
             </button>
             <button
               onClick={() => void recorder.stopRecording()}
-              title="快捷键 S：停止录音"
-              aria-keyshortcuts="S"
+              title="快捷键 S 或 Enter：停止录音"
+              aria-keyshortcuts="S Enter"
             >
-              停止录音 <span className="shortcut-key">S</span>
+              停止录音 <span className="shortcut-key">S / Enter</span>
             </button>
           </div>
         </section>
@@ -3635,10 +3642,10 @@ function App() {
           </button>
           <button
             onClick={() => void confirmRecording()}
-            title="快捷键 Enter：确定并编辑"
-            aria-keyshortcuts="Enter"
+            title="快捷键 Enter 或 S：确定并编辑"
+            aria-keyshortcuts="Enter S"
           >
-            确定并编辑 <span className="shortcut-key">Enter</span>
+            确定并编辑 <span className="shortcut-key">Enter / S</span>
           </button>
         </section>
       )}

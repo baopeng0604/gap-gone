@@ -23,6 +23,8 @@ pnpm install            # 安装依赖
 pnpm dev                # Vite 前端开发（http://127.0.0.1:1420）
 pnpm build              # tsc 类型检查 + Vite 构建 → dist/
 pnpm tauri dev          # 桌面开发版（Rust 后端 + WebView 前端）
+
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 pnpm tauri build        # 打包桌面应用 → src-tauri/target/release/bundle/
 ```
 

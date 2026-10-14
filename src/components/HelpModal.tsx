@@ -248,7 +248,8 @@ export default function HelpModal({
               <span className="help-modal-kbd">Shift+R</span>：恢复最近一次应用的自动检测
             </li>
             <li>
-              <span className="help-modal-kbd">S</span>：停止录音
+              <span className="help-modal-kbd">S</span> 或{" "}
+              <span className="help-modal-kbd">Enter</span>：录音中停止录音
             </li>
             <li>
               <span className="help-modal-kbd">X</span>：切换到切除工具（再按一次返回）
@@ -281,7 +282,9 @@ export default function HelpModal({
               <span className="help-modal-kbd">O</span>：打开音频文件
             </li>
             <li>
-              <span className="help-modal-kbd">Enter</span>：录音结束后确定并编辑
+              <span className="help-modal-kbd">Enter</span> 或{" "}
+              <span className="help-modal-kbd">S</span>：录音结束后确定并编辑。
+              录音流程里这两个键通用，连续按同一个键就能一路走到编辑页
             </li>
             <li>
               <span className="help-modal-kbd">Esc</span>：取消倒计时、录音中取消并返回编辑页，或取消录音结果
